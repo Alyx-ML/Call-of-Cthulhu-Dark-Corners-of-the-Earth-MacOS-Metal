@@ -410,3 +410,20 @@ Values in units of SDR white, calculated for a gray with an EDR headroom of 2.67
 ### Not verified
 
 - The image on screen: the Video menu position, the contact shadows, the HDR image and the GT7 image. The test runs did not capture or examine images.
+
+## 2026-11-20: GT7 tone mapping curve
+
+- Cause: with the toe strength 1.0 and the expansion knee at 0.6, the GT7 curve did not change sRGB values from 0.05 to 0.70 in SDR output. Thus the setting had no visible effect.
+- The toe strength is now 1.06 and the expansion knee is 0.25 for SDR output and HDR output.
+
+| sRGB value | 0.05 | 0.20 | 0.40 | 0.60 | 0.70 | 0.80 | 0.90 |
+|---|---|---|---|---|---|---|---|
+| Game | 0.05 | 0.20 | 0.40 | 0.60 | 0.70 | 0.80 | 0.90 |
+| GT7, toe 1.280 (too dark) | 0.01 | 0.13 | 0.34 | 0.59 | 0.70 | 0.79 | 0.91 |
+| GT7, toe 1.0 (no effect) | 0.05 | 0.20 | 0.40 | 0.60 | 0.70 | 0.79 | 0.91 |
+| GT7 now | 0.04 | 0.18 | 0.39 | 0.60 | 0.75 | 0.90 | 1.00 |
+
+SDR output, calculated for a gray.
+
+- Verified: `make app` built the app with only the two `key_frame` warnings. A level run with `MTL_DEBUG_LAYER=1` had no Metal validation error. The log of the player's run before this change had no error.
+- Not verified: the image on screen.

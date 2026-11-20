@@ -1789,9 +1789,9 @@ static const char util_msl[] =
     //     knee + (peak - knee) * (a u + (1 - a) u^3), u = (Y - knee) / (1 - knee), a = (1 - knee) / (peak - knee)
     //   has slope 1 at the knee and gives SDR white the peak of the screen (the EDR headroom).
     //   With tone mapping: an inverse Reinhard curve with slope 1 at the knee gives SDR white 1 + 19 (1 - knee) times
-    //   SDR white, and the GT7 curve then fits it to the peak. The knee is 0.25 for HDR output and 0.6 for SDR output.
+    //   SDR white, and the GT7 curve then fits it to the peak (SDR white for SDR output). The knee is 0.25.
     "    bool hdr = (k.mode & 8u) != 0u;\n"
-    "    float knee = hdr ? 0.25 : 0.6;\n"
+    "    float knee = 0.25;\n"
     "    float Y = dot(l, float3(0.2126, 0.7152, 0.0722));\n"
     "    float Ye;\n"
     "    if (hdr && (k.mode & 1u) == 0u) {\n"
@@ -2656,9 +2656,10 @@ static void gamma_reset(Swap *sw) { for (int i = 0; i < 256; i++) for (int c = 0
 //   DEALINGS IN THE SOFTWARE.
 //
 // The curve parameters are those of the reference (alpha 0.25, mid point 0.538, linear section 0.444, blend ratio
-// 0.6, chroma fade 0.98 .. 1.16), except the toe strength: 1.0 instead of 1.280. The game's image is display-referred
-// SDR; with the reference toe the curve made its shadows darker (sRGB 0.20 by 40%, sRGB 0.05 by 75%). With 1.0 the
-// curve does not change values below the linear section. The units are EDR units (1.0 = SDR white, which follows
+// 0.6, chroma fade 0.98 .. 1.16), except the toe strength: 1.06 instead of 1.280. The game's image is display-referred
+// SDR; with the reference toe the curve made its shadows much darker (sRGB 0.20 became 0.13, sRGB 0.05 became 0.01).
+// With 1.06 and the expansion knee at 0.25, SDR output maps sRGB 0.05, 0.20, 0.40, 0.60, 0.70, 0.80 and 0.90 to
+// 0.04, 0.18, 0.39, 0.60, 0.75, 0.90 and 1.00. The units are EDR units (1.0 = SDR white, which follows
 // the display brightness): SDR output has the target 1.0; HDR output has the EDR headroom of the screen as the
 // target, so the peak is the brightest value that the display can show at its current brightness.
 typedef struct { uint32_t mode; float paper, target, target_i, kA, kB, kC, mid, lin, toe, blend, fade0, fade1, p0, p1, p2; } PresentTM;
@@ -2671,7 +2672,7 @@ static void present_tm_consts(PresentTM *k, uint32_t mode, float headroom) {
     k->mode = mode;
     k->paper = 1.0f;                                    // SDR white in EDR units
     k->target = (mode & 2) && (mode & 8) ? headroom : 1.0f;
-    const float alpha = 0.25f, mid = 0.538f, lin = 0.444f, toe = 1.0f;
+    const float alpha = 0.25f, mid = 0.538f, lin = 0.444f, toe = 1.06f;
     float kk = (lin - 1.0f) / (alpha - 1.0f);
     k->kA = k->target * lin + k->target * kk;
     k->kB = -k->target * kk * expf(lin / kk);
