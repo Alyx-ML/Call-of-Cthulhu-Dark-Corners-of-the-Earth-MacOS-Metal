@@ -3,7 +3,10 @@
 // The settings live in guest memory (RtEnh), so that controls of the game's menu system write them directly. The
 // game's menu builder (CoCMenuBuilder.cpp) gets a menu "ENHANCEDOPTIONS", made with the same calls as its
 // "SOUNDOPTIONS" menu, and the menus "OPTIONS" (main menu) and "INGAMEOPTIONS" (pause menu) get a link to it after
-// their Sound link. The game's "VIDEOOPTIONS" menu gets the Subtitle Size setting after its own setting. The text
+// their Sound link, and a link to the menu "HDRCALIBRATION" (the peak brightness and paper white of HDR output, with
+// the test image of the runtime) after it. (A link in a menu of the SOUNDOPTIONS kind does not open its menu: Return
+// there goes back to OPTIONS.) The game's "VIDEOOPTIONS" menu gets the Subtitle Size setting after its own setting.
+// The text
 // of these controls has string IDs from TXT_BASE; the game's string lookup (0x4b3db0, CoCStringManager) gives this
 // file's text for them. patches.txt has the hook points: the five menu hooks, the intro videos (0x4b235c) and the
 // subtitle size (0x4c43fa, 0x4c44d4).
@@ -12,7 +15,7 @@
 // Anisotropic filtering is always 16x and is not in the menu (the file can set another value).
 // Reduced banding and the gamepad are always on and are not in the menu or the file.
 // Defaults: ambient occlusion, tone mapping, HDR, contact shadows, bloom, sharp character shadows and skip intro
-// videos off; subtitles at the game's size.
+// videos off; subtitles at the game's size; HDR peak brightness 1000 nits and paper white 100%.
 #include "rt32.h"
 #include "rt_enh.h"
 #include <errno.h>
@@ -53,11 +56,16 @@ extern void (*rt_dinput_poll_hook)(void);   // dinput8.c
 #define S_TEXTOPTION     0x62bf20u   // "TEXTOPTION"
 #define S_TEXTOPTIONENUM 0x62c0b8u   // "TEXTOPTIONENUM"
 #define G_SUB_LAYOUT     0x4c4590u   // thiscall () on CoCSubtitles: the layout of the subtitle panel and its text
+#define G_MENU_SHOWN     0x6c8590u   // the menu manager (0x6c8560, CoCStateMenuManager) +0x30: the menu on the screen
+                                     // (its update and draw calls go to this menu; 0 without a menu)
 
 // ---- text ----
 #define TXT_BASE 0xE000u
 enum { T_TITLE, T_GAME, T_2X, T_AO, T_OFF, T_LOW, T_MEDIUM, T_HIGH, T_ON,
        T_TONEMAP, T_HDR, T_CONTACT, T_SKIP, T_BLOOM, T_SHADOWS, T_SUBS, T_125, T_150, T_175,
+       T_CALIB, T_PEAK, T_PAPER,
+       T_NITS0, T_NITS_END = T_NITS0 + RT_ENH_HDR_PEAKS - 1,     // the values of RT_ENH_HDR_PEAK_NITS
+       T_PCT0, T_PCT_END = T_PCT0 + RT_ENH_HDR_PAPERS - 1,       // the values of RT_ENH_HDR_PAPER_PCT
        T_COUNT };
 static const char *const txt[T_COUNT] = {
     [T_TITLE] = "Enhancements", [T_GAME] = "Game", [T_2X] = "2x", [T_AO] = "Ambient Occlusion", [T_OFF] = "Off", [T_LOW] = "Low",
@@ -65,7 +73,12 @@ static const char *const txt[T_COUNT] = {
     [T_CONTACT] = "Contact Shadows", [T_SKIP] = "Skip Intro Videos", [T_BLOOM] = "Bloom",
     [T_SHADOWS] = "Sharp Character Shadows (restart)",
     [T_SUBS] = "Subtitle Size", [T_125] = "1.25x", [T_150] = "1.5x", [T_175] = "1.75x",
+    [T_CALIB] = "HDR Calibration", [T_PEAK] = "Peak (symbol barely visible)", [T_PAPER] = "Paper White",
+    [T_NITS0] = "400 nits", "600 nits", "800 nits", "1000 nits", "1200 nits", "1400 nits", "1600 nits", "2000 nits",
+    "3000 nits", "4000 nits",
+    [T_PCT0] = "50%", "75%", "100%", "125%", "150%", "200%",
 };
+_Static_assert(T_NITS_END == T_NITS0 + 9 && T_PCT_END == T_PCT0 + 5, "the value texts follow rt_enh.h");
 static uint32_t txt_guest[T_COUNT];
 
 // patch at 0x4b3db0: the text of string id `id` (TXT_BASE ..), as the game's lookup returns it (a guest char *)
@@ -92,8 +105,10 @@ static const struct { const char *key; size_t off; int32_t max; int32_t def; } k
     {"bloom", offsetof(RtEnh, bloom), 3, 0},
     {"sharp_character_shadows", offsetof(RtEnh, shadows), 1, 0},
     {"subtitle_size", offsetof(RtEnh, sub_scale), 4, 0},
+    {"hdr_peak", offsetof(RtEnh, hdr_peak), RT_ENH_HDR_PEAKS - 1, 3},          // 1000 nits
+    {"hdr_paper_white", offsetof(RtEnh, hdr_paper), RT_ENH_HDR_PAPERS - 1, 2},  // 100%
 };
-enum { K_ANISO, K_AO, K_TONEMAP, K_HDR, K_CONTACT, K_SKIP, K_BLOOM, K_SHADOWS, K_SUBS };
+enum { K_ANISO, K_AO, K_TONEMAP, K_HDR, K_CONTACT, K_SKIP, K_BLOOM, K_SHADOWS, K_SUBS, K_PEAK, K_PAPER };
 // keys of earlier versions whose settings are now always on: the loader skips them, the next save leaves them out
 static const char *const retired_keys[] = {"gamepad", "reduced_banding"};
 #define NKEYS (sizeof keys / sizeof keys[0])
@@ -112,8 +127,9 @@ static void cfg_save(void) {
     if (bad || rename(tmp, p) != 0) { rt_log("[enh] can't write %s: %s; the settings are not saved", p, strerror(errno)); remove(tmp); return; }
     saved = *rt_enh;
     if (rt_verbose) rt_log("[enh] settings saved: aniso %d, ao %d, tonemap %d, hdr %d, contact %d, skip_intro %d, "
-                           "bloom %d, shadows %d, subtitle size %d", rt_enh->aniso, rt_enh->ao, rt_enh->tonemap,
-                           rt_enh->hdr, rt_enh->contact, rt_enh->skip_intro, rt_enh->bloom, rt_enh->shadows, rt_enh->sub_scale);
+                           "bloom %d, shadows %d, subtitle size %d, hdr peak %d, hdr paper white %d", rt_enh->aniso,
+                           rt_enh->ao, rt_enh->tonemap, rt_enh->hdr, rt_enh->contact, rt_enh->skip_intro, rt_enh->bloom,
+                           rt_enh->shadows, rt_enh->sub_scale, rt_enh->hdr_peak, rt_enh->hdr_paper);
 }
 static void cfg_load(void) {
     for (size_t i = 0; i < NKEYS; i++) *field(rt_enh, i) = keys[i].def;
@@ -150,9 +166,17 @@ static void cfg_load(void) {
     saved = *rt_enh;
 }
 
-// the input hook (dinput8.c, once per keyboard read): gamepad input, and the settings file when a menu changed them
+static uint32_t calib_menu;              // the HDRCALIBRATION menu (guest address)
+
+// the input hook (dinput8.c, once per keyboard read): gamepad input, the settings file when a menu changed them,
+// and the test image of HDR calibration while its menu is on the screen
 static void input_frame(void) {
-    if (memcmp(&saved, rt_enh, sizeof saved) != 0) {
+    int changed = 0;
+    for (size_t i = 0; i < NKEYS; i++) changed |= *field(rt_enh, i) != *field(&saved, i);
+    int test = calib_menu && rd32(G_MENU_SHOWN) == calib_menu;
+    if (rt_verbose && test != rt_enh->hdr_test) rt_log("[enh] the HDR Calibration menu is %s the screen", test ? "on" : "off");
+    rt_enh->hdr_test = test;
+    if (changed) {
         for (size_t i = 0; i < NKEYS; i++)
             if (*field(rt_enh, i) < 0 || *field(rt_enh, i) > keys[i].max)
                 rt_fatal("[enh] the menu wrote %d to setting %s (range 0..%d)", *field(rt_enh, i), keys[i].key, keys[i].max);
@@ -186,11 +210,12 @@ void coc_enh_init(void) {
     d3d9_enh_shadow_target(512, 512, 23 /* D3DFMT_R5G6B5 */, 4);
     rt_dinput_poll_hook = input_frame;
     static const char *const lvl[] = {"off", "low", "medium", "high"}, *const sub[] = {"game", "1.25x", "1.5x", "1.75x", "2x"};
-    rt_log("[enh] settings: anisotropic filtering %s, ambient occlusion %s, GT7 tone mapping %s, HDR %s, contact shadows %s, "
-           "bloom %s, sharp character shadows %s, subtitle size %s, skip intro videos %s",
+    rt_log("[enh] settings: anisotropic filtering %s, ambient occlusion %s, GT7 tone mapping %s, HDR %s (peak %s, paper white "
+           "%s), contact shadows %s, bloom %s, sharp character shadows %s, subtitle size %s, skip intro videos %s",
            (const char *[]){"game", "2x", "4x", "8x", "16x"}[rt_enh->aniso], lvl[rt_enh->ao], rt_enh->tonemap ? "on" : "off",
-           rt_enh->hdr ? "on" : "off", rt_enh->contact ? "on" : "off", lvl[rt_enh->bloom],
-           rt_enh->shadows ? "on" : "off", sub[rt_enh->sub_scale], rt_enh->skip_intro ? "on" : "off");
+           rt_enh->hdr ? "on" : "off", txt[T_NITS0 + rt_enh->hdr_peak], txt[T_PCT0 + rt_enh->hdr_paper],
+           rt_enh->contact ? "on" : "off", lvl[rt_enh->bloom], rt_enh->shadows ? "on" : "off", sub[rt_enh->sub_scale],
+           rt_enh->skip_intro ? "on" : "off");
 }
 
 // ---- the menus ----
@@ -232,18 +257,27 @@ void coc_enh_sub_show(CPU *c, uint32_t subtitles) {
     if (rt_verbose) rt_log("[enh] subtitle layout again: size %s", (const char *[]){"game", "1.25x", "1.5x", "1.75x", "2x"}[sub_laid_out]);
 }
 
-static uint32_t menu_name;               // "ENHANCEDOPTIONS" in guest memory
+static uint32_t menu_name, calib_name;   // "ENHANCEDOPTIONS" and "HDRCALIBRATION" in guest memory
 static uint32_t name_guest(void) {
     if (!menu_name && !(menu_name = gstrdup("ENHANCEDOPTIONS"))) rt_fatal("[enh] out of guest memory for the menu name");
     return menu_name;
 }
+static uint32_t calib_name_guest(void) {
+    if (!calib_name && !(calib_name = gstrdup("HDRCALIBRATION"))) rt_fatal("[enh] out of guest memory for the menu name");
+    return calib_name;
+}
 
-// patches at 0x411a1f (OPTIONS) and 0x410be6 (INGAMEOPTIONS): a link to the Enhancements menu after the Sound link
+// patches at 0x411a1f (OPTIONS) and 0x410be6 (INGAMEOPTIONS): links to the Enhancements menu and to the HDR
+// Calibration menu after the Sound link
 void coc_enh_add_link(CPU *c, uint32_t menu) {
     uint32_t ctl = CALL(G_MENU_ADD, menu, S_TEXTOPTION);
     if (!ctl) rt_fatal("[enh] the menu system did not add the Enhancements link");
     CALL(G_CTL_LABEL, ctl, TXT_BASE + T_TITLE);
     CALL(G_CTL_LINK, ctl, 1, name_guest(), 0);
+    ctl = CALL(G_MENU_ADD, menu, S_TEXTOPTION);
+    if (!ctl) rt_fatal("[enh] the menu system did not add the HDR Calibration link");
+    CALL(G_CTL_LABEL, ctl, TXT_BASE + T_CALIB);
+    CALL(G_CTL_LINK, ctl, 1, calib_name_guest(), 0);
 }
 
 #define ENH_SETTINGS 7                   // the settings in the Enhancements menu (coc_enh_build_menu)
@@ -267,8 +301,9 @@ static void add_enum(CPU *c, uint32_t menu, int label, const int *values, int nv
 #define ROW_PAD     0.035f
 #define TITLE_H     0.07f
 #define TITLE_GAP   0.01f
-static void menu_rects(CPU *c, uint32_t menu, int rows) {
-    float rh = 2.0f * ROW_PAD + ROW_SPACING * (float)rows, top = 0.5f - (TITLE_H + TITLE_GAP + rh) / 2.0f;
+// the rectangles of `rows` rows (the last one the Back row) and of the title above them, from `top`
+static void menu_rects_at(CPU *c, uint32_t menu, int rows, float top) {
+    float rh = 2.0f * ROW_PAD + ROW_SPACING * (float)rows;
     const float r[8] = {0.15f, top + TITLE_H + TITLE_GAP, 0.85f, top + TITLE_H + TITLE_GAP + rh,   // the rows
                         0.15f, top, 0.85f, top + TITLE_H};                                        // the title
     uint32_t g = gcalloc(1, sizeof r);
@@ -277,6 +312,10 @@ static void menu_rects(CPU *c, uint32_t menu, int rows) {
     CALL(G_MENU_RECT, menu, g);
     CALL(G_MENU_TITLE_RECT, menu, g + 16);
     gfree(g);
+}
+// centered on the screen
+static void menu_rects(CPU *c, uint32_t menu, int rows) {
+    menu_rects_at(c, menu, rows, 0.5f - (TITLE_H + TITLE_GAP + 2.0f * ROW_PAD + ROW_SPACING * (float)rows) / 2.0f);
 }
 
 // patch at 0x412101 (the VIDEOOPTIONS builder, after its one setting): the Subtitle Size setting. The game draws the
@@ -296,18 +335,19 @@ void coc_enh_add_video(CPU *c, uint32_t menu) {
     rt_log("[enh] Subtitle Size added to the menu VIDEOOPTIONS");
 }
 
-// patch at 0x4123f1 (the end of the SOUNDOPTIONS builder): the Enhancements menu, built like SOUNDOPTIONS
-void coc_enh_build_menu(CPU *c) {
+// a menu built like SOUNDOPTIONS (the calls of the game's builder at 0x4123f1): the title `title`, Back goes to the
+// menu named `back` (a guest string), `rows` rows (the last one the Back row) from `top` (< 0: centered)
+static uint32_t menu_new(CPU *c, int title, uint32_t back, int rows, float top) {
     uint32_t mem = CALL(G_NEW, 0, 0x8c0, 7, S_FILE, 0x4c, 1);
-    if (!mem) rt_fatal("[enh] out of guest memory for the Enhancements menu");
+    if (!mem) rt_fatal("[enh] out of guest memory for a menu");
     uint32_t menu = CALL0(G_MENU_CTOR, mem);
-    if (!menu) rt_fatal("[enh] the menu system did not create the Enhancements menu");
+    if (!menu) rt_fatal("[enh] the menu system did not create a menu");
     uint32_t col = gcalloc(1, 16);
     if (!col) rt_fatal("[enh] out of guest memory for a menu color");
-    CALL(G_MENU_TITLE, menu, TXT_BASE + T_TITLE);
+    CALL(G_MENU_TITLE, menu, TXT_BASE + (uint32_t)title);
     CALL(G_MENU_HELP, menu, 0xf57, 0xf58, 0xFFFFFFFFu);
-    CALL(G_MENU_BACK, menu, 0, 1, S_OPTIONS);
-    CALL(G_MENU_BACK, menu, 1, 1, S_OPTIONS);
+    CALL(G_MENU_BACK, menu, 0, 1, back);
+    CALL(G_MENU_BACK, menu, 1, 1, back);
     CALL(G_MENU_416600, menu, 1, 0xFFFFFFFFu);
     CALL(G_MENU_COLOR, menu, 1, rd32(CALL(G_COLOR, col, 0, 0, 0, 0x60)));
     CALL(G_MENU_416270, menu, 1, 1);
@@ -316,10 +356,22 @@ void coc_enh_build_menu(CPU *c) {
     CALL(G_MENU_SOUND, menu, 0, 0x16, S_EMPTY);
     CALL(G_MENU_SOUND, menu, 1, 0x17, S_EMPTY);
     CALL(G_MENU_4163F0, menu, 9);
-    menu_rects(c, menu, ENH_SETTINGS + 1);   // the settings and the Back row
+    if (top < 0.0f) menu_rects(c, menu, rows); else menu_rects_at(c, menu, rows, top);
     CALL(G_MENU_416470, menu, 0);
     CALL(G_MENU_416220, menu, 0, 1);
     gfree(col);
+    return menu;
+}
+static void menu_register(CPU *c, uint32_t name, uint32_t menu) {
+    CALL0(G_MENU_FINISH, menu);
+    uint32_t mgr = CALL0(G_MENU_MANAGER, 0);
+    if (!mgr) rt_fatal("[enh] the menu manager is missing");
+    CALL(G_MENU_REGISTER, mgr, name, menu);
+}
+
+// patch at 0x4123f1 (the end of the SOUNDOPTIONS builder): the Enhancements menu and the HDR Calibration menu
+void coc_enh_build_menu(CPU *c) {
+    uint32_t menu = menu_new(c, T_TITLE, S_OPTIONS, ENH_SETTINGS + 1, -1.0f);   // the settings and the Back row
     add_enum(c, menu, T_AO, (const int[]){T_OFF, T_LOW, T_MEDIUM, T_HIGH}, 4, K_AO);
     add_enum(c, menu, T_TONEMAP, (const int[]){T_OFF, T_ON}, 2, K_TONEMAP);
     add_enum(c, menu, T_HDR, (const int[]){T_OFF, T_ON}, 2, K_HDR);
@@ -327,9 +379,18 @@ void coc_enh_build_menu(CPU *c) {
     add_enum(c, menu, T_BLOOM, (const int[]){T_OFF, T_LOW, T_MEDIUM, T_HIGH}, 4, K_BLOOM);
     add_enum(c, menu, T_SHADOWS, (const int[]){T_OFF, T_ON}, 2, K_SHADOWS);
     add_enum(c, menu, T_SKIP, (const int[]){T_OFF, T_ON}, 2, K_SKIP);
-    CALL0(G_MENU_FINISH, menu);
-    uint32_t mgr = CALL0(G_MENU_MANAGER, 0);
-    if (!mgr) rt_fatal("[enh] the menu manager is missing");
-    CALL(G_MENU_REGISTER, mgr, name_guest(), menu);
+    menu_register(c, name_guest(), menu);
     rt_log("[enh] menu ENHANCEDOPTIONS registered (%d settings)", ENH_SETTINGS);
+
+    // the HDR calibration: two settings and the Back row near the top of the screen; the runtime draws the test
+    // image below them (from 0.6 to 0.84 of the screen height) while the menu is on the screen
+    menu = menu_new(c, T_CALIB, S_OPTIONS, 3, 0.2f);
+    int peaks[RT_ENH_HDR_PEAKS], papers[RT_ENH_HDR_PAPERS];
+    for (int i = 0; i < RT_ENH_HDR_PEAKS; i++) peaks[i] = T_NITS0 + i;
+    for (int i = 0; i < RT_ENH_HDR_PAPERS; i++) papers[i] = T_PCT0 + i;
+    add_enum(c, menu, T_PEAK, peaks, RT_ENH_HDR_PEAKS, K_PEAK);
+    add_enum(c, menu, T_PAPER, papers, RT_ENH_HDR_PAPERS, K_PAPER);
+    menu_register(c, calib_name_guest(), menu);
+    calib_menu = menu;
+    rt_log("[enh] menu HDRCALIBRATION registered (2 settings)");
 }

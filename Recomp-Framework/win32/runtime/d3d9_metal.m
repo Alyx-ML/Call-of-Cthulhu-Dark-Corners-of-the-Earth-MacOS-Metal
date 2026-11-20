@@ -469,6 +469,13 @@ struct Device {
     struct { float view[16], proj[16]; uint32_t n; } enh_cam[4];
     uint32_t enh_ncam, enh_cam_frame;
     int enh_cam_logged;
+    // HDR output and tone mapping (rt_enh.h): the scene of the back buffer before the UI (tm_note)
+    id<MTLTexture> tm_ref;         // a copy of the back buffer at the last change from scene draws to UI draws
+    uint32_t tm_scene;             // the frame of the last scene draw into the back buffer
+    uint32_t tm_ref_frame;         // the frame of tm_ref
+    uint32_t tm_copies;            // the copies into tm_ref in tm_ref_frame
+    int tm_ui;                     // the last draw into the back buffer was a UI draw
+    struct { float headroom, potential; int peak, paper; } tm_logged;
 };
 
 // ---------------- submission ----------------
@@ -1735,8 +1742,10 @@ static const char util_msl[] =
     "  return float4(c, 1.0); }\n"
     // enhanced presentation (rt_enh.h): HDR expansion and GT7 tone mapping. The GT7 functions are a port of
     // gt7_tone_mapping.cpp v1.0 (Polyphony Digital Inc., MIT License; the notice is at present_tm_consts).
-    // Units: 1.0 = SDR white, the EDR unit of macOS (k.paper = 1); the peak of HDR output is the EDR headroom.
-    "struct TM { uint mode; float paper, target, target_i; float kA, kB, kC, mid; float lin, toe, blend, fade0; float fade1, p0, p1, p2; };\n"
+    // Units: 1.0 = SDR white, the EDR unit of macOS. k.paper is paper white and k.target the peak in these units (both
+    // 1 for SDR output; present_tm_consts).
+    // rel: the peak of the expansion as a factor of paper white (1 or more); w, h: the size of the drawable in pixels
+    "struct TM { uint mode; float paper, target, target_i; float kA, kB, kC, mid; float lin, toe, blend, fade0; float fade1, rel, w, h; };\n"
     "static float pq_enc(float n) {\n"
     "  float ym = pow(max(n, 0.0) / 10000.0, 0.1593017578125);\n"
     "  return pow((0.8359375 + 18.8515625 * ym) / (1.0 + 18.6875 * ym), 78.84375); }\n"
@@ -1768,49 +1777,85 @@ static const char util_msl[] =
     "  float cs = 1.0 - smoothstep(k.fade0, k.fade1, u.x / k.target_i);\n"
     "  float3 sc = ucs_to_rgb(float3(su.x, u.y * cs, u.z * cs));\n"
     "  return min((1.0 - k.blend) * sk + k.blend * sc, float3(k.target)); }\n"
-    // mode: 1 GT7 tone mapping, 2 the drawable is an EDR layer (extended linear, the screen's primaries), 8 HDR output
+    "static float3 tm_ramp(float3 c, constant float4 *ramp, uint gamma) {\n"
+    "  if ((gamma & 1u) == 0u) return c;\n"
+    "  float3 r;\n"
+    "  for (int j = 0; j < 3; j++) { float f = c[j] * 255.0; int i = min(int(floor(f)), 255); int i1 = min(i + 1, 255);\n"
+    "    r[j] = mix(ramp[i][j], ramp[i1][j], f - float(i)); }\n"
+    "  return r; }\n"
+    "static float3 tm_lin(float3 c) { return select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045); }\n"
+    "static float tm_luma(float3 l) { return dot(l, float3(0.2126, 0.7152, 0.0722)); }\n"
+    // the scene: a linear SDR color -> the output color (EDR units for HDR output: 1.0 = SDR white; linear SDR
+    // otherwise). The game's image is SDR: its highlights get back a range above paper white. The expansion acts on
+    // luminance and scales the three channels by the same factor, so the hue and the saturation stay those of the
+    // game. Below the knee (0.25, sRGB 0.54) the luminance does not change. Units of the curve: 1.0 = paper white.
+    //   HDR output without tone mapping: above the knee the curve
+    //     knee + (rel - knee) * (a u + (1 - a) u^3), u = (Y - knee) / (1 - knee), a = (1 - knee) / (rel - knee)
+    //   has slope 1 at the knee and gives SDR white the peak (rel = peak / paper white).
+    //   With tone mapping: an inverse Reinhard curve with slope 1 at the knee gives SDR white 1 + 19 (1 - knee) times
+    //   paper white, and the GT7 curve then fits it to the peak (SDR white for SDR output).
+    "static float3 scene_tm(float3 l, constant TM &k) {\n"
+    "  float knee = 0.25;\n"
+    "  float Y = tm_luma(l);\n"
+    "  float Ye;\n"
+    "  if ((k.mode & 8u) != 0u && (k.mode & 1u) == 0u) {\n"
+    "    float u = saturate((Y - knee) / (1.0 - knee));\n"
+    "    float a = min((1.0 - knee) / max(k.rel - knee, 1e-3), 1.0);\n"
+    "    Ye = Y <= knee ? Y : knee + (k.rel - knee) * (a * u + (1.0 - a) * u * u * u);\n"
+    "  } else {\n"
+    "    float t = min(max(Y - knee, 0.0) / (1.0 - knee), 0.95);\n"
+    "    Ye = Y <= knee ? Y : knee + (1.0 - knee) * t / (1.0 - t);\n"
+    "  }\n"
+    "  float3 x = l * (Y > 1e-6 ? Ye / Y : 1.0) * k.paper;\n"
+    "  x = float3(0.6274040 * x.r + 0.3292820 * x.g + 0.0433136 * x.b, 0.0690970 * x.r + 0.9195400 * x.g + 0.0113612 * x.b,\n"
+    "             0.0163916 * x.r + 0.0880132 * x.g + 0.8955950 * x.b);\n"
+    // without tone mapping a color above the peak is scaled down as a whole, so that its hue stays
+    "  float xm = max(x.r, max(x.g, x.b));\n"
+    "  float3 o = (k.mode & 1u) != 0u ? gt7(x, k) : (xm > k.target ? x * (k.target / xm) : x);\n"
+    "  return float3(1.6604910 * o.r - 0.5876411 * o.g - 0.0728499 * o.b, -0.1245505 * o.r + 1.1328999 * o.g - 0.0083494 * o.b,\n"
+    "                -0.0181508 * o.r - 0.1005789 * o.g + 1.1187297 * o.b); }\n"
+    // the HDR calibration test image (EDR units), below the rows of the calibration menu. Left: a square at the
+    // maximum of the screen (64 x SDR white; macOS clips it to the peak of the screen) with a symbol (a ring and a
+    // dot) at the chosen peak. The symbol is visible while the chosen peak is below the peak of the screen and
+    // disappears at the peak of the screen. Right: a bar at paper white (the UI) above ten steps of the game's gray
+    // scale (sRGB 0.1 .. 1.0) through the scene curve.
+    "static float3 calib(float2 p, float3 c, constant TM &k) {\n"
+    "  float s = 0.24 * k.h, y0 = 0.6 * k.h, cx = 0.5 * k.w;\n"
+    "  if (p.y < y0 || p.y >= y0 + s) return c;\n"
+    "  float ax = cx - 1.55 * s, bx = cx - 0.35 * s;\n"
+    "  if (p.x >= ax && p.x < ax + s) {\n"
+    "    float r = length(p - float2(ax + 0.5 * s, y0 + 0.5 * s)) / s;\n"
+    "    return float3(abs(r - 0.3) < 0.035 || r < 0.06 ? k.target : 64.0);\n"
+    "  }\n"
+    "  if (p.x >= bx && p.x < bx + 2.0 * s) {\n"
+    "    float q = (p.x - bx) / (0.2 * s);\n"
+    "    if (fract(q) < 0.04 || (p.y >= y0 + 0.2 * s && p.y < y0 + 0.24 * s)) return float3(0.0);\n"
+    "    if (p.y < y0 + 0.2 * s) return float3(k.paper);\n"
+    "    return scene_tm(tm_lin(float3(float(min(int(q), 9) + 1) / 10.0)), k);\n"
+    "  }\n"
+    "  return c; }\n"
+    // mode: 1 GT7 tone mapping, 2 the drawable is an EDR layer (extended linear, the screen's primaries), 8 HDR output,
+    // 16 the frame has a scene, 32 the HDR calibration test image.
+    // t is the back buffer; rt is the back buffer at the end of the scene, before the UI of the frame (t itself when
+    // the frame has no UI after the scene). The scene gets the scene curve; the UI stays at paper white. A pixel that
+    // the UI changed: final + (scene output - paper white x scene) x min(Y final / Y scene, 1). This keeps the curve
+    // for an unchanged pixel, scales it with a fade or a dark panel over the scene, and adds UI light at paper white.
     "fragment float4 present_enh_fs(QV in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]],\n"
     "                               constant float4 *ramp [[buffer(0)]], constant uint &gamma [[buffer(1)]],\n"
-    "                               constant TM &k [[buffer(2)]]) {\n"
-    "  float3 c = saturate(t.sample(s, in.uv).rgb);\n"
-    "  if ((gamma & 1u) != 0u) {\n"
-    "    float3 r;\n"
-    "    for (int j = 0; j < 3; j++) { float f = c[j] * 255.0; int i = min(int(floor(f)), 255); int i1 = min(i + 1, 255);\n"
-    "      r[j] = mix(ramp[i][j], ramp[i1][j], f - float(i)); }\n"
-    "    c = r;\n"
-    "  }\n"
-    "  float3 l = select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045);\n"
+    "                               constant TM &k [[buffer(2)]], texture2d<float> rt [[texture(1)]]) {\n"
+    "  float3 l = tm_lin(tm_ramp(saturate(t.sample(s, in.uv).rgb), ramp, gamma));\n"
     "  float3 disp = l;\n"
     "  if ((k.mode & 9u) != 0u) {\n"
-    // the game's image is SDR: its highlights get back a range above SDR white. The expansion acts on luminance and
-    // scales the three channels by the same factor, so the hue and the saturation stay those of the game. Below the
-    // knee the luminance does not change. Units: 1.0 = SDR white (EDR units); k.target is the peak.
-    //   HDR output without tone mapping: above the knee (0.25, sRGB 0.54) the curve
-    //     knee + (peak - knee) * (a u + (1 - a) u^3), u = (Y - knee) / (1 - knee), a = (1 - knee) / (peak - knee)
-    //   has slope 1 at the knee and gives SDR white the peak of the screen (the EDR headroom).
-    //   With tone mapping: an inverse Reinhard curve with slope 1 at the knee gives SDR white 1 + 19 (1 - knee) times
-    //   SDR white, and the GT7 curve then fits it to the peak (SDR white for SDR output). The knee is 0.25.
-    "    bool hdr = (k.mode & 8u) != 0u;\n"
-    "    float knee = 0.25;\n"
-    "    float Y = dot(l, float3(0.2126, 0.7152, 0.0722));\n"
-    "    float Ye;\n"
-    "    if (hdr && (k.mode & 1u) == 0u) {\n"
-    "      float u = saturate((Y - knee) / (1.0 - knee));\n"
-    "      float a = min((1.0 - knee) / max(k.target - knee, 1e-3), 1.0);\n"
-    "      Ye = Y <= knee ? Y : knee + (max(k.target, 1.0) - knee) * (a * u + (1.0 - a) * u * u * u);\n"
+    "    if ((k.mode & 16u) != 0u) {\n"
+    "      float3 r = tm_lin(tm_ramp(saturate(rt.sample(s, in.uv).rgb), ramp, gamma));\n"
+    "      float yr = tm_luma(r);\n"
+    "      float w = yr > 1e-6 ? min(tm_luma(l) / yr, 1.0) : 0.0;\n"
+    "      disp = max(l * k.paper + (scene_tm(r, k) - r * k.paper) * w, 0.0);\n"
     "    } else {\n"
-    "      float t = min(max(Y - knee, 0.0) / (1.0 - knee), 0.95);\n"
-    "      Ye = Y <= knee ? Y : knee + (1.0 - knee) * t / (1.0 - t);\n"
+    "      disp = l * k.paper;\n"
     "    }\n"
-    "    float3 x = l * (Y > 1e-6 ? Ye / Y : 1.0) * k.paper;\n"
-    "    x = float3(0.6274040 * x.r + 0.3292820 * x.g + 0.0433136 * x.b, 0.0690970 * x.r + 0.9195400 * x.g + 0.0113612 * x.b,\n"
-    "               0.0163916 * x.r + 0.0880132 * x.g + 0.8955950 * x.b);\n"
-    // without tone mapping a color above the peak is scaled down as a whole, so that its hue stays
-    "    float xm = max(x.r, max(x.g, x.b));\n"
-    "    float3 o = (k.mode & 1u) != 0u ? gt7(x, k) : (xm > k.target ? x * (k.target / xm) : x);\n"
-    "    disp = float3(1.6604910 * o.r - 0.5876411 * o.g - 0.0728499 * o.b, -0.1245505 * o.r + 1.1328999 * o.g - 0.0083494 * o.b,\n"
-    "                  -0.0181508 * o.r - 0.1005789 * o.g + 1.1187297 * o.b) / k.paper;\n"
     "  }\n"
+    "  if ((k.mode & 32u) != 0u) disp = calib(in.pos.xy, disp, k);\n"
     "  if ((k.mode & 2u) != 0u) return float4(disp, 1.0);\n"
     "  disp = saturate(disp);\n"
     "  float3 e = select(1.055 * pow(disp, 1.0 / 2.4) - 0.055, disp * 12.92, disp <= 0.0031308);\n"
@@ -2363,6 +2408,44 @@ static void enh_note_draw(Device *d) {
         d->enh_color = r0->tex->mtl; d->enh_depth = d->ds->tex->mtl;
     }
 }
+// HDR output and tone mapping (rt_enh.h) act on the scene and keep the UI at paper white. A draw into the back
+// buffer with no depth test and with alpha blending is a UI draw (in a level of the game: the HUD, the text and the
+// menus, after the game's full-screen copy of its post-processed scene); the other draws into the back buffer are
+// scene draws. At each change from scene draws to UI draws the back buffer is copied into tm_ref, at most TM_COPIES
+// times in a frame (later changes in that frame keep the last copy). A frame of the game has one change in a level
+// and two in some frames of the pause menu.
+#define TM_COPIES 4
+static void tm_note(Device *d) {
+    if (!rt_enh || (rt_enh->tonemap != 1 && rt_enh->hdr != 1)) return;
+    Surf *r0 = d->rt[0];
+    if (!r0 || !r0->swap || r0->swap != d->swap) return;
+    const uint32_t *rs = d->st.rs;
+    uint32_t f = d->frame + 1;
+    if ((d->ds && rs[RS_ZENABLE]) || !rs[RS_ALPHABLENDENABLE]) { d->tm_scene = f; d->tm_ui = 0; return; }
+    int start = !d->tm_ui && d->tm_scene == f;
+    d->tm_ui = 1;
+    if (!start) return;
+    if (d->tm_ref_frame != f) { d->tm_ref_frame = f; d->tm_copies = 0; }
+    if (d->tm_copies >= TM_COPIES) return;
+    d->tm_copies++;
+    Tex *bt = r0->tex;
+    if (d->pend.active) begin_pass_flush_clear(d);
+    if (bt->ms > 1) tex_resolve(d, bt);
+    id<MTLTexture> src = bt->ms > 1 ? bt->resolve : bt->mtl;
+    if (!d->tm_ref || d->tm_ref.width != src.width || d->tm_ref.height != src.height || d->tm_ref.pixelFormat != src.pixelFormat) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:src.width
+                                                                                      height:src.height mipmapped:NO];
+        td.storageMode = MTLStorageModePrivate; td.usage = MTLTextureUsageShaderRead;
+        d->tm_ref = [d->mtl newTextureWithDescriptor:td];
+        if (!d->tm_ref) rt_fatal("[d3d9] out of GPU memory for the scene copy of HDR output (%lux%lu)",
+                                 (unsigned long)src.width, (unsigned long)src.height);
+    }
+    [get_blit(d) copyFromTexture:src toTexture:d->tm_ref];
+    bt->last_use = cur_serial(d);
+    if (rt_verbose && d->frame % 600 == 0)
+        rt_log("[d3d9] HDR output and tone mapping: frame %u, scene copy %u before the UI (%lux%lu)", d->frame, d->tm_copies,
+               (unsigned long)src.width, (unsigned long)src.height);
+}
 // the end of the opaque scene of this frame (a target change, a copy or clear of the back buffer, Present): the
 // ambient occlusion, contact shadow and bloom passes run once, on the GPU after the draws recorded so far
 static void enh_apply(Device *d) {
@@ -2406,6 +2489,7 @@ static uint32_t draw(Device *d, uint32_t pt, uint32_t prims, int indexed, uint32
     if (!prims) return D3D_OK;
     if (prims > 0x555555u) return D3DERR_INVALIDCALL;
     uint32_t inst = 1;
+    tm_note(d);
     if (!prepare(d, pt == 1, up, &inst, indexed)) { d->stat_skipped++; return D3D_OK; }
     d->stat_draws++;
     enh_note_draw(d);
@@ -2660,18 +2744,21 @@ static void gamma_reset(Swap *sw) { for (int i = 0; i < 256; i++) for (int c = 0
 // SDR; with the reference toe the curve made its shadows much darker (sRGB 0.20 became 0.13, sRGB 0.05 became 0.01).
 // With 1.06 and the expansion knee at 0.25, SDR output maps sRGB 0.05, 0.20, 0.40, 0.60, 0.70, 0.80 and 0.90 to
 // 0.04, 0.18, 0.39, 0.60, 0.75, 0.90 and 1.00. The units are EDR units (1.0 = SDR white, which follows
-// the display brightness): SDR output has the target 1.0; HDR output has the EDR headroom of the screen as the
-// target, so the peak is the brightest value that the display can show at its current brightness.
-typedef struct { uint32_t mode; float paper, target, target_i, kA, kB, kC, mid, lin, toe, blend, fade0, fade1, p0, p1, p2; } PresentTM;
+// the display brightness). SDR output has paper white and the target 1.0. HDR output has the paper white of the
+// calibration (a factor of SDR white) and the calibrated peak in nits converted to EDR units: SDR white is taken as
+// 100 nits x the potential EDR headroom / the current EDR headroom (rt_enh.h, RT_ENH_HDR_PEAK_NITS).
+typedef struct { uint32_t mode; float paper, target, target_i, kA, kB, kC, mid, lin, toe, blend, fade0, fade1, rel, w, h; } PresentTM;
 static float pq_enc(float n) {
     float ym = powf(n > 0 ? n / 10000.0f : 0.0f, 0.1593017578125f);
     return powf((0.8359375f + 18.8515625f * ym) / (1.0f + 18.6875f * ym), 78.84375f);
 }
-static void present_tm_consts(PresentTM *k, uint32_t mode, float headroom) {
+static void present_tm_consts(PresentTM *k, uint32_t mode, float paper, float peak, uint32_t w, uint32_t h) {
     memset(k, 0, sizeof *k);
     k->mode = mode;
-    k->paper = 1.0f;                                    // SDR white in EDR units
-    k->target = (mode & 2) && (mode & 8) ? headroom : 1.0f;
+    k->paper = paper;
+    k->target = peak;
+    k->rel = peak > paper ? peak / paper : 1.0f;
+    k->w = (float)w; k->h = (float)h;
     const float alpha = 0.25f, mid = 0.538f, lin = 0.444f, toe = 1.06f;
     float kk = (lin - 1.0f) / (alpha - 1.0f);
     k->kA = k->target * lin + k->target * kk;
@@ -2739,17 +2826,36 @@ static uint32_t swap_present(Device *d, Swap *sw, uint32_t srp, uint32_t drp, ui
     if (tm_mode) {
         __unsafe_unretained id<MTLBuffer> tb; uint32_t to;
         PresentTM *k = ring_alloc(d, sizeof(PresentTM), &tb, &to);
-        float headroom = rt_cocoa_edr_headroom();
-        present_tm_consts(k, tm_mode, headroom);
+        float paper = 1.0f, peak = 1.0f;
         if (edr_dt && (tm_mode & 8)) {
-            static float logged = 0;
-            if (headroom != logged) {
-                rt_log("[d3d9] HDR output: peak %.2f x SDR white (the EDR headroom of the screen now; up to %.2f on this screen)%s",
-                       headroom, rt_cocoa_edr_potential(), (tm_mode & 1) ? ", GT7 tone mapping" : "");
-                logged = headroom;
+            static const int peaks[RT_ENH_HDR_PEAKS] = RT_ENH_HDR_PEAK_NITS, papers[RT_ENH_HDR_PAPERS] = RT_ENH_HDR_PAPER_PCT;
+            if (rt_enh->hdr_peak < 0 || rt_enh->hdr_peak >= RT_ENH_HDR_PEAKS || rt_enh->hdr_paper < 0 || rt_enh->hdr_paper >= RT_ENH_HDR_PAPERS)
+                rt_fatal("[d3d9] HDR calibration out of range: peak %d, paper white %d", rt_enh->hdr_peak, rt_enh->hdr_paper);
+            float headroom = rt_cocoa_edr_headroom(), potential = rt_cocoa_edr_potential();
+            if (!(headroom >= 1.0f) || !(potential >= headroom))
+                rt_fatal("[d3d9] HDR output: the screen gave the EDR headroom %.3f and the potential EDR headroom %.3f", headroom, potential);
+            float white = 100.0f * potential / headroom;  // the nits of SDR white (rt_enh.h)
+            paper = (float)papers[rt_enh->hdr_paper] / 100.0f;
+            peak = (float)peaks[rt_enh->hdr_peak] / white;
+            if (headroom != d->tm_logged.headroom || potential != d->tm_logged.potential ||
+                peaks[rt_enh->hdr_peak] != d->tm_logged.peak || papers[rt_enh->hdr_paper] != d->tm_logged.paper) {
+                rt_log("[d3d9] HDR output: peak %d nits (%.2f x SDR white), paper white %d%% of SDR white%s; the screen: EDR "
+                       "headroom %.2f of %.2f, SDR white approximately %.0f nits, peak approximately %.0f nits",
+                       peaks[rt_enh->hdr_peak], peak, papers[rt_enh->hdr_paper], (tm_mode & 1) ? ", GT7 tone mapping" : "",
+                       headroom, potential, white, white * headroom);
+                d->tm_logged.headroom = headroom; d->tm_logged.potential = potential;
+                d->tm_logged.peak = peaks[rt_enh->hdr_peak]; d->tm_logged.paper = papers[rt_enh->hdr_paper];
             }
+            if (rt_enh->hdr_test) tm_mode |= 32u;
         }
+        // the scene of this frame and its copy before the UI (tm_note); the back buffer itself when the last draw was
+        // not a UI draw
+        uint32_t f = d->frame + 1;
+        int ref = sw == d->swap && d->tm_ui && d->tm_ref_frame == f && d->tm_ref && d->tm_ref.width == img.width && d->tm_ref.height == img.height;
+        if (sw == d->swap && d->tm_scene == f) tm_mode |= 16u;
+        present_tm_consts(k, tm_mode, paper, peak, DW, DH);
         [e setFragmentBuffer:tb offset:to atIndex:2];
+        [e setFragmentTexture:ref ? d->tm_ref : img atIndex:1];
     }
     util_quad(d, e, tm_mode ? 'H' : 'P', 0, dt.pixelFormat, img, scaled ? d->samp_lin : d->samp_pt, sr, bb->w, bb->h, drc, DW, DH, rb, ro, &gamma);
     // the D3D9 cursor (SetCursorProperties / ShowCursor) follows the mouse

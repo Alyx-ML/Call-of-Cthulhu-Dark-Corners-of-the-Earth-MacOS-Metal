@@ -1,6 +1,6 @@
 // Enhancement settings that the runtime applies on top of the game (anisotropic filtering, ambient occlusion,
-// tone mapping, HDR output, contact shadows, bloom, reduced banding, sharp shadows; and settings that the game
-// project applies: gamepad input, intro videos, subtitle size).
+// tone mapping, HDR output and its calibration, contact shadows, bloom, reduced banding, sharp shadows; and
+// settings that the game project applies: gamepad input, intro videos, subtitle size).
 //
 // The game project owns the settings: it allocates RtEnh in guest memory, so that controls of the game's own
 // menus can write the fields directly, and sets rt_enh before the first frame. While rt_enh is NULL the runtime
@@ -22,7 +22,21 @@ typedef struct RtEnh {
     int32_t shadows;   // 0: off; 1: the shadow targets of d3d9_enh_shadow_target created from now on are larger and keep
                        //    8 bits per channel
     int32_t sub_scale; // game project: the size of the subtitles (0 = the game's size; the game project gives the steps)
+    int32_t hdr_peak;  // HDR output: the peak brightness, an index into RT_ENH_HDR_PEAK_NITS
+    int32_t hdr_paper; // HDR output: paper white (the white of the game's image and UI), an index into RT_ENH_HDR_PAPER_PCT
+    int32_t hdr_test;  // game project: 1 while the HDR calibration menu is on the screen; the presented image then has
+                       //    the calibration test image (only with HDR output)
 } RtEnh;
+
+// The values of hdr_peak in nits (cd/m2). macOS gives the brightness of the screen only as EDR headroom, a factor of
+// the current SDR white. The runtime takes the peak of the screen as 100 nits x the potential EDR headroom (16 on a
+// Liquid Retina XDR display: 1600 nits, its HDR peak), so SDR white is approximately
+// 100 nits x potential headroom / current headroom. A peak above the peak of the screen is clipped by macOS.
+#define RT_ENH_HDR_PEAK_NITS {400, 600, 800, 1000, 1200, 1400, 1600, 2000, 3000, 4000}
+#define RT_ENH_HDR_PEAKS 10
+// The values of hdr_paper: paper white as a percentage of the SDR white of macOS (100 = the white of other apps)
+#define RT_ENH_HDR_PAPER_PCT {50, 75, 100, 125, 150, 200}
+#define RT_ENH_HDR_PAPERS 6
 
 extern RtEnh *rt_enh;
 

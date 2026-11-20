@@ -427,3 +427,56 @@ SDR output, calculated for a gray.
 
 - Verified: `make app` built the app with only the two `key_frame` warnings. A level run with `MTL_DEBUG_LAYER=1` had no Metal validation error. The log of the player's run before this change had no error.
 - Not verified: the image on screen.
+
+## 2026-11-20: HDR output of the scene only, and the HDR Calibration menu
+
+### Cause of the problem
+
+- HDR output expanded the full presented image: the scene and the UI.
+- The expansion changed only values above the knee (linear 0.25, sRGB 0.54). Most pixels of a level are darker than the knee. Thus the scene changed little.
+- The UI text and the menus are near SDR white. The expansion moved SDR white to the peak of the screen. Thus the UI became 2.67 times brighter.
+
+### Scene and UI
+
+- Measured in a level: after the 3D scene, the game makes its own post-processing in other render targets. Then it copies the result to the back buffer with one full-screen draw (no depth test, no blending). After that, the game draws the HUD, the text and the menus with alpha blending and with no depth test.
+- The runtime (`d3d9_metal.m`, `tm_note`) now records each draw into the back buffer:
+  - A draw with no depth test and with alpha blending is a UI draw.
+  - Each other draw is a scene draw.
+- At each change from scene draws to UI draws, the runtime copies the back buffer (`tm_ref`). A frame has a maximum of 4 copies.
+  - Measured: 1 copy for each frame in a level. 2 copies for each frame during approximately 11 s near the start of the level. Menu frames have no scene draws and no copy.
+- The presentation shader (`present_enh_fs`) gets the final image and the scene copy.
+  - A pixel that the UI did not change gets the scene curve.
+  - A pixel that the UI changed: final × paper white + (scene curve − scene × paper white) × min(Y final / Y scene, 1). Thus a fade keeps the curve in proportion, and the light of the UI stays at paper white.
+  - A frame with no scene draw (a menu) stays at paper white. It gets no expansion and no GT7 tone mapping.
+- GT7 tone mapping in SDR output uses the same scene copy. Thus GT7 no longer changes the UI.
+
+### Units of HDR output
+
+- macOS gives the brightness of the screen only as EDR headroom. EDR headroom is a factor of the current SDR white. macOS does not give a value in nits.
+- The runtime takes the peak of the screen as 100 nits × the potential EDR headroom. This is an estimate. It agrees with a Liquid Retina XDR display: potential headroom 16, HDR peak 1600 nits.
+- The test Mac: EDR headroom 2.67, potential headroom 16. Thus SDR white is approximately 600 nits, and the peak is approximately 1600 nits.
+- The peak in EDR units = peak in nits × current headroom / (100 × potential headroom). macOS clips values above the current headroom.
+
+### HDR Calibration menu
+
+- **Options > HDR Calibration** (main menu and pause menu), after Enhancements.
+- A link in the Enhancements menu did not open its menu: in a menu of the SOUNDOPTIONS kind, Return goes back to OPTIONS. This was also true for a link to SOUNDOPTIONS. Thus the link is in OPTIONS and INGAMEOPTIONS.
+- Settings (Enhancements.cfg keys `hdr_peak` and `hdr_paper_white`):
+
+| Setting | Values | Default |
+|---|---|---|
+| Peak (symbol barely visible) | 400, 600, 800, 1000, 1200, 1400, 1600, 2000, 3000, 4000 nits | 1000 nits |
+| Paper White | 50%, 75%, 100%, 125%, 150%, 200% of SDR white | 100% |
+
+- While the menu is on the screen (the menu manager at 0x6c8560, field +0x30), the runtime draws a test image from 0.6 to 0.84 of the screen height:
+  - Left: a square at 64 × SDR white, which macOS clips to the peak of the screen. A ring and a dot in the square are at the selected peak. The symbol disappears when the selected peak is equal to or more than the peak of the screen.
+  - Right: a bar at paper white (the UI), and below it ten steps of the game's gray scale (sRGB 0.1 to 1.0) through the scene curve.
+- The test image shows only with HDR output on.
+
+### Verification
+
+- `make app` built the app with only the two `key_frame` warnings.
+- Headless runs with `MTL_DEBUG_LAYER=1` had no Metal validation error: the main menu, the HDR Calibration menu, and a level with ambient occlusion, contact shadows, bloom, GT7 tone mapping and HDR output.
+- In the HDR Calibration menu, Right and Left changed the peak (1000, 1200, 1400 nits) and paper white (100%, 125%). Each change was saved to Enhancements.cfg, and the runtime used the new values in the next frame (log: "HDR output: peak 1200 nits (2.00 x SDR white)").
+- The log showed "the HDR Calibration menu is on the screen" when the menu opened, and "off the screen" after Escape.
+- Not verified: the image on the screen (screenshots are not permitted). The layout of the OPTIONS menu with one more row and the position of the test image are not verified on the screen.
