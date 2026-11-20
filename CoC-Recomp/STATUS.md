@@ -332,3 +332,36 @@ The game has no in-game HUD. In a level, the game draws only the scene and, duri
 - The image on screen: the strength of ambient occlusion and contact shadows, and the HDR colors. The test runs did not capture or examine images.
 - Full screen and the pause. Headless runs do not change the window and do not pause. The code was examined.
 - The look direction in a level after the change of byte 0x35. The game reads the value at start; no input test in the level examined the look direction.
+
+## 2026-11-20: Menu layout, Subtitle Size in Video, ambient occlusion strength, HDR colors
+
+### Menus
+
+- The Enhancements menu has 7 settings: Ambient Occlusion, GT7 Tone Mapping, HDR Output, Contact Shadows, Bloom, Sharp Character Shadows (restart) and Skip Intro Videos.
+- Cause of the bad position: the game gives each menu a rectangle (parts of the screen). The Enhancements menu used the rectangle of the game's short menus, (0.28, 0.33, 0.72, 0.73). The rows have a fixed spacing, so the 11 rows went below the rectangle and the long labels went into the value column.
+- `enhance.c` (`menu_rects`) now gives the menu a rectangle from 0.15 to 0.85 of the screen width. The height is calculated for the rows and the Back row, and the title and the rows are centered on the screen. The row spacing (0.0545) and the space above and below the rows (0.035) are measured on the game's menus.
+- Reduced banding and the gamepad are always on. They are not in the menu or in `Enhancements.cfg`. The loader skips the old keys `reduced_banding` and `gamepad`, and the next save removes them.
+- Subtitle Size is in Options > Video (`VIDEOOPTIONS`), after the game's own setting. The patch at 0x412101 adds it.
+
+### Ambient occlusion
+
+- Cause: the passes ran too early in some scenes. The game removes its scene depth buffer and binds it again during the scene. A change of the depth buffer ended the scene, so the passes ran after 1 of approximately 700 scene draws and the later draws covered the result.
+- Now only the removal or the replacement of the depth buffer that the scene uses ends the scene. Binding a depth buffer where there was none does not end it. After the change, the passes ran after all scene draws (for example 500 before, 4 after).
+- The XeGTAO default strength was too weak for this game: the mean visibility of a level frame on High was 0.94 to 0.985. The levels now change the strength: effect radius 0.8, 1.2 and 1.6 m, final value power 2.4, 3.0 and 3.6. On High the mean visibility is now 0.86 to 0.89 in most level frames, and 15 to 20% of the pixels are darker by 30% or more (measured on the AO texture).
+
+### HDR
+
+- Cause of the low saturation: the SDR layer has no color space, so macOS shows the game's colors with the primaries of the screen (Display P3 on the test Mac). The EDR layer used extended linear sRGB, so macOS changed the colors to the smaller sRGB gamut.
+- The EDR layer now uses the extended linear form of the screen's color space. The log of the test run shows `kCGColorSpaceDisplayP3`.
+- The expansion knee for HDR output is now 0.25 of SDR white (sRGB 0.54). With the knee at 0.6, only values above sRGB 0.85 changed. Calculated for a gray with GT7 tone mapping and an EDR headroom of 2.67: sRGB 0.75 gives 0.68 x SDR white (0.52 before), sRGB 0.85 gives 1.32 x (0.72 before), sRGB 0.95 gives the peak 2.67 x (1.60 before). SDR output with tone mapping keeps the knee at 0.6.
+
+### Verified
+
+- `make gen` and `make app` built the app. The only warnings are the two `key_frame` deprecation warnings in `wmvcore.c`.
+- Headless runs with keys from `RT_INPUT`: Options > Video > Subtitle Size changed from 1.75x to 2x and the game saved it. Options > Enhancements showed the new menu; Ambient Occlusion and Contact Shadows changed and the game saved them.
+- The menu log shows 7 settings in ENHANCEDOPTIONS and Subtitle Size in VIDEOOPTIONS. An old settings file with `gamepad` and `reduced_banding` loaded with no message.
+- In a level run with `MTL_DEBUG_LAYER=1`, the Metal validation layer reported no error. The log shows XeGTAO, the contact shadows, the bloom, the 16-bit render targets and HDR output with the Display P3 color space.
+
+### Not verified
+
+- The image on screen: the menu position, the strength of the ambient occlusion and the HDR colors. The test runs did not capture or examine images.

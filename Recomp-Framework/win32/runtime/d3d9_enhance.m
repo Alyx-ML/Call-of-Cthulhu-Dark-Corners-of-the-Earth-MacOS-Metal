@@ -54,7 +54,7 @@
 // P33 not zero (orthographic) gives no pass for the frame.
 //
 // Units. The game's near plane is 8 units and its scenes measure thousands of units, so one unit is taken as one
-// centimeter (UNCONFIRMED). The XeGTAO effect radius 0.5 m is 50 units (with the XeGTAO radius multiplier 1.457).
+// centimeter (UNCONFIRMED). The XeGTAO effect radius is in meters (with the XeGTAO radius multiplier 1.457).
 //
 // Bloom: the dual filter of Marius Bjorge ("Bandwidth-Efficient Rendering", SIGGRAPH 2015), from the project's
 // "Graphic Enhancements" folder (rt_d3d9_bloom.m), adapted to this renderer. The game's own glow (a quarter-size
@@ -66,9 +66,11 @@
 // intensity (low 0.35, medium 0.7, high 1.2) to the scene in linear light. The levels are RGBA16Float. The threshold
 // and the intensities are UNCONFIRMED tuning.
 //
-// Settings: XeGTAO falloff range 0.615, sample distribution power 2, final value power 2.2, depth mip offset 3.30,
-// denoise beta 1.2, slices x steps low 1 x 2, medium 2 x 2, high 3 x 3. Bend: 60 samples, 4 hard samples, 8 fade
-// samples, surface thickness 0.005, bilinear threshold 0.02, contrast 4. The game has no separate light term, so
+// Settings: XeGTAO falloff range 0.615, sample distribution power 2, depth mip offset 3.30, denoise beta 1.2. The
+// levels low, medium and high use 1 x 2, 2 x 2 and 3 x 3 slices x steps, an effect radius of 0.8, 1.2 and 1.6 m
+// and a final value power of 2.4, 3.0 and 3.6. With the XeGTAO defaults (0.5 m, power 2.2) the mean visibility of
+// a level frame was 0.94 to 0.985; with high it is 0.86 to 0.89 in most level frames (measured on the AO texture).
+// Bend: 60 samples, 4 hard samples, 8 fade samples, surface thickness 0.005, bilinear threshold 0.02, contrast 4. The game has no separate light term, so
 // the contact shadow removes CONTACT_STRENGTH of the color (UNCONFIRMED tuning).
 #import <Metal/Metal.h>
 #include "rt32.h"
@@ -435,6 +437,8 @@ typedef struct { int32_t count[3]; int32_t offset[2]; } SssDispatch;
 typedef struct { float px[2]; float threshold, knee, scale, pad0, pad1, pad2; } BP;
 
 static const uint32_t ao_slices[4] = {0, 1, 2, 3}, ao_steps[4] = {0, 2, 2, 3};
+// the strength of each level: the effect radius in meters and the XeGTAO final value power
+static const float ao_radius[4] = {0.0f, 0.8f, 1.2f, 1.6f}, ao_power[4] = {0.0f, 2.4f, 3.0f, 3.6f};
 #define BLOOM_LEVELS 6
 static const float bloom_intensity[4] = {0.0f, 0.35f, 0.7f, 1.2f};
 
@@ -613,7 +617,7 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
             c.mulx = 2.0f / P[0]; c.muly = -2.0f / P[5]; c.addx = -1.0f / P[0]; c.addy = 1.0f / P[5];
             c.mpx = c.mulx * c.px; c.mpy = c.muly * c.py;
             c.da = da; c.db = db;
-            c.radius = 0.5f * UNIT_SCALE * 1.457f; c.falloff = 0.615f; c.power = 2.2f; c.mipoff = 3.30f; c.beta = 1.2f;
+            c.radius = ao_radius[ao] * UNIT_SCALE * 1.457f; c.falloff = 0.615f; c.power = ao_power[ao]; c.mipoff = 3.30f; c.beta = 1.2f;
             if (!E.logged_ao) { rt_log("[d3d9] XeGTAO ambient occlusion %lux%lu: %u slices x %u steps", (unsigned long)w, (unsigned long)h, ao_slices[ao], ao_steps[ao]); E.logged_ao = 1; }
             [ce setBytes:&c length:sizeof c atIndex:0];
             [ce setTexture:depth atIndex:0];

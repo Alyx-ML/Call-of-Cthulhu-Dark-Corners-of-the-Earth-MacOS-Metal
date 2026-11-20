@@ -3,14 +3,16 @@
 // The settings live in guest memory (RtEnh), so that controls of the game's menu system write them directly. The
 // game's menu builder (CoCMenuBuilder.cpp) gets a menu "ENHANCEDOPTIONS", made with the same calls as its
 // "SOUNDOPTIONS" menu, and the menus "OPTIONS" (main menu) and "INGAMEOPTIONS" (pause menu) get a link to it after
-// their Sound link. The text of the new menu has string IDs from TXT_BASE; the game's string lookup
-// (0x4b3db0, CoCStringManager) gives this file's text for them. patches.txt has the hook points: the four menu
-// hooks, the intro videos (0x4b235c) and the subtitle size (0x4c43fa, 0x4c44d4).
+// their Sound link. The game's "VIDEOOPTIONS" menu gets the Subtitle Size setting after its own setting. The text
+// of these controls has string IDs from TXT_BASE; the game's string lookup (0x4b3db0, CoCStringManager) gives this
+// file's text for them. patches.txt has the hook points: the five menu hooks, the intro videos (0x4b235c) and the
+// subtitle size (0x4c43fa, 0x4c44d4).
 //
 // The settings are saved to Enhancements.cfg in the data folder (key=value lines) when a value changes.
 // Anisotropic filtering is always 16x and is not in the menu (the file can set another value).
-// Defaults: ambient occlusion, tone mapping, HDR, contact shadows, bloom, reduced banding,
-// sharp character shadows and skip intro videos off; subtitles at the game's size; gamepad on.
+// Reduced banding and the gamepad are always on and are not in the menu or the file.
+// Defaults: ambient occlusion, tone mapping, HDR, contact shadows, bloom, sharp character shadows and skip intro
+// videos off; subtitles at the game's size.
 #include "rt32.h"
 #include "rt_enh.h"
 #include <errno.h>
@@ -31,8 +33,8 @@ extern void (*rt_dinput_poll_hook)(void);   // dinput8.c
 #define G_MENU_416270    0x416270u
 #define G_MENU_SOUND     0x416190u   // thiscall (which, sound id, "")
 #define G_MENU_4163F0    0x4163f0u
-#define G_MENU_416400    0x416400u
-#define G_MENU_416440    0x416440u
+#define G_MENU_RECT      0x416400u   // thiscall (float[4] *): the rectangle of the rows (copied)
+#define G_MENU_TITLE_RECT 0x416440u  // thiscall (float[4] *): the rectangle of the title (copied)
 #define G_MENU_416470    0x416470u
 #define G_MENU_416220    0x416220u
 #define G_MENU_ADD       0x417910u   // thiscall (control type name) -> control
@@ -55,13 +57,13 @@ extern void (*rt_dinput_poll_hook)(void);   // dinput8.c
 // ---- text ----
 #define TXT_BASE 0xE000u
 enum { T_TITLE, T_GAME, T_2X, T_AO, T_OFF, T_LOW, T_MEDIUM, T_HIGH, T_ON,
-       T_TONEMAP, T_HDR, T_CONTACT, T_PAD, T_SKIP, T_BLOOM, T_BANDING, T_SHADOWS, T_SUBS, T_125, T_150, T_175,
+       T_TONEMAP, T_HDR, T_CONTACT, T_SKIP, T_BLOOM, T_SHADOWS, T_SUBS, T_125, T_150, T_175,
        T_COUNT };
 static const char *const txt[T_COUNT] = {
     [T_TITLE] = "Enhancements", [T_GAME] = "Game", [T_2X] = "2x", [T_AO] = "Ambient Occlusion", [T_OFF] = "Off", [T_LOW] = "Low",
     [T_MEDIUM] = "Medium", [T_HIGH] = "High", [T_ON] = "On", [T_TONEMAP] = "GT7 Tone Mapping", [T_HDR] = "HDR Output",
-    [T_CONTACT] = "Contact Shadows", [T_PAD] = "Gamepad (SDL3)", [T_SKIP] = "Skip Intro Videos", [T_BLOOM] = "Bloom",
-    [T_BANDING] = "Reduced Banding (restart)", [T_SHADOWS] = "Sharp Character Shadows (restart)",
+    [T_CONTACT] = "Contact Shadows", [T_SKIP] = "Skip Intro Videos", [T_BLOOM] = "Bloom",
+    [T_SHADOWS] = "Sharp Character Shadows (restart)",
     [T_SUBS] = "Subtitle Size", [T_125] = "1.25x", [T_150] = "1.5x", [T_175] = "1.75x",
 };
 static uint32_t txt_guest[T_COUNT];
@@ -86,14 +88,14 @@ static const struct { const char *key; size_t off; int32_t max; int32_t def; } k
     {"tone_mapping", offsetof(RtEnh, tonemap), 1, 0},
     {"hdr", offsetof(RtEnh, hdr), 1, 0},
     {"contact_shadows", offsetof(RtEnh, contact), 1, 0},
-    {"gamepad", offsetof(RtEnh, pad), 1, 1},
     {"skip_intro", offsetof(RtEnh, skip_intro), 1, 0},
     {"bloom", offsetof(RtEnh, bloom), 3, 0},
-    {"reduced_banding", offsetof(RtEnh, banding), 1, 0},
     {"sharp_character_shadows", offsetof(RtEnh, shadows), 1, 0},
     {"subtitle_size", offsetof(RtEnh, sub_scale), 4, 0},
 };
-enum { K_ANISO, K_AO, K_TONEMAP, K_HDR, K_CONTACT, K_PAD, K_SKIP, K_BLOOM, K_BANDING, K_SHADOWS, K_SUBS };
+enum { K_ANISO, K_AO, K_TONEMAP, K_HDR, K_CONTACT, K_SKIP, K_BLOOM, K_SHADOWS, K_SUBS };
+// keys of earlier versions whose settings are now always on: the loader skips them, the next save leaves them out
+static const char *const retired_keys[] = {"gamepad", "reduced_banding"};
 #define NKEYS (sizeof keys / sizeof keys[0])
 static int32_t *field(RtEnh *e, size_t i) { return (int32_t *)((char *)e + keys[i].off); }
 static void cfg_path(char *p, size_t n) { snprintf(p, n, "%s/Enhancements.cfg", rt_data_dir); }
@@ -109,13 +111,14 @@ static void cfg_save(void) {
     bad |= fclose(f) != 0;
     if (bad || rename(tmp, p) != 0) { rt_log("[enh] can't write %s: %s; the settings are not saved", p, strerror(errno)); remove(tmp); return; }
     saved = *rt_enh;
-    if (rt_verbose) rt_log("[enh] settings saved: aniso %d, ao %d, tonemap %d, hdr %d, contact %d, pad %d, skip_intro %d, "
-                           "bloom %d, banding %d, shadows %d, subtitle size %d", rt_enh->aniso, rt_enh->ao, rt_enh->tonemap,
-                           rt_enh->hdr, rt_enh->contact, rt_enh->pad, rt_enh->skip_intro, rt_enh->bloom, rt_enh->banding,
-                           rt_enh->shadows, rt_enh->sub_scale);
+    if (rt_verbose) rt_log("[enh] settings saved: aniso %d, ao %d, tonemap %d, hdr %d, contact %d, skip_intro %d, "
+                           "bloom %d, shadows %d, subtitle size %d", rt_enh->aniso, rt_enh->ao, rt_enh->tonemap,
+                           rt_enh->hdr, rt_enh->contact, rt_enh->skip_intro, rt_enh->bloom, rt_enh->shadows, rt_enh->sub_scale);
 }
 static void cfg_load(void) {
     for (size_t i = 0; i < NKEYS; i++) *field(rt_enh, i) = keys[i].def;
+    rt_enh->banding = 1;                 // reduced banding: always on
+    rt_enh->pad = 1;                     // gamepad input (SDL3): always on
     char p[1200];
     cfg_path(p, sizeof p);
     FILE *f = fopen(p, "r");
@@ -130,8 +133,11 @@ static void cfg_load(void) {
         char *s = line; while (*s == ' ' || *s == '\t') s++;
         if (*s == '#' || *s == '\n' || *s == '\r' || !*s) continue;
         char *eq = strchr(s, '=');
-        size_t i = NKEYS;
+        size_t i = NKEYS, r;
         if (eq) for (i = 0; i < NKEYS; i++) if ((size_t)(eq - s) == strlen(keys[i].key) && !strncmp(s, keys[i].key, (size_t)(eq - s))) break;
+        for (r = 0; eq && i == NKEYS && r < sizeof retired_keys / sizeof retired_keys[0]; r++)
+            if ((size_t)(eq - s) == strlen(retired_keys[r]) && !strncmp(s, retired_keys[r], (size_t)(eq - s))) break;
+        if (eq && i == NKEYS && r < sizeof retired_keys / sizeof retired_keys[0]) continue;
         char *end = NULL;
         long v = eq ? strtol(eq + 1, &end, 10) : -1;
         if (i == NKEYS || !end || end == eq + 1 || (*end && *end != '\n' && *end != '\r') || v < 0 || v > keys[i].max) {
@@ -176,10 +182,10 @@ void coc_enh_init(void) {
     rt_dinput_poll_hook = input_frame;
     static const char *const lvl[] = {"off", "low", "medium", "high"}, *const sub[] = {"game", "1.25x", "1.5x", "1.75x", "2x"};
     rt_log("[enh] settings: anisotropic filtering %s, ambient occlusion %s, GT7 tone mapping %s, HDR %s, contact shadows %s, "
-           "bloom %s, reduced banding %s, sharp character shadows %s, subtitle size %s, skip intro videos %s, gamepad %s",
+           "bloom %s, sharp character shadows %s, subtitle size %s, skip intro videos %s",
            (const char *[]){"game", "2x", "4x", "8x", "16x"}[rt_enh->aniso], lvl[rt_enh->ao], rt_enh->tonemap ? "on" : "off",
-           rt_enh->hdr ? "on" : "off", rt_enh->contact ? "on" : "off", lvl[rt_enh->bloom], rt_enh->banding ? "on" : "off",
-           rt_enh->shadows ? "on" : "off", sub[rt_enh->sub_scale], rt_enh->skip_intro ? "on" : "off", rt_enh->pad ? "on" : "off");
+           rt_enh->hdr ? "on" : "off", rt_enh->contact ? "on" : "off", lvl[rt_enh->bloom],
+           rt_enh->shadows ? "on" : "off", sub[rt_enh->sub_scale], rt_enh->skip_intro ? "on" : "off");
 }
 
 // ---- the menus ----
@@ -235,7 +241,7 @@ void coc_enh_add_link(CPU *c, uint32_t menu) {
     CALL(G_CTL_LINK, ctl, 1, name_guest(), 0);
 }
 
-static int menu_controls;               // the settings in the Enhancements menu
+#define ENH_SETTINGS 7                   // the settings in the Enhancements menu (coc_enh_build_menu)
 static void add_enum(CPU *c, uint32_t menu, int label, const int *values, int nvalues, size_t key) {
     uint32_t ctl = CALL(G_MENU_ADD, menu, S_TEXTOPTIONENUM);
     if (!ctl) rt_fatal("[enh] the menu system did not add an Enhancements control");
@@ -244,7 +250,33 @@ static void add_enum(CPU *c, uint32_t menu, int label, const int *values, int nv
     if (nvalues != keys[key].max + 1) rt_fatal("[enh] control %s has %d values for the range 0..%d", keys[key].key, nvalues, keys[key].max);
     CALL(G_ENUM_BIND, ctl, enh_guest + (uint32_t)keys[key].off);
     CALL(G_CTL_LAYOUT, ctl, 0xFFFFFFFFu, 0xFFFFFFFEu, 0xFFFFFFFEu);
-    menu_controls++;
+}
+
+// patch at 0x412101 (the VIDEOOPTIONS builder, after its one setting): the Subtitle Size setting
+void coc_enh_add_video(CPU *c, uint32_t menu) {
+    add_enum(c, menu, T_SUBS, (const int[]){T_GAME, T_125, T_150, T_175, T_2X}, 5, K_SUBS);
+    rt_log("[enh] Subtitle Size added to the menu VIDEOOPTIONS");
+}
+
+// The menu rectangles, as parts of the screen (left, top, right, bottom). The game's menus of this kind use
+// (0.28, 0.33, 0.72, 0.73) for the rows and (0.28, 0.25, 0.72, 0.32) for the title; the rows have a fixed spacing
+// and go below the rectangle when there are more than 7. The rectangles here are sized for the rows and centered
+// on the screen. The row spacing (0.0545) and the space above the first row and below the last row (0.035) are
+// measured on the game's menus; the title height (0.07) and the gap below it (0.01) are those of the game.
+#define ROW_SPACING 0.0545f
+#define ROW_PAD     0.035f
+#define TITLE_H     0.07f
+#define TITLE_GAP   0.01f
+static void menu_rects(CPU *c, uint32_t menu, int rows) {
+    float rh = 2.0f * ROW_PAD + ROW_SPACING * (float)rows, top = 0.5f - (TITLE_H + TITLE_GAP + rh) / 2.0f;
+    const float r[8] = {0.15f, top + TITLE_H + TITLE_GAP, 0.85f, top + TITLE_H + TITLE_GAP + rh,   // the rows
+                        0.15f, top, 0.85f, top + TITLE_H};                                        // the title
+    uint32_t g = gcalloc(1, sizeof r);
+    if (!g) rt_fatal("[enh] out of guest memory for the menu rectangles");
+    memcpy(G2H(g), r, sizeof r);
+    CALL(G_MENU_RECT, menu, g);
+    CALL(G_MENU_TITLE_RECT, menu, g + 16);
+    gfree(g);
 }
 
 // patch at 0x4123f1 (the end of the SOUNDOPTIONS builder): the Enhancements menu, built like SOUNDOPTIONS
@@ -267,8 +299,7 @@ void coc_enh_build_menu(CPU *c) {
     CALL(G_MENU_SOUND, menu, 0, 0x16, S_EMPTY);
     CALL(G_MENU_SOUND, menu, 1, 0x17, S_EMPTY);
     CALL(G_MENU_4163F0, menu, 9);
-    CALL(G_MENU_416400, menu, 0x6b680c);
-    CALL(G_MENU_416440, menu, 0x6b67fc);
+    menu_rects(c, menu, ENH_SETTINGS + 1);   // the settings and the Back row
     CALL(G_MENU_416470, menu, 0);
     CALL(G_MENU_416220, menu, 0, 1);
     gfree(col);
@@ -277,14 +308,11 @@ void coc_enh_build_menu(CPU *c) {
     add_enum(c, menu, T_HDR, (const int[]){T_OFF, T_ON}, 2, K_HDR);
     add_enum(c, menu, T_CONTACT, (const int[]){T_OFF, T_ON}, 2, K_CONTACT);
     add_enum(c, menu, T_BLOOM, (const int[]){T_OFF, T_LOW, T_MEDIUM, T_HIGH}, 4, K_BLOOM);
-    add_enum(c, menu, T_BANDING, (const int[]){T_OFF, T_ON}, 2, K_BANDING);
     add_enum(c, menu, T_SHADOWS, (const int[]){T_OFF, T_ON}, 2, K_SHADOWS);
-    add_enum(c, menu, T_SUBS, (const int[]){T_GAME, T_125, T_150, T_175, T_2X}, 5, K_SUBS);
     add_enum(c, menu, T_SKIP, (const int[]){T_OFF, T_ON}, 2, K_SKIP);
-    add_enum(c, menu, T_PAD, (const int[]){T_OFF, T_ON}, 2, K_PAD);
     CALL0(G_MENU_FINISH, menu);
     uint32_t mgr = CALL0(G_MENU_MANAGER, 0);
     if (!mgr) rt_fatal("[enh] the menu manager is missing");
     CALL(G_MENU_REGISTER, mgr, name_guest(), menu);
-    rt_log("[enh] menu ENHANCEDOPTIONS registered (%d settings)", menu_controls);
+    rt_log("[enh] menu ENHANCEDOPTIONS registered (%d settings)", ENH_SETTINGS);
 }

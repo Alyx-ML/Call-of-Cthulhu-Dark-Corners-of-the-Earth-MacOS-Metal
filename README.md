@@ -83,19 +83,20 @@ The game has a menu **Options > Enhancements**. The menu also shows in the pause
 | HDR Output | Off, On |
 | Contact Shadows | Off, On |
 | Bloom | Off, Low, Medium, High |
-| Reduced Banding (restart) | Off, On |
 | Sharp Character Shadows (restart) | Off, On |
-| Subtitle Size | Game, 1.25x, 1.5x, 1.75x, 2x |
 | Skip Intro Videos | Off, On |
-| Gamepad (SDL3) | Off, On |
 
-Texture filtering is 16x anisotropic. HDR Output needs a display with HDR (EDR) support.
+**Options > Video** has the setting **Subtitle Size** (Game, 1.25x, 1.5x, 1.75x, 2x).
+
+These items are always on: 16x anisotropic texture filtering, reduced color banding and game controller support (SDL3).
+
+HDR Output needs a display with HDR (EDR) support.
 
 ## Mac features
 
 - **Full screen:** use **View > Enter Full Screen** (Control-Command-F) or the green window button. The image keeps its aspect ratio.
 - **Pause in the background:** when you switch to a different app, the game stops and the sound stops. The game continues when you go back.
-- **Game controllers:** controllers that macOS and SDL3 support work through the Gamepad (SDL3) setting.
+- **Game controllers:** controllers that macOS and SDL3 support work.
 
 ## Troubleshooting
 

@@ -322,30 +322,42 @@ void rt_cocoa_full_screen(uint32_t hwnd, int on) {
     });
 }
 
-// HDR output (rt_enh.h): on = 1 makes the layer an extended dynamic range (EDR) layer (RGBA16Float, extended linear
-// sRGB, 1.0 = SDR white); on = 0 gives the SDR layer of makeBackingLayer back. The change is made on the main thread,
-// so the game sees it in the pixel format of a later drawable. Each call also refreshes the EDR headroom of the
-// window's screen (rt_cocoa_edr_headroom).
+// HDR output (rt_enh.h): on = 1 makes the layer an extended dynamic range (EDR) layer (RGBA16Float, 1.0 = SDR
+// white); on = 0 gives the SDR layer of makeBackingLayer back. The EDR color space is the extended linear form of
+// the screen's own color space. The SDR layer has no color space (Core Animation does no color matching), so the
+// game's colors use the primaries of the screen; with the screen's primaries the EDR layer shows the same colors.
+// The change is made on the main thread, so the game sees it in the pixel format of a later drawable. Each call also
+// refreshes the EDR headroom and the EDR color space of the window's screen (rt_cocoa_edr_headroom).
 static float edr_headroom = 1.0f;
 void rt_cocoa_layer_edr(void *layer_ref, int on, int refresh_only) {
     CAMetalLayer *l = (__bridge CAMetalLayer *)layer_ref;
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (!refresh_only) {
-            if (on) {
-                CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearSRGB);
-                if (!cs) rt_fatal("[cocoa] the extended linear sRGB color space is not available");
-                l.wantsExtendedDynamicRangeContent = YES;
-                l.pixelFormat = MTLPixelFormatRGBA16Float;
-                l.colorspace = cs;
-                CGColorSpaceRelease(cs);
-            } else {
-                l.wantsExtendedDynamicRangeContent = NO;
-                l.pixelFormat = MTLPixelFormatBGRA8Unorm;
-                l.colorspace = NULL;
-            }
-        }
         id dl = l.delegate;
         NSScreen *sc = [dl isKindOfClass:[NSView class]] ? ((NSView *)dl).window.screen : nil;
+        if (!refresh_only && !on) {
+            l.wantsExtendedDynamicRangeContent = NO;
+            l.pixelFormat = MTLPixelFormatBGRA8Unorm;
+            l.colorspace = NULL;
+        } else if (!refresh_only || l.wantsExtendedDynamicRangeContent) {
+            // a window on no screen (a headless run) takes the main screen's color space
+            NSScreen *cs_screen = sc ? sc : NSScreen.mainScreen;
+            CGColorSpaceRef base = cs_screen.colorSpace.CGColorSpace;
+            CGColorSpaceRef cs = base ? CGColorSpaceCreateExtendedLinearized(base) : NULL;
+            if (!cs) rt_fatal("[cocoa] the screen has no color space with an extended linear form; HDR output is not possible");
+            if (!refresh_only) {
+                l.wantsExtendedDynamicRangeContent = YES;
+                l.pixelFormat = MTLPixelFormatRGBA16Float;
+            }
+            if (!l.colorspace || !CFEqual(l.colorspace, cs)) {
+                l.colorspace = cs;
+                if (rt_verbose) {
+                    CFStringRef n = CGColorSpaceCopyName(base);
+                    rt_log("[cocoa] EDR layer color space: the extended linear form of %s", n ? CFStringGetCStringPtr(n, kCFStringEncodingUTF8) ?: "(a name that is not UTF-8)" : "(no name)");
+                    if (n) CFRelease(n);
+                }
+            }
+            CGColorSpaceRelease(cs);
+        }
         float h = sc ? (float)sc.maximumExtendedDynamicRangeColorComponentValue : 1.0f;
         __atomic_store(&edr_headroom, &h, __ATOMIC_RELAXED);
     });

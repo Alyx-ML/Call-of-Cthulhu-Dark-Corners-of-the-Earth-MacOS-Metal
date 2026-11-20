@@ -1767,7 +1767,7 @@ static const char util_msl[] =
     "  float cs = 1.0 - smoothstep(k.fade0, k.fade1, u.x / k.target_i);\n"
     "  float3 sc = ucs_to_rgb(float3(su.x, u.y * cs, u.z * cs));\n"
     "  return min((1.0 - k.blend) * sk + k.blend * sc, float3(k.target)); }\n"
-    // mode: 1 GT7 tone mapping, 2 the drawable is an EDR layer (extended linear sRGB), 8 HDR output
+    // mode: 1 GT7 tone mapping, 2 the drawable is an EDR layer (extended linear, the screen's primaries), 8 HDR output
     "fragment float4 present_enh_fs(QV in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]],\n"
     "                               constant float4 *ramp [[buffer(0)]], constant uint &gamma [[buffer(1)]],\n"
     "                               constant TM &k [[buffer(2)]]) {\n"
@@ -1783,11 +1783,13 @@ static const char util_msl[] =
     "  if ((k.mode & 9u) != 0u) {\n"
     // the game's image is SDR: its highlights get back a range above SDR white. The expansion acts on luminance and
     // scales the three channels by the same factor, so the hue and the saturation stay those of the game. Below the
-    // knee (0.6 of SDR white) the luminance does not change; above it an inverse Reinhard curve with slope 1 at the
-    // knee expands it (SDR white becomes 8.2 times SDR white, which the tone mapping then fits to the display)
+    // knee the luminance does not change; above it an inverse Reinhard curve with slope 1 at the knee expands it, to
+    // 1 + 19 x (1 - knee) times SDR white at SDR white, which the tone mapping then fits to the display. The knee is
+    // 0.25 of SDR white for HDR output (linear 0.25 is sRGB 0.54) and 0.6 for SDR output with tone mapping
+    "    float knee = (k.mode & 8u) != 0u ? 0.25 : 0.6;\n"
     "    float Y = dot(l, float3(0.2126, 0.7152, 0.0722));\n"
-    "    float t = min(max(Y - 0.6, 0.0) / 0.4, 0.95);\n"
-    "    float Ye = Y <= 0.6 ? Y : 0.6 + 0.4 * t / (1.0 - t);\n"
+    "    float t = min(max(Y - knee, 0.0) / (1.0 - knee), 0.95);\n"
+    "    float Ye = Y <= knee ? Y : knee + (1.0 - knee) * t / (1.0 - t);\n"
     "    float3 x = l * (Y > 1e-6 ? Ye / Y : 1.0) * k.paper;\n"
     "    x = float3(0.6274040 * x.r + 0.3292820 * x.g + 0.0433136 * x.b, 0.0690970 * x.r + 0.9195400 * x.g + 0.0113612 * x.b,\n"
     "               0.0163916 * x.r + 0.0880132 * x.g + 0.8955950 * x.b);\n"
@@ -3543,7 +3545,9 @@ METHOD(dev_GetRenderTarget) {
 METHOD(dev_SetDepthStencilSurface) {
     DEVICE; Surf *s = M(1) ? surf_of(M(1)) : NULL;
     if (M(1) && (!s || !s->tex->f->kind)) return D3DERR_INVALIDCALL;
-    if (s != d->ds && d->rt[0] && d->rt[0]->swap) enh_apply(d);
+    // the scene ends when its depth buffer is replaced or removed while the back buffer is the target; binding a
+    // depth buffer where there was none does not end it (the game binds its scene depth buffer again during the scene)
+    if (s != d->ds && d->rt[0] && d->rt[0]->swap && d->ds && d->ds->tex->mtl == d->enh_depth) enh_apply(d);
     targets_changing(d);
     REBIND(d->ds, s);
     mark_dirty(d);

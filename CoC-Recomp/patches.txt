@@ -15,3 +15,5 @@
 4c43fa { extern uint32_t coc_enh_sub_height(uint32_t); R_edx = coc_enh_sub_height(rd32((uint32_t)(R_eax + 0x618u))); }
 # 0x4c44d4 (cmp byte [esi+0x998], 0): a subtitle shows (esi: CoCSubtitles); after a Subtitle Size change the layout runs again
 4c44d4 { C.eax = R_eax; C.ecx = R_ecx; C.esp = R_esp; C.esi = R_esi; C.edi = R_edi; extern void coc_enh_sub_show(CPU *, uint32_t); coc_enh_sub_show(c, R_esi); } { uint8_t a = rd8((uint32_t)(R_esi + 0x998u)), b = (uint8_t)0x0u, r; r = (uint8_t)(a - b); cf = a < b; of = (((a ^ b) & (a ^ r)) >> 7) & 1; zf = ((r) & 0xFFu) == 0; sf = ((r) >> 7) & 1; pr = (uint8_t)(r); }
+# 0x412101 (mov ecx, esi): the VIDEOOPTIONS menu (esi) after its one setting: the Subtitle Size setting
+412101 { C.eax = R_eax; C.ecx = R_ecx; C.esp = R_esp; C.esi = R_esi; C.edi = R_edi; extern void coc_enh_add_video(CPU *, uint32_t); coc_enh_add_video(c, R_esi); } R_ecx = (uint32_t)(R_esi);
