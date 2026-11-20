@@ -1758,10 +1758,13 @@ static const char util_msl[] =
     "  return float4(c, 1.0); }\n"
     // enhanced presentation (rt_enh.h): HDR expansion and GT7 tone mapping. The GT7 functions are a port of
     // gt7_tone_mapping.cpp v1.0 (Polyphony Digital Inc., MIT License; the notice is at present_tm_consts).
-    // Units: 1.0 = SDR white, the EDR unit of macOS. k.paper is paper white and k.target the peak in these units (both
-    // 1 for SDR output; present_tm_consts).
-    // rel: the peak of the expansion as a factor of paper white (1 or more); w, h: the size of the drawable in pixels
-    "struct TM { uint mode; float paper, target, target_i; float kA, kB, kC, mid; float lin, toe, blend, fade0; float fade1, rel, w, h; };\n"
+    // Units of the output: 1.0 = SDR white, the EDR unit of macOS. k.paper is paper white and k.target the peak in these
+    // units (both 1 for SDR output; present_tm_consts). rel: the peak of the expansion as a factor of paper white (1 or
+    // more); w, h: the size of the drawable in pixels. GT7: the units of the reference (frame-buffer units, 1.0 = 100
+    // nits): gt is the target luminance of the curve, expo the factor from the game's linear color to these units and
+    // oscale the factor from the curve's output to the output units; kA .. fade1 and target_i are the curve constants.
+    "struct TM { uint mode; float paper, target, target_i; float kA, kB, kC, mid; float lin, toe, blend, fade0; float fade1, rel, w, h;\n"
+    "            float gt, expo, oscale, pad; };\n"
     "static float pq_enc(float n) {\n"
     "  float ym = pow(max(n, 0.0) / 10000.0, 0.1593017578125);\n"
     "  return pow((0.8359375 + 18.8515625 * ym) / (1.0 + 18.6875 * ym), 78.84375); }\n"
@@ -1784,7 +1787,7 @@ static const char util_msl[] =
     "static float gt7_curve(float x, constant TM &k) {\n"
     "  if (x < 0.0) return 0.0;\n"
     "  float wl = smoothstep(0.0, k.mid, x), wt = 1.0 - wl;\n"
-    "  if (x < k.lin * k.target) return wt * (k.mid * pow(x / k.mid, k.toe)) + wl * x;\n"
+    "  if (x < k.lin * k.gt) return wt * (k.mid * pow(x / k.mid, k.toe)) + wl * x;\n"
     "  return k.kA + k.kB * exp(x * k.kC); }\n"
     "static float3 gt7(float3 c, constant TM &k) {\n"
     "  float3 u = rgb_to_ucs(c);\n"
@@ -1792,7 +1795,7 @@ static const char util_msl[] =
     "  float3 su = rgb_to_ucs(sk);\n"
     "  float cs = 1.0 - smoothstep(k.fade0, k.fade1, u.x / k.target_i);\n"
     "  float3 sc = ucs_to_rgb(float3(su.x, u.y * cs, u.z * cs));\n"
-    "  return min((1.0 - k.blend) * sk + k.blend * sc, float3(k.target)); }\n"
+    "  return min((1.0 - k.blend) * sk + k.blend * sc, float3(k.gt)); }\n"
     "static float3 tm_ramp(float3 c, constant float4 *ramp, uint gamma) {\n"
     "  if ((gamma & 1u) == 0u) return c;\n"
     "  float3 r;\n"
@@ -1811,14 +1814,21 @@ static const char util_msl[] =
     //     knee + (w1 - knee) * (a u + (1 - a) u^3), u = (Y - knee) / (1 - knee), a = (1 - knee) / (w1 - knee)
     //   has slope 1 at the knee. Above white, w1 + (rel - w1) (1 - exp(-s (Y - 1) / (rel - w1))) continues it with the
     //   same slope s and approaches the peak.
-    //   With tone mapping: an inverse Reinhard curve with slope 1 at the knee gives white 1 + 19 (1 - knee) times
-    //   paper white, a color above white gets that times Y, and the GT7 curve then fits the result to the peak (SDR
-    //   white for SDR output).
+    //   With GT7 tone mapping: the reference operator. The game's linear color (Rec. 709 primaries, converted to the
+    //   Rec. 2020 input of the reference) times expo is the scene in frame-buffer units; the output times oscale is
+    //   the output color.
+    "static float3 to2020(float3 x) {\n"
+    "  return float3(0.6274040 * x.r + 0.3292820 * x.g + 0.0433136 * x.b, 0.0690970 * x.r + 0.9195400 * x.g + 0.0113612 * x.b,\n"
+    "                0.0163916 * x.r + 0.0880132 * x.g + 0.8955950 * x.b); }\n"
+    "static float3 to709(float3 o) {\n"
+    "  return float3(1.6604910 * o.r - 0.5876411 * o.g - 0.0728499 * o.b, -0.1245505 * o.r + 1.1328999 * o.g - 0.0083494 * o.b,\n"
+    "                -0.0181508 * o.r - 0.1005789 * o.g + 1.1187297 * o.b); }\n"
     "static float3 scene_tm(float3 l, constant TM &k) {\n"
+    "  if ((k.mode & 1u) != 0u) return to709(gt7(to2020(l * k.expo), k)) * k.oscale;\n"
     "  float knee = 0.25;\n"
     "  float Y = tm_luma(l);\n"
     "  float Ye;\n"
-    "  if ((k.mode & 8u) != 0u && (k.mode & 1u) == 0u) {\n"
+    "  {\n"
     "    float w1 = 1.0 + 0.75 * (k.rel - 1.0);\n"
     "    float a = min((1.0 - knee) / max(w1 - knee, 1e-3), 1.0);\n"
     "    if (Y <= knee) Ye = Y;\n"
@@ -1827,19 +1837,11 @@ static const char util_msl[] =
     "      float sl = (w1 - knee) / (1.0 - knee) * (3.0 - 2.0 * a), room = k.rel - w1;\n"
     "      Ye = room > 1e-4 ? w1 + room * (1.0 - exp(-sl * (Y - 1.0) / room)) : w1;\n"
     "    }\n"
-    "  } else {\n"
-    "    float t = min(max(Y - knee, 0.0) / (1.0 - knee), 0.95);\n"
-    "    Ye = Y <= knee ? Y : knee + (1.0 - knee) * t / (1.0 - t);\n"
-    "    if (Y > 1.0) Ye *= Y;\n"
     "  }\n"
-    "  float3 x = l * (Y > 1e-6 ? Ye / Y : 1.0) * k.paper;\n"
-    "  x = float3(0.6274040 * x.r + 0.3292820 * x.g + 0.0433136 * x.b, 0.0690970 * x.r + 0.9195400 * x.g + 0.0113612 * x.b,\n"
-    "             0.0163916 * x.r + 0.0880132 * x.g + 0.8955950 * x.b);\n"
+    "  float3 x = to2020(l * (Y > 1e-6 ? Ye / Y : 1.0) * k.paper);\n"
     // without tone mapping a color above the peak is scaled down as a whole, so that its hue stays
     "  float xm = max(x.r, max(x.g, x.b));\n"
-    "  float3 o = (k.mode & 1u) != 0u ? gt7(x, k) : (xm > k.target ? x * (k.target / xm) : x);\n"
-    "  return float3(1.6604910 * o.r - 0.5876411 * o.g - 0.0728499 * o.b, -0.1245505 * o.r + 1.1328999 * o.g - 0.0083494 * o.b,\n"
-    "                -0.0181508 * o.r - 0.1005789 * o.g + 1.1187297 * o.b); }\n"
+    "  return to709(xm > k.target ? x * (k.target / xm) : x); }\n"
     // the HDR calibration test image (EDR units), below the rows of the calibration menu. Left: a square at the
     // maximum of the screen (64 x SDR white; macOS clips it to the peak of the screen) with a symbol (a ring and a
     // dot) at the chosen peak. The symbol is visible while the chosen peak is below the peak of the screen and
@@ -2874,35 +2876,40 @@ static void gamma_reset(Swap *sw) { for (int i = 0; i < 256; i++) for (int c = 0
 //   CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 //   DEALINGS IN THE SOFTWARE.
 //
-// The curve parameters are those of the reference (alpha 0.25, mid point 0.538, linear section 0.444, blend ratio
-// 0.6, chroma fade 0.98 .. 1.16), except the toe strength: 1.06 instead of 1.280. The game's image is display-referred
-// SDR; with the reference toe the curve made its shadows much darker (sRGB 0.20 became 0.13, sRGB 0.05 became 0.01).
-// With 1.06 and the expansion knee at 0.25, SDR output maps sRGB 0.05, 0.20, 0.40, 0.60, 0.70, 0.80 and 0.90 to
-// 0.04, 0.18, 0.39, 0.60, 0.75, 0.90 and 1.00. The units are EDR units (1.0 = SDR white, which follows
-// the display brightness). SDR output has paper white and the target 1.0. HDR output has the paper white of the
-// calibration (a factor of SDR white) and the calibrated peak in nits converted to EDR units: SDR white is taken as
-// 100 nits x the potential EDR headroom / the current EDR headroom (rt_enh.h, RT_ENH_HDR_PEAK_NITS).
-typedef struct { uint32_t mode; float paper, target, target_i, kA, kB, kC, mid, lin, toe, blend, fade0, fade1, rel, w, h; } PresentTM;
+// The curve parameters are those of the reference (alpha 0.25, mid point 0.538, linear section 0.444, toe strength
+// 1.280, blend ratio 0.6, chroma fade 0.98 .. 1.16), in the units of the reference: frame-buffer units, 1.0 = 100 nits.
+//   SDR output (initializeAsSDR): the target is 2.5 (the SDR paper white of 250 nits of the reference); the game's
+//   white is at that paper white (expo 2.5), and the output is divided by 2.5 (oscale 0.4). Thus the colors between
+//   the mid point and the linear section (linear 0.215 .. 0.444) do not change.
+//   HDR output (initializeAsHDR): the target is the calibrated peak in nits / 100. The game's white is at the
+//   calibrated paper white in nits (expo = paper white nits / 100), and the output in nits is converted to EDR units
+//   (oscale = 100 / the nits of SDR white). SDR white is taken as 100 nits x the potential EDR headroom / the current
+//   EDR headroom (rt_enh.h, RT_ENH_HDR_PEAK_NITS).
+// HDR output without tone mapping uses the units of EDR (1.0 = SDR white).
+typedef struct { uint32_t mode; float paper, target, target_i, kA, kB, kC, mid, lin, toe, blend, fade0, fade1, rel, w, h;
+                 float gt, expo, oscale, pad; } PresentTM;
 static float pq_enc(float n) {
     float ym = powf(n > 0 ? n / 10000.0f : 0.0f, 0.1593017578125f);
     return powf((0.8359375f + 18.8515625f * ym) / (1.0f + 18.6875f * ym), 78.84375f);
 }
-static void present_tm_consts(PresentTM *k, uint32_t mode, float paper, float peak, uint32_t w, uint32_t h) {
+static void present_tm_consts(PresentTM *k, uint32_t mode, float paper, float peak, float gt, float expo, float oscale,
+                              uint32_t w, uint32_t h) {
     memset(k, 0, sizeof *k);
     k->mode = mode;
     k->paper = paper;
     k->target = peak;
     k->rel = peak > paper ? peak / paper : 1.0f;
     k->w = (float)w; k->h = (float)h;
-    const float alpha = 0.25f, mid = 0.538f, lin = 0.444f, toe = 1.06f;
+    k->gt = gt; k->expo = expo; k->oscale = oscale;
+    const float alpha = 0.25f, mid = 0.538f, lin = 0.444f, toe = 1.280f;
     float kk = (lin - 1.0f) / (alpha - 1.0f);
-    k->kA = k->target * lin + k->target * kk;
-    k->kB = -k->target * kk * expf(lin / kk);
-    k->kC = -1.0f / (kk * k->target);
+    k->kA = gt * lin + gt * kk;
+    k->kB = -gt * kk * expf(lin / kk);
+    k->kC = -1.0f / (kk * gt);
     k->mid = mid; k->lin = lin; k->toe = toe;
     k->blend = 0.6f; k->fade0 = 0.98f; k->fade1 = 1.16f;
     // ICtCp intensity of a gray of the target luminance (the LMS rows of the reference sum to 1)
-    float p = pq_enc(k->target * 100.0f);
+    float p = pq_enc(gt * 100.0f);
     k->target_i = (2048.0f * p + 2048.0f * p) / 4096.0f;
 }
 
@@ -2963,7 +2970,7 @@ static uint32_t swap_present(Device *d, Swap *sw, uint32_t srp, uint32_t drp, ui
     if (tm_mode) {
         __unsafe_unretained id<MTLBuffer> tb; uint32_t to;
         PresentTM *k = ring_alloc(d, sizeof(PresentTM), &tb, &to);
-        float paper = 1.0f, peak = 1.0f;
+        float paper = 1.0f, peak = 1.0f, gt = 2.5f, expo = 2.5f, oscale = 0.4f;   // GT7: SDR output
         if (edr_dt && (tm_mode & 8)) {
             static const int peaks[RT_ENH_HDR_PEAKS] = RT_ENH_HDR_PEAK_NITS, papers[RT_ENH_HDR_PAPERS] = RT_ENH_HDR_PAPER_PCT;
             if (rt_enh->hdr_peak < 0 || rt_enh->hdr_peak >= RT_ENH_HDR_PEAKS || rt_enh->hdr_paper < 0 || rt_enh->hdr_paper >= RT_ENH_HDR_PAPERS)
@@ -2974,6 +2981,7 @@ static uint32_t swap_present(Device *d, Swap *sw, uint32_t srp, uint32_t drp, ui
             float white = 100.0f * potential / headroom;  // the nits of SDR white (rt_enh.h)
             paper = (float)papers[rt_enh->hdr_paper] / 100.0f;
             peak = (float)peaks[rt_enh->hdr_peak] / white;
+            gt = (float)peaks[rt_enh->hdr_peak] / 100.0f; expo = paper * white / 100.0f; oscale = 100.0f / white;   // GT7: HDR output
             if (headroom != d->tm_logged.headroom || potential != d->tm_logged.potential ||
                 peaks[rt_enh->hdr_peak] != d->tm_logged.peak || papers[rt_enh->hdr_paper] != d->tm_logged.paper) {
                 rt_log("[d3d9] HDR output: peak %d nits (%.2f x SDR white), paper white %d%% of SDR white%s; the screen: EDR "
@@ -2993,7 +3001,7 @@ static uint32_t swap_present(Device *d, Swap *sw, uint32_t srp, uint32_t drp, ui
         // the scene of this frame before the game's post-processing (enh_apply)
         int pre = sw == d->swap && d->tm_pre_frame == f && d->tm_pre && d->tm_pre.width == img.width && d->tm_pre.height == img.height;
         if (pre) tm_mode |= 64u;
-        present_tm_consts(k, tm_mode, paper, peak, DW, DH);
+        present_tm_consts(k, tm_mode, paper, peak, gt, expo, oscale, DW, DH);
         [e setFragmentBuffer:tb offset:to atIndex:2];
         [e setFragmentTexture:ref ? d->tm_ref : img atIndex:1];
         [e setFragmentTexture:pre ? d->tm_pre : img atIndex:2];

@@ -57,16 +57,20 @@
 // centimeter (UNCONFIRMED). The XeGTAO effect radius is in meters (with the XeGTAO radius multiplier 1.457).
 //
 // Bloom: the dual filter of Marius Bjorge ("Bandwidth-Efficient Rendering", SIGGRAPH 2015), from the project's
-// "Graphic Enhancements" folder (rt_d3d9_bloom.m), adapted to this renderer. The game's own glow (a quarter-size
+// "Graphic Enhancements" folder (rt_d3d9_bloom.m), adapted to this renderer, with the bloom of Jorge Jimenez ("Next
+// Generation Post Processing in Call of Duty: Advanced Warfare", SIGGRAPH 2014). The game's own glow (a quarter-size
 // bright pass alpha * color - 1, blurred and added to the scene) gives no light from 8-bit scene colors, so the
-// bloom here starts from the scene: the first pass is the 13-tap filter of Jorge Jimenez ("Next Generation Post
-// Processing in Call of Duty: Advanced Warfare", SIGGRAPH 2014) with the Karis average, in linear light, followed by
-// a soft threshold (threshold 0.75, knee 0.35 of linear white). Six levels down (1/2 to 1/64 of the scene size), six
-// passes up, each adding the up-sampled levels below it; the composite adds the mean of the levels times the
-// intensity (low 0.35, medium 0.7, high 1.2) to the scene in linear light. The levels are RGBA16Float. The threshold
-// and the intensities are UNCONFIRMED tuning. The passes do not clamp to white: a half-float back buffer (rt_enh.h
-// reduced banding) gives its colors above white to the bloom and keeps the composite above white, for HDR output and
-// tone mapping; a unorm back buffer clamps the composite when it stores it.
+// bloom here starts from the scene. The first pass is the 13-tap filter of Jimenez with the Karis average, in linear
+// light, without a threshold. Six levels down (1/2 to 1/64 of the scene size), six passes up, each adding the
+// up-sampled levels below it. The composite mixes the mean of the levels into the scene in linear light:
+// scene x (1 - k) + bloom x k (Jimenez: k 0.04). Thus the bloom moves light from bright areas into their
+// surroundings and does not add light to the image. k is 0.04 (low), 0.08 (medium) and 0.15 (high); medium and
+// high are UNCONFIRMED tuning. A threshold does not suit this game: the game's scenes are dark. With the earlier
+// soft threshold (0.75 of linear white), the bright pass of a level frame kept a mean of 0.00004 of white per pixel
+// (measured on the back buffer), and the bloom was almost not visible. The levels are RGBA16Float. The passes do not
+// clamp to white: a half-float back buffer (rt_enh.h reduced banding) gives its colors above white to the bloom and
+// keeps the composite above white, for HDR output and tone mapping; a unorm back buffer clamps the composite when it
+// stores it.
 //
 // Settings: XeGTAO falloff range 0.615, sample distribution power 2, depth mip offset 3.30, denoise beta 1.2. The
 // levels low, medium and high use 1 x 2, 2 x 2 and 3 x 3 slices x steps, an effect radius of 0.8, 1.2 and 1.6 m
@@ -377,8 +381,10 @@ static const char enh_src[] =
     "  float2 sp = (float2(q) + 0.5) * float2(k.px, k.py);\n"
     "  return float3((float2(k.mulx, k.muly) * sp + float2(k.addx, k.addy)) * z, z);\n"
     "}\n"
-    // N.L of the light at a pixel: the normal from the neighbor with the smaller depth step on each axis, toward the
-    // camera; 1 where the normal or the direction to the light has no length
+    // The weight of the contact shadow at a pixel, from N.L of the light: 0 on a surface that faces away from the
+    // light, 1 from N.L 0.25 (76 degrees from the normal), smoothstep between. The normal comes from the neighbor with
+    // the smaller depth step on each axis, toward the camera. The weight is 1 where the normal or the direction to
+    // the light has no length.
     "static float contact_nl(depth2d<float, access::read> dt, int2 ip, constant CC &k) {\n"
     "  float3 p0 = cpos(dt, ip, k), pl = cpos(dt, ip - int2(1, 0), k), pr = cpos(dt, ip + int2(1, 0), k);\n"
     "  float3 pt = cpos(dt, ip - int2(0, 1), k), pb = cpos(dt, ip + int2(0, 1), k);\n"
@@ -389,7 +395,7 @@ static const char enh_src[] =
     "  float3 l = k.light.w != 0.0 ? k.light.xyz - p0 : k.light.xyz;\n"
     "  float nn = dot(n, n), ll = dot(l, l);\n"
     "  if (!(nn > 1e-24) || !(ll > 1e-24)) return 1.0;\n"
-    "  return saturate(dot(n, l) * rsqrt(nn) * rsqrt(ll));\n"
+    "  return smoothstep(0.0, 0.25, dot(n, l) * rsqrt(nn) * rsqrt(ll));\n"
     "}\n"
     "fragment float4 enh_fs(PV in [[stage_in]], texture2d<float, access::read> a [[texture(0)]],\n"
     "  texture2d<float, access::read> e [[texture(1)]], texture2d<float, access::read> sh [[texture(2)]],\n"
@@ -416,7 +422,8 @@ static const char enh_src[] =
     "  BV o; o.pos = float4(q * 2.0 - 1.0, 0.0, 1.0); o.uv = float2(q.x, 1.0 - q.y); return o;\n"
     "}\n"
     "constexpr sampler bls(filter::linear, address::clamp_to_edge);\n"
-    "struct BP { float2 px; float threshold, knee; float scale, pad0, pad1, pad2; };\n"
+    // BP.k: the bloom part of the composite; inv: 1 / the number of levels
+    "struct BP { float2 px; float k, inv; };\n"
     "static float3 to_lin(float3 c) { c = max(c, 0.0); return select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045); }\n"
     "static float3 to_srgb(float3 l) { l = max(l, 0.0); return select(1.055 * pow(l, 1.0 / 2.4) - 0.055, l * 12.92, l <= 0.0031308); }\n"
     "static float karis(float3 c) { return 1.0 / (1.0 + max(max(c.r, c.g), c.b)); }\n"
@@ -431,11 +438,7 @@ static const char enh_src[] =
     "  float3 b0 = (d + e + i + j) * 0.25, b1 = (a + b + f + g) * 0.25, b2 = (b + c + g + h) * 0.25;\n"
     "  float3 b3 = (f + g + k + l) * 0.25, b4 = (g + h + l + m) * 0.25;\n"
     "  float w0 = 0.5 * karis(b0), w1 = 0.125 * karis(b1), w2 = 0.125 * karis(b2), w3 = 0.125 * karis(b3), w4 = 0.125 * karis(b4);\n"
-    "  float3 col = (b0 * w0 + b1 * w1 + b2 * w2 + b3 * w3 + b4 * w4) / (w0 + w1 + w2 + w3 + w4);\n"
-    "  float br = max(max(col.r, col.g), col.b);\n"
-    "  float soft = clamp(br - p.threshold + p.knee, 0.0, 2.0 * p.knee);\n"
-    "  soft = soft * soft / (4.0 * p.knee + 1e-5);\n"
-    "  return float4(col * (max(soft, br - p.threshold) / max(br, 1e-5)), 1.0);\n"
+    "  return float4((b0 * w0 + b1 * w1 + b2 * w2 + b3 * w3 + b4 * w4) / (w0 + w1 + w2 + w3 + w4), 1.0);\n"
     "}\n"
     "fragment float4 bloom_down(BV in [[stage_in]], texture2d<float> t [[texture(0)]], constant BP &p [[buffer(0)]]) {\n"
     "  float2 uv = in.uv, hp = p.px;\n"
@@ -453,10 +456,10 @@ static const char enh_src[] =
     "fragment float4 bloom_up(BV in [[stage_in]], texture2d<float> t [[texture(0)]], constant BP &p [[buffer(0)]]) {\n"
     "  return float4(up8(t, in.uv, p.px), 0.0);\n"
     "}\n"
-    // the composite: the scene pixel is read in place (framebuffer fetch); scale = intensity / number of levels
+    // the composite: the scene pixel is read in place (framebuffer fetch)
     "fragment float4 bloom_comp(BV in [[stage_in]], texture2d<float> t [[texture(0)]], constant BP &p [[buffer(0)]],\n"
     "  float4 dst [[color(0)]]) {\n"
-    "  return float4(to_srgb(to_lin(dst.rgb) + up8(t, in.uv, p.px) * p.scale), dst.a);\n"
+    "  return float4(to_srgb(mix(to_lin(dst.rgb), up8(t, in.uv, p.px) * p.inv, p.k)), dst.a);\n"
     "}\n";
 
 typedef struct { float sx, sy, px, py, mulx, muly, addx, addy, mpx, mpy, da, db, radius, falloff, power, mipoff, beta, pad; } AOC;
@@ -464,13 +467,13 @@ typedef struct { float light[4]; int32_t offset[2]; float far_z, near_z, thickne
 typedef struct { float beta; uint32_t ao, contact; float strength; float light[4]; float mulx, muly, addx, addy, da, db, px, py; } CC;
 typedef struct { int32_t count[3]; int32_t offset[2]; } SssDispatch;
 
-typedef struct { float px[2]; float threshold, knee, scale, pad0, pad1, pad2; } BP;
+typedef struct { float px[2]; float k, inv; } BP;
 
 static const uint32_t ao_slices[4] = {0, 1, 2, 3}, ao_steps[4] = {0, 2, 2, 3};
 // the strength of each level: the effect radius in meters and the XeGTAO final value power
 static const float ao_radius[4] = {0.0f, 0.8f, 1.2f, 1.6f}, ao_power[4] = {0.0f, 2.4f, 3.0f, 3.6f};
 #define BLOOM_LEVELS 6
-static const float bloom_intensity[4] = {0.0f, 0.35f, 0.7f, 1.2f};
+static const float bloom_intensity[4] = {0.0f, 0.04f, 0.08f, 0.15f};   // k of the composite
 
 static struct {
     id<MTLDevice> dev;
@@ -800,7 +803,6 @@ int d3d9_enh_bloom(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
             E.logged_bloom = 1;
         }
         BP p; memset(&p, 0, sizeof p);
-        p.threshold = 0.75f; p.knee = 0.35f;
         p.px[0] = 1.0f / (float)w; p.px[1] = 1.0f / (float)h;
         bloom_pass(cb, E.bloom_pre, color, E.bloom_lv[0], &p, 0);
         for (int i = 1; i < BLOOM_LEVELS; i++) {
@@ -815,7 +817,7 @@ int d3d9_enh_bloom(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
             bloom_pass(cb, E.bloom_up, E.bloom_lv[i + 1], out, &p, 1);
         }
         p.px[0] = 0.5f / (float)w; p.px[1] = 0.5f / (float)h;
-        p.scale = bloom_intensity[level] / (float)BLOOM_LEVELS;
+        p.k = bloom_intensity[level]; p.inv = 1.0f / (float)BLOOM_LEVELS;
         bloom_pass(cb, E.bloom_comp, E.bloom_lv[0], color, &p, 1);
     }
     return 1;

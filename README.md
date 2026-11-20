@@ -93,6 +93,8 @@ These items are always on: 16x anisotropic texture filtering, reduced color band
 HDR Output needs a display with HDR (EDR) support. HDR Output and GT7 Tone Mapping change the 3D scene. The UI, the text and the menus stay at paper white.
 
 - **Highlights:** the game clamps its final image to white. The app keeps the colors of the scene that are brighter than white (lamps, fire, bloom) from before the game's post-processing. With HDR Output, these highlights go above the white of the game, up to the peak. With GT7 Tone Mapping in SDR, they keep their detail.
+- **GT7 Tone Mapping** is the tone mapping of Gran Turismo 7 (Polyphony Digital, MIT license), with the parameters of the reference. In SDR, the white of the game is at 250 nits of the reference. With HDR Output, the white of the game is at paper white and the highlights go up to the peak.
+- **Bloom** has no threshold: it mixes a wide blur of the scene into the scene (Low 4%, Medium 8%, High 15%). Bright areas spread light into their surroundings.
 - **Contact shadows** use the lights of the game: the light of the character nearest to the camera. A surface that the light does not reach gets no contact shadow.
 
 ### HDR Calibration

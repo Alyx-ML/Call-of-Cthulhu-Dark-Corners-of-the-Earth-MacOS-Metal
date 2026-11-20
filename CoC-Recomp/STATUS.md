@@ -533,3 +533,38 @@ SDR output, calculated for a gray.
 - `d3d9_shader_const_reg` gave the same registers as a separate Python reader for 7 constant names in all 119 shader files of the game. Corrupted copies of each shader (changed words and all truncations) had no error with AddressSanitizer and UndefinedBehaviorSanitizer.
 - The measurement code was temporary. It is removed.
 - Not verified: the image on the screen (screenshots are not permitted). `GetFrontBufferData` with a half-float front buffer did not run in the tests.
+
+## 2026-11-20: GT7 tone mapping as in the reference, bloom without a threshold, softer N·L weight of contact shadows
+
+### GT7 tone mapping
+
+- Reference: `gt7_tone_mapping.cpp` v1.0 (Polyphony Digital Inc., MIT License), from the SIGGRAPH 2025 course "Physically Based Shading in Theory and Practice" (https://blog.selfshadow.com/publications/s2025-shading-course/pdi/supplemental/gt7_tone_mapping.cpp).
+- Cause of the muted image: the earlier port did not use the units of the reference.
+  - The reference uses frame-buffer units: 1.0 is 100 nits. The mid point 0.538 of the toe is in these units.
+  - The earlier port used EDR units (1.0 is SDR white) with the target 1.0 for SDR output. Thus the toe acted on all values below 0.538 of white (sRGB 0.76), and most of the image was in the toe.
+  - The earlier port also had a toe strength of 1.06 in place of 1.280, and an inverse Reinhard expansion before the curve.
+- Correction (`d3d9_metal.m`, `scene_tm`, `present_tm_consts`):
+  - SDR output (`initializeAsSDR`): the target is 2.5 (250 nits, the SDR paper white of the reference). The white of the game is at 2.5. The output is divided by 2.5.
+  - HDR output (`initializeAsHDR`): the target is the calibrated peak in nits / 100. The white of the game is at the calibrated paper white in nits / 100. The output in nits is converted to EDR units.
+  - The parameters are those of the reference: alpha 0.25, mid point 0.538, linear section 0.444, toe strength 1.280, blend ratio 0.6, chroma fade 0.98 to 1.16.
+  - GT7 has no inverse Reinhard expansion now. A color above white comes from the highlights of `tm_pre`. HDR output without GT7 does not change.
+- Calculated for a gray in SDR output: linear 0.215 to 0.444 (sRGB 0.50 to 0.70) does not change. The white of the game goes to linear 0.835 (sRGB 0.92). A highlight above white goes toward 1.0. Linear 0.05 (sRGB 0.25) goes to 0.036 (sRGB 0.21).
+- Calculated for HDR output, peak 1000 nits, paper white 600 nits: the white of the game goes to 585 nits. A highlight of 4 × white goes to the peak.
+
+### Bloom
+
+- Measured on the back buffer before the bloom, in a level: the brightest pixel was 1.0 to 1.8 of linear white, and 0.000% to 0.007% of the pixels were above white. The mean of the earlier bright pass (soft threshold 0.75) was 0.00004 of white per pixel. Thus the bloom was almost not visible.
+- Correction (`d3d9_enhance.m`): the bloom of Jorge Jimenez (SIGGRAPH 2014) has no threshold. The composite mixes the mean of the levels into the scene: scene × (1 − k) + bloom × k. k is 0.04 (low, the value of Jimenez), 0.08 (medium) and 0.15 (high). The bloom moves light from bright areas into their surroundings. It does not add light to the image.
+- Measured after the correction with bloom high: the mean luminance of the frame did not change (0.0135 before and after). The mean change was 0.0002 to 0.0005 per pixel. The maximum change near lamps was 0.10 to 0.18 of linear white.
+
+### Contact shadows
+
+- The N·L weight of the contact shadow is now smoothstep(0, 0.25, N·L). The weight was N·L. A surface that the light reaches at an angle up to 76 degrees from its normal now gets the full contact shadow. A surface that faces away from the light still gets no contact shadow.
+- The contact shadows are a port of the screen-space shadows of Bend Studio (`bend_sss_gpu.h`, `bend_sss_cpu.h`) with the default settings of Bend: 60 samples, 4 hard samples, 8 fade samples, surface thickness 0.005, bilinear threshold 0.02, contrast 4.
+
+### Verification
+
+- `make app` built the app with no warnings.
+- Two headless level runs (45 and 55 seconds) with HDR output, GT7, ambient occlusion high, contact shadows and bloom high. The second run had `MTL_DEBUG_LAYER=1` and no Metal validation error.
+- The measurement code was temporary. It is removed.
+- Not verified: the image on the screen (screenshots are not permitted).
