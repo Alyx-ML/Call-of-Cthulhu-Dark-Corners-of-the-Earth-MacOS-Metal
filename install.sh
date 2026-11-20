@@ -36,7 +36,7 @@ done
 step "Checking this Mac"
 [ "$(uname -m)" = "arm64" ] || fail "this port needs a Mac with Apple silicon (arm64). This Mac is $(uname -m)."
 MACOS="$(sw_vers -productVersion)"
-[ "${MACOS%%.*}" -ge 14 ] || fail "this port needs macOS 14 or later. This Mac has macOS $MACOS."
+[ "${MACOS%%.*}" -ge 26 ] || fail "this port needs macOS 26 or later. This Mac has macOS $MACOS."
 if ! xcode-select -p >/dev/null 2>&1 || ! xcrun --find clang >/dev/null 2>&1; then
     xcode-select --install >/dev/null 2>&1 || true
     fail "the Xcode Command Line Tools are not installed. Complete the installer window that opened, then run this script again."

@@ -11,7 +11,7 @@ This repository contains no game files and no game code. You must own the game. 
 ## Requirements
 
 - A Mac with Apple silicon (M1 or later).
-- macOS 14 or later.
+- macOS 26 or later. The app does not open on an earlier version.
 - The Xcode Command Line Tools. The installer opens the install window if they are not installed.
 - Homebrew (https://brew.sh). The installer uses Homebrew to install SDL3 for game controllers.
 - An internet connection during the install. The installer downloads the FFmpeg source and two Python packages (`capstone`, `lief`).
