@@ -365,3 +365,48 @@ The game has no in-game HUD. In a level, the game draws only the scene and, duri
 ### Not verified
 
 - The image on screen: the menu position, the strength of the ambient occlusion and the HDR colors. The test runs did not capture or examine images.
+
+## 2026-11-20: Contact shadow light, HDR in EDR units, GT7 toe, Video menu position
+
+### Contact shadows
+
+- Cause: the light came from the projector of the character shadows. In a level this light is a lamp approximately 1.7 m above the ground, and it changes between frames (screen positions (1351, 296), (286, 525) and (1637, -32) in three measured frames). With this light, 25 to 65% of the frame was in shadow (mean of the shadow texture 0.25 to 0.65), and single columns differed from their neighbors by up to 0.2 (the vertical lines on the screen).
+- The new function `d3d9_enh_light_dir` gives a fixed light. `enhance.c` sets a light straight above (+Z, the up axis of the world: the camera's up vector had a Z part of 0.92 to 1.0).
+- Result (measured on the shadow texture in a level): the mean is 0.88 to 0.94, and the largest difference of a column from its neighbors is 0.05.
+- With a fill value in the shadow texture, 34 to 385 of 2,025,000 pixels kept the fill value after the dispatches. Thus the dispatches write almost all pixels; the lines did not come from pixels that were not written.
+
+### HDR
+
+- The units are now EDR units: 1.0 = SDR white, which follows the display brightness. The value 2.5 (250 nits) of the GT7 reference is not used. The peak of HDR output is the EDR headroom of the screen (`maximumExtendedDynamicRangeColorComponentValue`), read again every 60 frames.
+- The log shows the headroom now and the largest headroom of the screen (`maximumPotentialExtendedDynamicRangeColorComponentValue`). On the test Mac: 2.67 now, 16.0 possible. The headroom becomes larger when the display brightness is lower.
+- HDR output without tone mapping has a new curve: above the knee (0.25) it has slope 1 at the knee and gives SDR white the peak. A color above the peak is scaled down as a whole, so its hue stays.
+
+| sRGB value | SDR, GT7 before | SDR, GT7 now | HDR, no tone mapping | HDR, GT7 |
+|---|---|---|---|---|
+| 0.05 | 0.001 | 0.004 | 0.004 | 0.004 |
+| 0.20 | 0.020 | 0.033 | 0.033 | 0.033 |
+| 0.40 | 0.127 | 0.133 | 0.133 | 0.133 |
+| 0.75 | 0.519 | 0.519 | 0.603 | 0.678 |
+| 0.85 | 0.674 | 0.674 | 1.034 | 1.322 |
+| 0.95 | 1.000 | 1.000 | 1.928 | 2.670 |
+| 1.00 | 1.000 | 1.000 | 2.670 | 2.670 |
+
+Values in units of SDR white, calculated for a gray with an EDR headroom of 2.67.
+
+### GT7 tone mapping
+
+- Cause of the dark image: the toe of the GT7 curve (strength 1.280). The game's image is already display-referred SDR, and the toe made the shadows darker: sRGB 0.20 by 40%, sRGB 0.05 by 75%. The toe strength is now 1.0, so values below the linear section do not change.
+
+### Video menu
+
+- The game draws the brightness test image of Options > Video at a fixed place. With the Subtitle Size row, the Back row was on the image. The rectangles of the Video menu now move up by one row (0.0545 of the screen height).
+
+### Verified
+
+- `make app` built the app. The only warnings are the two `key_frame` deprecation warnings in `wmvcore.c`.
+- Options > Video > Subtitle Size changed from 2x to 1.75x in a headless run, and the game saved it.
+- In a level run with `MTL_DEBUG_LAYER=1`, the Metal validation layer reported no error. The log shows the fixed light of the contact shadows, XeGTAO, the bloom and HDR output with the Display P3 color space.
+
+### Not verified
+
+- The image on screen: the Video menu position, the contact shadows, the HDR image and the GT7 image. The test runs did not capture or examine images.

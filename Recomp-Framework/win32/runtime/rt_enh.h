@@ -31,6 +31,10 @@ extern RtEnh *rt_enh;
 // creg .. creg + 3 hold the light's view-projection matrix (one row per register, clip = position * M).
 // Without this call (or in a frame without such a draw) the frame has no contact shadows.
 void d3d9_enh_light_pass(uint32_t w, uint32_t h, uint32_t fmt, uint32_t creg);
+// A fixed light for the contact shadows instead: the direction toward the light (x, y, z) in world space, a light
+// at infinity. With this call every frame with a scene camera has contact shadows. d3d9_enh_light_pass then does not
+// give the light; its render targets still do not end the scene when the game draws into them during the scene.
+void d3d9_enh_light_dir(float x, float y, float z);
 
 // The camera of ambient occlusion and contact shadows: without this call, the fixed-function view and projection
 // transforms of the scene draws. With it, the vertex shader constants creg .. creg + 3 of the opaque draws into the

@@ -39,6 +39,7 @@ void rt_cocoa_set_size(uint32_t hwnd, int w, int h);
 void rt_cocoa_full_screen(uint32_t hwnd, int on);
 void rt_cocoa_layer_edr(void *layer, int on, int refresh_only);
 float rt_cocoa_edr_headroom(void);
+float rt_cocoa_edr_potential(void);
 id<MTLDevice> rt_metal_device(void);
 extern int rt_mouse_x, rt_mouse_y;
 
@@ -1734,7 +1735,7 @@ static const char util_msl[] =
     "  return float4(c, 1.0); }\n"
     // enhanced presentation (rt_enh.h): HDR expansion and GT7 tone mapping. The GT7 functions are a port of
     // gt7_tone_mapping.cpp v1.0 (Polyphony Digital Inc., MIT License; the notice is at present_tm_consts).
-    // Framebuffer units: 1.0 = 100 nits; the game's SDR white is the GT7 SDR paper white (250 nits).
+    // Units: 1.0 = SDR white, the EDR unit of macOS (k.paper = 1); the peak of HDR output is the EDR headroom.
     "struct TM { uint mode; float paper, target, target_i; float kA, kB, kC, mid; float lin, toe, blend, fade0; float fade1, p0, p1, p2; };\n"
     "static float pq_enc(float n) {\n"
     "  float ym = pow(max(n, 0.0) / 10000.0, 0.1593017578125);\n"
@@ -1783,17 +1784,30 @@ static const char util_msl[] =
     "  if ((k.mode & 9u) != 0u) {\n"
     // the game's image is SDR: its highlights get back a range above SDR white. The expansion acts on luminance and
     // scales the three channels by the same factor, so the hue and the saturation stay those of the game. Below the
-    // knee the luminance does not change; above it an inverse Reinhard curve with slope 1 at the knee expands it, to
-    // 1 + 19 x (1 - knee) times SDR white at SDR white, which the tone mapping then fits to the display. The knee is
-    // 0.25 of SDR white for HDR output (linear 0.25 is sRGB 0.54) and 0.6 for SDR output with tone mapping
-    "    float knee = (k.mode & 8u) != 0u ? 0.25 : 0.6;\n"
+    // knee the luminance does not change. Units: 1.0 = SDR white (EDR units); k.target is the peak.
+    //   HDR output without tone mapping: above the knee (0.25, sRGB 0.54) the curve
+    //     knee + (peak - knee) * (a u + (1 - a) u^3), u = (Y - knee) / (1 - knee), a = (1 - knee) / (peak - knee)
+    //   has slope 1 at the knee and gives SDR white the peak of the screen (the EDR headroom).
+    //   With tone mapping: an inverse Reinhard curve with slope 1 at the knee gives SDR white 1 + 19 (1 - knee) times
+    //   SDR white, and the GT7 curve then fits it to the peak. The knee is 0.25 for HDR output and 0.6 for SDR output.
+    "    bool hdr = (k.mode & 8u) != 0u;\n"
+    "    float knee = hdr ? 0.25 : 0.6;\n"
     "    float Y = dot(l, float3(0.2126, 0.7152, 0.0722));\n"
-    "    float t = min(max(Y - knee, 0.0) / (1.0 - knee), 0.95);\n"
-    "    float Ye = Y <= knee ? Y : knee + (1.0 - knee) * t / (1.0 - t);\n"
+    "    float Ye;\n"
+    "    if (hdr && (k.mode & 1u) == 0u) {\n"
+    "      float u = saturate((Y - knee) / (1.0 - knee));\n"
+    "      float a = min((1.0 - knee) / max(k.target - knee, 1e-3), 1.0);\n"
+    "      Ye = Y <= knee ? Y : knee + (max(k.target, 1.0) - knee) * (a * u + (1.0 - a) * u * u * u);\n"
+    "    } else {\n"
+    "      float t = min(max(Y - knee, 0.0) / (1.0 - knee), 0.95);\n"
+    "      Ye = Y <= knee ? Y : knee + (1.0 - knee) * t / (1.0 - t);\n"
+    "    }\n"
     "    float3 x = l * (Y > 1e-6 ? Ye / Y : 1.0) * k.paper;\n"
     "    x = float3(0.6274040 * x.r + 0.3292820 * x.g + 0.0433136 * x.b, 0.0690970 * x.r + 0.9195400 * x.g + 0.0113612 * x.b,\n"
     "               0.0163916 * x.r + 0.0880132 * x.g + 0.8955950 * x.b);\n"
-    "    float3 o = (k.mode & 1u) != 0u ? gt7(x, k) : min(x, float3(k.target));\n"
+    // without tone mapping a color above the peak is scaled down as a whole, so that its hue stays
+    "    float xm = max(x.r, max(x.g, x.b));\n"
+    "    float3 o = (k.mode & 1u) != 0u ? gt7(x, k) : (xm > k.target ? x * (k.target / xm) : x);\n"
     "    disp = float3(1.6604910 * o.r - 0.5876411 * o.g - 0.0728499 * o.b, -0.1245505 * o.r + 1.1328999 * o.g - 0.0083494 * o.b,\n"
     "                  -0.0181508 * o.r - 0.1005789 * o.g + 1.1187297 * o.b) / k.paper;\n"
     "  }\n"
@@ -2293,6 +2307,12 @@ static void enh_camera_vote(Device *d, uint32_t f, const float view[16], const f
     } else d->enh_ncam++;
     memcpy(d->enh_cam[k].view, view, 64); memcpy(d->enh_cam[k].proj, proj, 64); d->enh_cam[k].n = 1;
 }
+static struct { int on; float dir[3]; } enh_ld;
+void d3d9_enh_light_dir(float x, float y, float z) {
+    float n = sqrtf(x * x + y * y + z * z);
+    if (!(n > 0.0f) || !isfinite(n)) rt_fatal("[d3d9] d3d9_enh_light_dir: the direction (%g, %g, %g) has no length", x, y, z);
+    enh_ld.on = 1; enh_ld.dir[0] = x / n; enh_ld.dir[1] = y / n; enh_ld.dir[2] = z / n;
+}
 static int enh_is_light_target(const Surf *s) { return enh_lp.w && s && s->w == enh_lp.w && s->h == enh_lp.h && s->tex->fmt == enh_lp.fmt; }
 static float det3(float a0, float a1, float a2, float b0, float b1, float b2, float c0, float c1, float c2) {
     return a0 * (b1 * c2 - b2 * c1) - a1 * (b0 * c2 - b2 * c0) + a2 * (b0 * c1 - b1 * c0);
@@ -2352,7 +2372,10 @@ static void enh_apply(Device *d) {
     if (d->pend.active) begin_pass_flush_clear(d);
     ensure_cmd(d);
     end_encoders(d);
-    d->enh_sc.have_light = d->enh_light_frame == f;
+    if (enh_ld.on) {
+        memcpy(d->enh_sc.light, enh_ld.dir, sizeof enh_ld.dir); d->enh_sc.light[3] = 0.0f;
+        d->enh_sc.have_light = 1;
+    } else d->enh_sc.have_light = d->enh_light_frame == f;
     int ao = rt_enh->ao, contact = rt_enh->contact;
     if (enh_camvs.on && (ao > 0 || contact > 0)) {
         // the camera with the most draws (the level geometry, whose world transform is the identity)
@@ -2632,9 +2655,12 @@ static void gamma_reset(Swap *sw) { for (int i = 0; i < 256; i++) for (int c = 0
 //   CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 //   DEALINGS IN THE SOFTWARE.
 //
-// The curve parameters are those of the reference (alpha 0.25, mid point 0.538, linear section 0.444, toe strength
-// 1.280, blend ratio 0.6, chroma fade 0.98 .. 1.16). SDR output uses the GT7 SDR paper white (250 nits) as the
-// target; HDR output uses 250 nits times the EDR headroom of the screen.
+// The curve parameters are those of the reference (alpha 0.25, mid point 0.538, linear section 0.444, blend ratio
+// 0.6, chroma fade 0.98 .. 1.16), except the toe strength: 1.0 instead of 1.280. The game's image is display-referred
+// SDR; with the reference toe the curve made its shadows darker (sRGB 0.20 by 40%, sRGB 0.05 by 75%). With 1.0 the
+// curve does not change values below the linear section. The units are EDR units (1.0 = SDR white, which follows
+// the display brightness): SDR output has the target 1.0; HDR output has the EDR headroom of the screen as the
+// target, so the peak is the brightest value that the display can show at its current brightness.
 typedef struct { uint32_t mode; float paper, target, target_i, kA, kB, kC, mid, lin, toe, blend, fade0, fade1, p0, p1, p2; } PresentTM;
 static float pq_enc(float n) {
     float ym = powf(n > 0 ? n / 10000.0f : 0.0f, 0.1593017578125f);
@@ -2643,9 +2669,9 @@ static float pq_enc(float n) {
 static void present_tm_consts(PresentTM *k, uint32_t mode, float headroom) {
     memset(k, 0, sizeof *k);
     k->mode = mode;
-    k->paper = 2.5f;                                    // 250 nits in framebuffer units (1.0 = 100 nits)
-    k->target = (mode & 2) && (mode & 8) ? k->paper * headroom : k->paper;
-    const float alpha = 0.25f, mid = 0.538f, lin = 0.444f, toe = 1.280f;
+    k->paper = 1.0f;                                    // SDR white in EDR units
+    k->target = (mode & 2) && (mode & 8) ? headroom : 1.0f;
+    const float alpha = 0.25f, mid = 0.538f, lin = 0.444f, toe = 1.0f;
     float kk = (lin - 1.0f) / (alpha - 1.0f);
     k->kA = k->target * lin + k->target * kk;
     k->kB = -k->target * kk * expf(lin / kk);
@@ -2717,8 +2743,8 @@ static uint32_t swap_present(Device *d, Swap *sw, uint32_t srp, uint32_t drp, ui
         if (edr_dt && (tm_mode & 8)) {
             static float logged = 0;
             if (headroom != logged) {
-                rt_log("[d3d9] HDR output: EDR headroom %.2f, peak %.0f nits at an SDR white of 250 nits%s", headroom,
-                       250.0f * headroom, (tm_mode & 1) ? ", GT7 tone mapping" : "");
+                rt_log("[d3d9] HDR output: peak %.2f x SDR white (the EDR headroom of the screen now; up to %.2f on this screen)%s",
+                       headroom, rt_cocoa_edr_potential(), (tm_mode & 1) ? ", GT7 tone mapping" : "");
                 logged = headroom;
             }
         }

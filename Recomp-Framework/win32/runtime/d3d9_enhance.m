@@ -46,7 +46,7 @@
 //
 // The two ports come from the project's "Graphic Enhancements" folder (rt_d3d9_ao.m, rt_d3d9_sss.m) and are
 // adapted to this renderer: the camera is the game's view and projection transforms (SetTransform), and the light
-// is the projector of the game's own character shadows (d3d9_enh_light_pass).
+// is the projector of the game's own character shadows (d3d9_enh_light_pass) or a fixed direction (d3d9_enh_light_dir).
 //
 // Camera. For a perspective projection P (row-vector form, w = z_view * P23, P33 = 0) the positive view distance
 // of a depth value z is t = P32 / (z - P22 / P23). The passes use the left-handed view space (x right, y up,

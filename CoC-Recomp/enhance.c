@@ -170,9 +170,14 @@ void coc_enh_init(void) {
     if (!enh_guest) rt_fatal("[enh] out of guest memory for the enhancement settings");
     rt_enh = (RtEnh *)G2H(enh_guest);
     cfg_load();
-    // the light of the contact shadows: the character shadow projector (512x512 R5G6B5 target, no depth buffer,
-    // the light's view-projection matrix in c0..c3)
+    // the character shadow projector (512x512 R5G6B5 target, no depth buffer, the light's view-projection matrix in
+    // c0..c3): the game draws into these targets during the scene
     d3d9_enh_light_pass(512, 512, 23 /* D3DFMT_R5G6B5 */, 0);
+    // the light of the contact shadows is a fixed light straight above (the world's up axis is +Z: the camera's up
+    // vector had a Z part of 0.92 to 1.0 in a level). The projector of the character shadows is a lamp near the
+    // ground (approximately 1.7 m high) that changes between frames; with it, 25 to 65% of a level frame was in
+    // shadow and the shadows moved from frame to frame.
+    d3d9_enh_light_dir(0.0f, 0.0f, 1.0f);
     // the camera: the game draws the world with vertex shaders and does not set the fixed-function transforms; its
     // world shaders (Static_Lightmapped.vso and others) have the world-view-projection matrix matFinal in c0..c3
     d3d9_enh_camera_vs(0);
@@ -252,11 +257,6 @@ static void add_enum(CPU *c, uint32_t menu, int label, const int *values, int nv
     CALL(G_CTL_LAYOUT, ctl, 0xFFFFFFFFu, 0xFFFFFFFEu, 0xFFFFFFFEu);
 }
 
-// patch at 0x412101 (the VIDEOOPTIONS builder, after its one setting): the Subtitle Size setting
-void coc_enh_add_video(CPU *c, uint32_t menu) {
-    add_enum(c, menu, T_SUBS, (const int[]){T_GAME, T_125, T_150, T_175, T_2X}, 5, K_SUBS);
-    rt_log("[enh] Subtitle Size added to the menu VIDEOOPTIONS");
-}
 
 // The menu rectangles, as parts of the screen (left, top, right, bottom). The game's menus of this kind use
 // (0.28, 0.33, 0.72, 0.73) for the rows and (0.28, 0.25, 0.72, 0.32) for the title; the rows have a fixed spacing
@@ -277,6 +277,23 @@ static void menu_rects(CPU *c, uint32_t menu, int rows) {
     CALL(G_MENU_RECT, menu, g);
     CALL(G_MENU_TITLE_RECT, menu, g + 16);
     gfree(g);
+}
+
+// patch at 0x412101 (the VIDEOOPTIONS builder, after its one setting): the Subtitle Size setting. The game draws the
+// brightness test image of this menu at a fixed place, below the Brightness row and the Back row; with the new row
+// the Back row was on the image. The rectangles of the menu (the game's (0.28, 0.33, 0.72, 0.73) and
+// (0.28, 0.25, 0.72, 0.32)) move up by one row, so that the Back row is above the image again.
+void coc_enh_add_video(CPU *c, uint32_t menu) {
+    add_enum(c, menu, T_SUBS, (const int[]){T_GAME, T_125, T_150, T_175, T_2X}, 5, K_SUBS);
+    const float r[8] = {0.28f, 0.33f - ROW_SPACING, 0.72f, 0.73f - ROW_SPACING,    // the rows
+                        0.28f, 0.25f - ROW_SPACING, 0.72f, 0.32f - ROW_SPACING};   // the title
+    uint32_t g = gcalloc(1, sizeof r);
+    if (!g) rt_fatal("[enh] out of guest memory for the menu rectangles");
+    memcpy(G2H(g), r, sizeof r);
+    CALL(G_MENU_RECT, menu, g);
+    CALL(G_MENU_TITLE_RECT, menu, g + 16);
+    gfree(g);
+    rt_log("[enh] Subtitle Size added to the menu VIDEOOPTIONS");
 }
 
 // patch at 0x4123f1 (the end of the SOUNDOPTIONS builder): the Enhancements menu, built like SOUNDOPTIONS

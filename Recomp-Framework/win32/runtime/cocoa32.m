@@ -328,7 +328,7 @@ void rt_cocoa_full_screen(uint32_t hwnd, int on) {
 // game's colors use the primaries of the screen; with the screen's primaries the EDR layer shows the same colors.
 // The change is made on the main thread, so the game sees it in the pixel format of a later drawable. Each call also
 // refreshes the EDR headroom and the EDR color space of the window's screen (rt_cocoa_edr_headroom).
-static float edr_headroom = 1.0f;
+static float edr_headroom = 1.0f, edr_potential = 1.0f;
 void rt_cocoa_layer_edr(void *layer_ref, int on, int refresh_only) {
     CAMetalLayer *l = (__bridge CAMetalLayer *)layer_ref;
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -359,9 +359,13 @@ void rt_cocoa_layer_edr(void *layer_ref, int on, int refresh_only) {
             CGColorSpaceRelease(cs);
         }
         float h = sc ? (float)sc.maximumExtendedDynamicRangeColorComponentValue : 1.0f;
+        float hp = sc ? (float)sc.maximumPotentialExtendedDynamicRangeColorComponentValue : 1.0f;
         __atomic_store(&edr_headroom, &h, __ATOMIC_RELAXED);
+        __atomic_store(&edr_potential, &hp, __ATOMIC_RELAXED);
     });
 }
+// the largest EDR headroom of the window's screen (at a lower display brightness the headroom is larger)
+float rt_cocoa_edr_potential(void) { float h; __atomic_load(&edr_potential, &h, __ATOMIC_RELAXED); return h < 1.0f ? 1.0f : h; }
 float rt_cocoa_edr_headroom(void) { float h; __atomic_load(&edr_headroom, &h, __ATOMIC_RELAXED); return h < 1.0f ? 1.0f : h; }
 
 void rt_cocoa_set_title(uint32_t hwnd, const char *title) {
