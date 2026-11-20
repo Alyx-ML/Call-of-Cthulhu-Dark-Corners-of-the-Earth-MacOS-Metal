@@ -1337,7 +1337,11 @@ static char *ps_entry(const ShaderInfo *si, int ff, int flat, int sprite) {
     sput(&b, ");\n");
     if (ff || ((si->version >> 8) & 0xFF) < 3) sput(&b, "    o.color0 = d3d_fog(o.color0, in, k);\n");
     sput(&b, "    if (!d3d_alpha_pass(o.color0.w, k)) discard_fragment();\n    PSOutC res;\n");
-    for (int i = 0; i < 4; i++) if (si->color_mask & (1 << i)) sput(&b, "    res.c%d = o.color%d;\n", i, i);
+    // k.alpha_ref.w, bit i: color output i goes to an 8-bit target stored as half float and is clamped to [0, 1]
+    // (ps_consts_header)
+    for (int i = 0; i < 4; i++)
+        if (si->color_mask & (1 << i))
+            sput(&b, "    res.c%d = (uint(k.alpha_ref.w) & %du) != 0u ? saturate(o.color%d) : o.color%d;\n", i, 1 << i, i, i);
     if (si->writes_depth) sput(&b, "    res.depth = o.depth4.x;\n");
     if (!si->color_mask && !si->writes_depth) sput(&b, "    res.c0 = float4(0.0);\n");
     sput(&b, "    return res;\n}\n");
@@ -2128,6 +2132,13 @@ static void ps_consts_header(Device *d, PSConsts *k) {
     k->alpha_ref[0] = (float)(S->rs[RS_ALPHAREF] & 0xFF);
     k->alpha_ref[1] = S->rs[RS_ALPHATESTENABLE] ? 1.0f : 0.0f;
     k->alpha_ref[2] = (float)S->rs[RS_ALPHAFUNC];
+    // the color outputs into a render target of fmt_fp_argb or fmt_fp_xrgb (an 8-bit back buffer stored as half float):
+    // a target of the game's 8-bit format clamps the shader color to [0, 1] before the blend, so these outputs are
+    // clamped too (bit i: color output i)
+    uint32_t cl = 0;
+    for (int i = 0; i < 4; i++)
+        if (d->rt[i] && (d->rt[i]->tex->f == &fmt_fp_argb || d->rt[i]->tex->f == &fmt_fp_xrgb)) cl |= 1u << i;
+    k->alpha_ref[3] = (float)cl;
     k->fog[0] = fbits(S->rs[RS_FOGSTART]); k->fog[1] = fbits(S->rs[RS_FOGEND]); k->fog[2] = fbits(S->rs[RS_FOGDENSITY]);
     color4(S->rs[RS_FOGCOLOR], k->fog_color);
     memset(k->fog_mode, 0, sizeof k->fog_mode);
@@ -3113,13 +3124,14 @@ static void gamma_reset(Swap *sw) { for (int i = 0; i < 256; i++) for (int c = 0
 //   CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 //   DEALINGS IN THE SOFTWARE.
 //
-// The curve parameters are those of the reference (alpha 0.25, mid point 0.538, linear section 0.444, toe strength
-// 1.280, blend ratio 0.6, chroma fade 0.98 .. 1.16), in the units of the reference: frame-buffer units, 1.0 = 100 nits.
+// The curve parameters are those of the reference (alpha 0.25, mid point 0.538, linear section 0.444, blend ratio 0.6,
+// chroma fade 0.98 .. 1.16), except the toe strength: 1.0, not 1.280 (present_tm_consts). The units are those of the
+// reference: frame-buffer units, 1.0 = 100 nits.
 //   SDR output (initializeAsSDR): the target is 2.5 (the SDR paper white of 250 nits of the reference); the game's
 //   white is at that paper white (expo 2.5), and the output is divided by 2.5 (oscale 0.4). Thus the colors between
 //   the mid point and the linear section (linear 0.215 .. 0.444) do not change.
-//   HDR output (initializeAsHDR): the target is the calibrated peak in nits / 100. The game's white is at the
-//   calibrated paper white in nits (expo = paper white nits / 100), and the output in nits is converted to EDR units
+//   HDR output (initializeAsHDR): the target is the calibrated peak in nits / 100. The game's white is at paper white
+//   (expo = paper white in EDR units x the nits of SDR white / 100), and the output in nits is converted to EDR units
 //   (oscale = 100 / the nits of SDR white). SDR white is taken as 100 nits x the potential EDR headroom / the current
 //   EDR headroom (rt_enh.h, RT_ENH_HDR_PEAK_NITS).
 // HDR output without tone mapping uses the units of EDR (1.0 = SDR white).
@@ -3138,7 +3150,10 @@ static void present_tm_consts(PresentTM *k, uint32_t mode, float paper, float pe
     k->rel = peak > paper ? peak / paper : 1.0f;
     k->w = (float)w; k->h = (float)h;
     k->gt = gt; k->expo = expo; k->oscale = oscale;
-    const float alpha = 0.25f, mid = 0.538f, lin = 0.444f, toe = 1.280f;
+    // toe 1.0, not the 1.280 of the reference: the game's image is already tone mapped and has its own toe, and a second
+    // toe darkened its shadows (sRGB 0.1: 0.56 x in HDR, 0.43 x in SDR). With 1.0 the curve is linear below the linear
+    // section, so the shadows and the midtones stay those of the game; the shoulder above the linear section stays.
+    const float alpha = 0.25f, mid = 0.538f, lin = 0.444f, toe = 1.0f;
     float kk = (lin - 1.0f) / (alpha - 1.0f);
     k->kA = gt * lin + gt * kk;
     k->kB = -gt * kk * expf(lin / kk);
@@ -3218,15 +3233,17 @@ static uint32_t swap_present(Device *d, Swap *sw, uint32_t srp, uint32_t drp, ui
             if (!(headroom >= 1.0f) || !(potential >= headroom))
                 rt_fatal("[d3d9] HDR output: the screen gave the EDR headroom %.3f and the potential EDR headroom %.3f", headroom, potential);
             float white = 100.0f * potential / headroom;  // the nits of SDR white (rt_enh.h)
-            paper = (float)papers[rt_enh->hdr_paper] / white;
+            // paper white: step 0 (300 nits) is the SDR white of macOS (1.0); the other steps scale it by their nits / 300
+            paper = (float)papers[rt_enh->hdr_paper] / (float)papers[RT_ENH_HDR_DEFAULT];
             peak = (float)peaks[rt_enh->hdr_peak] / white;
-            gt = (float)peaks[rt_enh->hdr_peak] / 100.0f; expo = (float)papers[rt_enh->hdr_paper] / 100.0f; oscale = 100.0f / white;   // GT7: HDR output
+            gt = (float)peaks[rt_enh->hdr_peak] / 100.0f; expo = paper * white / 100.0f; oscale = 100.0f / white;   // GT7: HDR output
             if (headroom != d->tm_logged.headroom || potential != d->tm_logged.potential ||
                 peaks[rt_enh->hdr_peak] != d->tm_logged.peak || papers[rt_enh->hdr_paper] != d->tm_logged.paper) {
-                rt_log("[d3d9] HDR output: peak %d nits (%.2f x SDR white), paper white %d nits (%.2f x SDR white)%s; the screen: EDR "
-                       "headroom %.2f of %.2f, SDR white approximately %.0f nits, peak approximately %.0f nits",
-                       peaks[rt_enh->hdr_peak], peak, papers[rt_enh->hdr_paper], paper, (tm_mode & 1) ? ", GT7 tone mapping" : "",
-                       headroom, potential, white, white * headroom);
+                rt_log("[d3d9] HDR output: peak %d nits (%.2f x SDR white), paper white %.2f x SDR white (approximately %.0f nits; "
+                       "Brightness %d nits / %d nits)%s; the screen: EDR headroom %.2f of %.2f, SDR white approximately %.0f nits, "
+                       "peak approximately %.0f nits",
+                       peaks[rt_enh->hdr_peak], peak, paper, paper * white, papers[rt_enh->hdr_paper], papers[RT_ENH_HDR_DEFAULT],
+                       (tm_mode & 1) ? ", GT7 tone mapping" : "", headroom, potential, white, white * headroom);
                 d->tm_logged.headroom = headroom; d->tm_logged.potential = potential;
                 d->tm_logged.peak = peaks[rt_enh->hdr_peak]; d->tm_logged.paper = papers[rt_enh->hdr_paper];
             }

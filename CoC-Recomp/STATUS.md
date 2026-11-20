@@ -819,3 +819,61 @@ The Prototype launcher calls `finishLaunching` only when the game starts. Before
 - Quit in the Dock and Command-Q while the window is open.
 - The look of the window on the screen (no screen capture).
 - VoiceOver with the window.
+
+## 2026-11-20: Crash in memcpy (small copy to an unaligned address)
+
+Problem: the game stopped during play with `[rt] indirect call/jump to unknown address 0x47ce74` in `F_47cd10` (MSVC `memcpy`).
+
+Cause: for a copy of 0 to 3 bytes to an unaligned destination, `memcpy` runs `sub ecx, 4 ; jb 0x47cd64`, and `0x47cd64: jmp dword ptr [ecx*4 + 0x47ce6c]`. Only the borrow reaches the jump, so the index is -4 to -1 and the 4 entries are before `0x47ce6c`. The recompiler read the table forward from `0x47ce6c` and found no entries, so the translated jump had no cases.
+
+Correction: `Recomp-Framework/win32/tools/recomp_w32.py`, new `borrow_index()`. When every branch to the jump is `sub reg, N ; jb`, and no instruction falls through to the jump, the translator reads the N entries before the table address. The new code translated 2 jumps: `0x47cd64` (cases `0x47ce6c`, `0x47ce74`, `0x47ce80`, `0x47ce94`) and `0x47b2d4`, a second copy of the same routine (cases `0x47b3dc`, `0x47b3e4`, `0x47b3f0`, `0x47b404`). No other generated line changed.
+
+Verification: `make gen` and `make app` completed with no warnings. A 45 s headless boot presented 2400 frames with no runtime error. Not verified: the small unaligned copy path itself at run time.
+
+## 2026-11-20: HDR paper white at the SDR white of macOS
+
+Problem (user report): HDR output was far too dark.
+
+Cause: the runtime used the Brightness (HDR) values of the RE Engine as absolute nits. It converted them to EDR units with an estimate of the nits of SDR white (100 nits x potential EDR headroom / current EDR headroom). macOS always shows the desktop with EDR, at the SDR white that the user selects. Measured on the user's screen with the game open: potential EDR headroom 16.000, current EDR headroom 2.667, thus SDR white approximately 600 nits. Paper white was 300 / 600 = 0.50 x the white of the desktop at step 0, and 640 / 600 = 1.07 x at step +10.
+
+Sources: [KoKlusz, Resident Evil 4 (PC) HDR Analysis](https://github.com/KoKlusz/HDR-Gaming-Database/discussions/63) gives Brightness (HDR) as "scene brightness" and compares the HDR default with the SDR image at 300 nits. [hdrgamer, Resident Evil 4 HDR Settings](https://www.hdrgamer.com/2023/03/resident-evil-4-hdr-settings.html) gives it as the midpoint setting. Both are secondary sources, read 2026-11-20.
+
+Correction (`Recomp-Framework/win32/runtime/d3d9_metal.m`, `rt_enh.h`): step 0 of Brightness (HDR) is paper white at the SDR white of macOS (EDR 1.0). Each other step is that white x its nits / 300 (+10: 2.13, -10: 0.17). The UI stays at paper white. With GT7 tone mapping, expo is paper white x the nits of SDR white / 100, so the game's white is again at paper white. Max Brightness (HDR) does not change: the peak is in nits and is converted with the estimate of SDR white, and the test square shows the peak of the screen.
+
+Verification: `make build/CoCDCoTE` compiled and linked (only the two known `key_frame` warnings of `wmvcore.c`). Not verified: a run with the new code. The user's game was open from the app bundle, so the bundle was not rebuilt and no second game was started.
+
+Not changed: the calibration screens. No source found describes the image of the second screen (Brightness) of the RE Engine.
+
+## 2026-11-20: GT7 tone mapping without the toe, bright area under characters
+
+### GT7 tone mapping made the game too dark
+
+Problem (user report): with GT7 tone mapping on, the game was very dark.
+
+Cause: the GT7 curve has a toe (strength 1.280) below its mid point (0.538 frame-buffer units). The reference applies the curve to the linear light of a scene. This game gives an image that its own pipeline already tone mapped, with its own toe. The second toe darkened the shadows again. Calculated with a copy of the shader functions in Python (paper white at the SDR white of macOS, SDR white 600 nits, peak 1600 nits):
+
+| Game gray (sRGB) | Output / input, HDR | Output / input, SDR |
+|---|---|---|
+| 0.05 | 0.42 | 0.33 |
+| 0.10 | 0.56 | 0.43 |
+| 0.20 | 0.83 | 0.62 |
+| 0.30 | 1.00 | 0.81 |
+| 0.50 | 1.00 | 1.00 |
+
+Correction (`Recomp-Framework/win32/runtime/d3d9_metal.m`, `present_tm_consts`): the toe strength is 1.0. With this value the curve is linear below the linear section. Calculated: all the grays of the table give 1.00 in HDR and SDR. A dark color (sRGB 0.2, 0.1, 0.05) gives 1.00 in each channel (before: 0.77, 0.63, 0.55). The shoulder above the linear section does not change (SDR white: 0.835, as before).
+
+### Bright area under characters
+
+Problem (user report, with an image of the town): a bright, flat area with straight edges on the ground under a character.
+
+Measured (headless run from the user's town save, temporary logging, now removed): the game projects the character shadows with the pixel shader `psProjector1_xDiff_Neg.pso` into the back buffer (RGBA16Float, 1800 × 1125), with alpha blending, `SRCBLEND` = ZERO and `DESTBLEND` = SRCCOLOR. Thus the ground is multiplied by the shader color. The shader (ps_1_1, disassembled) calculates `r0.rgb = (1 - shadow) * v0 + 0.5` (`def c0 = 0.5`).
+
+Cause: where the projector has no shadow, the color is 0.5 + v0, which is above 1 when the vertex color v0 is above 0.5. The game's back buffer is 8-bit (X8R8G8B8 or A8R8G8B8). An 8-bit target clamps the shader color to [0, 1] before the blend, so the factor is 1 and the ground does not change. The runtime stores this back buffer as RGBA16Float (highlights above white), and a half-float target does not clamp. Thus the projector area was multiplied by up to 1.5.
+
+Correction (`d3d9_metal.m`, `ps_consts_header` and the pixel shader entry point; `d3d9_internal.h`, comment of `alpha_ref`): for each color output into a target of `fmt_fp_argb` or `fmt_fp_xrgb` (an 8-bit back buffer stored as half float), `alpha_ref.w` has a bit, and the shader output is clamped to [0, 1]. The blend itself stays in half float, so additive blending can still go above white. The fixed-function path already clamps each texture stage. The other 32-bit render targets are RGBA16Unorm and clamp in the hardware.
+
+### Verification
+
+- `make app` built the app (only the two known `key_frame` warnings of `wmvcore.c`).
+- Headless run of 90 s from a copy of the user's town save, with `MTL_DEBUG_LAYER=1`: no Metal validation error, no translation error, 4200 frames. The dumped Metal source of all 29 pixel shaders has the clamp.
+- Not verified: the image on the screen. Screenshots are not permitted, and the value of v0 under the character was not measured.

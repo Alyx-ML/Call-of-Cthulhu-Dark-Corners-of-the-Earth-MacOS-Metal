@@ -53,7 +53,8 @@ typedef struct {
     float c[VS_CONST_F][4];
 } VSConsts;
 typedef struct {
-    float alpha_ref[4];        // x: D3DRS_ALPHAREF (0-255), y: alpha test on, z: D3DRS_ALPHAFUNC
+    float alpha_ref[4];        // x: D3DRS_ALPHAREF (0-255), y: alpha test on, z: D3DRS_ALPHAFUNC, w: bit i: color output i
+                               //    is clamped to [0, 1] (an 8-bit render target stored as half float)
     float fog[4];              // start, end, density
     float fog_color[4];
     float fog_mode[4];         // x: 0 off, 1 EXP, 2 EXP2, 3 LINEAR (vertex fog: any nonzero); y: 0 factor from FOG0,

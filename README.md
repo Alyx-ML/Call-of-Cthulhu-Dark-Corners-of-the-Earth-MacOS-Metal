@@ -115,7 +115,7 @@ The game made its menus, text and pointer for 4:3 screens. On a wider screen, th
 HDR Output needs a display with HDR (EDR) support. HDR Output and GT7 Tone Mapping change the 3D scene. The UI, the text and the menus stay at paper white.
 
 - **Highlights:** the game clamps its final image to white. The app keeps the colors of the scene that are brighter than white (lamps, fire, bloom) from before the game's post-processing. With HDR Output, these highlights go above the white of the game, up to the peak. With GT7 Tone Mapping in SDR, they keep their detail.
-- **GT7 Tone Mapping** is the tone mapping of Gran Turismo 7 (Polyphony Digital, MIT license), with the parameters of the reference. In SDR, the white of the game is at 250 nits of the reference. With HDR Output, the white of the game is at paper white and the highlights go up to the peak.
+- **GT7 Tone Mapping** is the tone mapping of Gran Turismo 7 (Polyphony Digital, MIT license), with the parameters of the reference except the toe. The image of the game already has its own toe, so the curve does not darken the shadows again. The shadows and the midtones stay as the game made them, and the curve compresses only the highlights. In SDR, the white of the game is at 250 nits of the reference. With HDR Output, the white of the game is at paper white and the highlights go up to the peak.
 - **Bloom** has no threshold: it mixes a wide blur of the scene into the scene (Low 4%, Medium 8%, High 15%). Bright areas spread light into their surroundings.
 - **Field of View** multiplies the field of view of the player camera (the game: 55 degrees vertical). Cut scenes keep their field of view. All cameras use the aspect ratio of the window, so that the 3D image is not too wide.
 - **Sanity Effects** sets the strength of the visual sanity effects of the game: Black And White, Blurred Vision, Vertigo Blur, Screen Distort and Camera Motion Blur. Off removes them. The sounds and the sanity value of the game do not change.
@@ -137,7 +137,7 @@ The two settings are those of the Capcom RE Engine (Resident Evil Village, Resid
 
 1. Find the square on the left of the test image. It has a smaller square in it.
 2. Increase **Max Brightness (HDR)** until the outline of the smaller square is barely visible.
-3. Look at the bar and the gray steps on the right. Set **Brightness (HDR)** to the brightness that you prefer for the white of the game and the UI. The default (300 nits) is a balanced value.
+3. Look at the bar and the gray steps on the right. Set **Brightness (HDR)** to the brightness that you prefer for the white of the game and the UI. The default (300 nits) is a balanced value. macOS always shows the desktop with EDR. Step 0 puts the white of the game at the white of the macOS desktop. Each other step multiplies that white by its value / 300 nits (+10: 2.13 times, -10: 0.17 times).
 
 macOS does not give the brightness of the screen in nits. The app takes the peak of the screen as 100 nits × the potential EDR headroom of the screen (1600 nits on a Liquid Retina XDR display). The app converts the two settings from nits with this value.
 

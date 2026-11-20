@@ -226,6 +226,9 @@ class FuncGen:
             mm = op.mem
             if mm.base or not mm.index or mm.scale != 4 or self.iat_slot(op) is not None: return None
             ta = mm.disp & 0xFFFFFFFF
+            n = self.borrow_index(seen, i, mm.index)
+            if n:
+                return self.read_table(ta - 4 * n, n, n) or None
             for k in range(len(prev) - 1, -1, -1):   # MSVC memmove: neg ecx ; jmp [ecx*4 + table] reads backward
                 x = prev[k]; ops = x.operands
                 if ops and ops[0].type == X.X86_OP_REG and self.same_gpr(ops[0].reg, mm.index) and x.mnemonic not in ("cmp", "test"):
@@ -247,6 +250,27 @@ class FuncGen:
             if ops and ops[0].type == X.X86_OP_REG and self.same_gpr(ops[0].reg, r):
                 return None
         return None
+
+    def borrow_index(self, seen, i, idx):
+        """MSVC memcpy: 'sub ecx, N ; jb L' ... 'L: jmp [ecx*4 + table]'. Only the borrow reaches L, so the index is
+        -N..-1 and the N entries are before the table address. The result is N, or None for another form."""
+        n = None
+        for x in seen.values():
+            if not x: continue
+            if x.address + x.size == i.address and x.mnemonic not in ("jmp", "ret"):
+                return None   # the jmp also runs after the instruction before it
+            ops = x.operands
+            if not (x.group(cs.CS_GRP_JUMP) and ops and ops[0].type == X.X86_OP_IMM and (ops[0].imm & 0xFFFFFFFF) == i.address):
+                continue
+            if x.mnemonic != "jb": return None
+            s = next((p for p in seen.values() if p and p.address + p.size == x.address), None)
+            if not s or s.mnemonic != "sub" or len(s.operands) != 2: return None
+            so = s.operands
+            if so[0].type != X.X86_OP_REG or not self.same_gpr(so[0].reg, idx) or so[1].type != X.X86_OP_IMM: return None
+            k = so[1].imm & 0xFFFFFFFF
+            if not 0 < k <= 16 or (n is not None and n != k): return None
+            n = k
+        return n
 
     def table_limit(self, prev, k, idx):
         """Look back for 'cmp idx, N' (guarding ja) -> N+1 entries.  Also follows a byte index table."""

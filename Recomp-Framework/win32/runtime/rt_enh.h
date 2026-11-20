@@ -46,7 +46,9 @@ typedef struct RtEnh {
 #define RT_ENH_HDR_PEAK_NITS {300, 400, 500, 600, 700, 750, 800, 850, 900, 950, 1000, \
                               1100, 1200, 1400, 1600, 1800, 2000, 2500, 3000, 3500, 4000}
 #define RT_ENH_HDR_PEAKS 21
-// The values of hdr_paper (Brightness (HDR)), 50 to 640 nits.
+// The values of hdr_paper (Brightness (HDR)), 50 to 640 nits. macOS always shows SDR content at its SDR white (EDR
+// 1.0), so step 0 (300 nits) is paper white at the SDR white of macOS, and another step is paper white at that SDR
+// white x its nits / 300 (for example +10: 2.13 x SDR white, -10: 0.17 x SDR white).
 #define RT_ENH_HDR_PAPER_NITS {50, 80, 120, 160, 180, 200, 220, 240, 260, 280, 300, \
                                320, 340, 380, 420, 460, 500, 540, 580, 610, 640}
 #define RT_ENH_HDR_PAPERS 21
@@ -54,7 +56,7 @@ typedef struct RtEnh {
 // macOS gives the brightness of the screen only as EDR headroom, a factor of the current SDR white. The runtime takes
 // the peak of the screen as 100 nits x the potential EDR headroom (16 on a Liquid Retina XDR display: 1600 nits, its
 // HDR peak), so SDR white is approximately 100 nits x potential headroom / current headroom. The runtime converts
-// the two values from nits to EDR units with this SDR white. macOS clips a peak above the peak of the screen.
+// the peak from nits to EDR units with this SDR white. macOS clips a peak above the peak of the screen.
 
 extern RtEnh *rt_enh;
 
