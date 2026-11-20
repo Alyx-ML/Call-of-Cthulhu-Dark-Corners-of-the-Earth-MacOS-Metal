@@ -19,6 +19,7 @@ This repository contains no game files and no game code. You must own the game. 
 - The game folder of the GOG release, with these contents:
   - The `Engine` folder with `CoCMainWin32.exe`.
   - The other game folders from the GOG install (for example `Scripts`, `Resources`, `MainMenu`).
+  - The file `goggame-1189711155.ico` of the GOG install. The installer makes the app icon from it.
 
 The installer checks the SHA-256 of `Engine/CoCMainWin32.exe`. The supported value is:
 
@@ -81,6 +82,8 @@ The game has a menu **Options > Enhancements**. The menu also shows in the pause
 | Field of View | Game, 110%, 120%, 130%, 140% |
 | Sanity Effects | Game, 75%, 50%, 25%, Off |
 | Anti-Aliasing (MetalFX) | Off, On |
+| Retina Resolution (restart) | Off, On |
+| Headphone Audio (HRTF) | Off, On |
 | Ambient Occlusion | Off, Low, Medium, High |
 | GT7 Tone Mapping | Off, On |
 | HDR Output | Off, On |
@@ -100,7 +103,9 @@ HDR Output needs a display with HDR (EDR) support. HDR Output and GT7 Tone Mappi
 - **Bloom** has no threshold: it mixes a wide blur of the scene into the scene (Low 4%, Medium 8%, High 15%). Bright areas spread light into their surroundings.
 - **Field of View** multiplies the field of view of the player camera (the game: 55 degrees vertical). Cut scenes keep their field of view. All cameras use the aspect ratio of the window, so that the 3D image is not too wide.
 - **Sanity Effects** sets the strength of the visual sanity effects of the game: Black And White, Blurred Vision, Vertigo Blur, Screen Distort and Camera Motion Blur. Off removes them. The sounds and the sanity value of the game do not change.
-- **Anti-Aliasing (MetalFX)** smooths the edges of the 3D scene with the MetalFX temporal scaler of macOS at the full resolution of the window.
+- **Anti-Aliasing (MetalFX)** smooths the edges of the 3D scene with the MetalFX temporal scaler of macOS at the full resolution of the window. With anti-aliasing, the textures of the 3D scene use sharper mipmap levels (a texture LOD bias of -1, as the MetalFX guide of Apple recommends).
+- **Retina Resolution** makes the game use the resolution of the screen in pixels (for example 3600 × 2250 on a screen of 1800 × 1125 points). Without it, the game uses the screen size in points, and macOS scales the image up. The setting applies at the next start of the game. On the test Mac (M4 Pro) with all enhancements on, the game ran at 54 to 55 frames per second with Retina Resolution, and at 60 frames per second without it.
+- **Headphone Audio (HRTF)** plays the 3D sounds of the game through the spatial audio of macOS for headphones (the head-related transfer function of the AUSpatialMixer, with your personalized spatial audio profile when macOS has one). Use it with headphones. Without it, 3D sounds use left-right panning.
 - **Contact shadows** use the lights of the game: the light of the character nearest to the camera. A surface that the light does not reach gets no contact shadow.
 
 ### HDR Calibration
@@ -123,6 +128,8 @@ macOS does not give the brightness of the screen in nits. The app takes the peak
 ## Mac features
 
 - **Full screen:** use **View > Enter Full Screen** (Control-Command-F) or the green window button. The image keeps its aspect ratio.
+- **Window size:** when the game is not in full screen, use **Window > Window Size 50%**, **75%** or **100%** (of the screen), or drag the edge of the window. **Window > Minimize** (Command-M) and **Zoom** are also in the menu.
+- **App menu:** **About**, **Hide** (Command-H), **Hide Others** (Option-Command-H), **Show All** and **Quit** (Command-Q). The menu bar shows the name "Call of Cthulhu".
 - **Frame rate:** the game runs at 60 frames per second, also on a 120 Hz (ProMotion) display. The scripts of the game fail above 60 frames per second. The app presents each frame at an equal interval.
 - **Pause in the background:** when you switch to a different app, the game stops and the sound stops. The game continues when you go back.
 - **Game controllers:** controllers that macOS and SDL3 support work.

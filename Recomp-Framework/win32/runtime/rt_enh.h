@@ -1,6 +1,6 @@
 // Enhancement settings that the runtime applies on top of the game (anisotropic filtering, ambient occlusion,
 // tone mapping, HDR output and its calibration, contact shadows, bloom, reduced banding, sharp shadows, temporal
-// anti-aliasing; and
+// anti-aliasing, the display mode of the Retina resolution, headphone audio; and
 // settings that the game project applies: gamepad input, intro videos, subtitle size, field of view, sanity effects).
 //
 // The game project owns the settings: it allocates RtEnh in guest memory, so that controls of the game's own
@@ -33,6 +33,10 @@ typedef struct RtEnh {
     int32_t aa;        // 0: off; 1: MetalFX temporal anti-aliasing of the 3D scene
     int32_t sanity;    // game project: the intensity of the game's visual sanity effects (0 = the game's; the game
                        //    project gives the steps)
+    int32_t retina;    // 0: the game's resolution; 1: the Retina resolution, the size of the screen in pixels. The display
+                       //    modes then include that size; the game project gives it to the game (at its next start)
+    int32_t hrtf;      // 0: 3D sounds with balance panning; 1: 3D sounds through the head-related transfer function (HRTF)
+                       //    of macOS for headphones (fmodex.c)
 } RtEnh;
 
 // The HDR calibration has the two settings of the Capcom RE Engine (Resident Evil Village, Resident Evil 4), with the

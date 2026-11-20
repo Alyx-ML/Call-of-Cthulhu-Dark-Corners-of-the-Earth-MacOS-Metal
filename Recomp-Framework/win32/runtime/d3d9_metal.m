@@ -35,6 +35,7 @@
 void *rt_window_layer(uint32_t hwnd);
 void rt_window_size(uint32_t hwnd, int *w, int *h);
 void rt_cocoa_screen_size(int *w, int *h);
+void rt_cocoa_screen_pixels(int *w, int *h);
 void rt_cocoa_set_size(uint32_t hwnd, int w, int h);
 void rt_cocoa_full_screen(uint32_t hwnd, int on);
 void rt_cocoa_layer_edr(void *layer, int on, int refresh_only);
@@ -495,6 +496,9 @@ struct Device {
     struct { float headroom, potential; int peak, paper; } tm_logged;
     // temporal anti-aliasing (rt_enh.h aa): the 3D scene draws of a frame move by a sub-pixel offset (taa_offset)
     float taa_jit[2];              // the offset (pixels, y down) in the vertex constants uploaded last (pos_fixup)
+    float taa_lod;                 // the texture LOD bias of temporal anti-aliasing in the pixel constants uploaded last
+                                   //    (ps_consts_header): TAA_LOD_BIAS for a scene draw with an offset, otherwise 0
+    int taa_lod_logged;            // the first draw with the LOD bias is in the log
     uint32_t taa_frame;            // the last frame with anti-aliasing
     float taa_vp[16];              // the view-projection of the camera of the last anti-aliasing frame
     int taa_vp_ok;                 // taa_vp holds a camera
@@ -2004,17 +2008,25 @@ static float taa_halton(uint32_t i, uint32_t b) {
     while (i > 0) { r += f * (float)(i % b); i /= b; f /= (float)b; }
     return r;
 }
-static void taa_offset(const Device *d, uint32_t f, float o[2]) {
+// returns 1 when frame f has offsets (o), 0 when it has none (o = 0)
+static int taa_offset(const Device *d, uint32_t f, float o[2]) {
     o[0] = o[1] = 0.0f;
-    if (!rt_enh || rt_enh->aa != 1 || d->taa_frame == 0 || d->taa_frame != f - 1) return;
+    if (!rt_enh || rt_enh->aa != 1 || d->taa_frame == 0 || d->taa_frame != f - 1) return 0;
     uint32_t i = f % TAA_PHASES + 1;
     o[0] = taa_halton(i, 2) - 0.5f; o[1] = taa_halton(i, 3) - 0.5f;
+    return 1;
 }
-static void taa_draw_offset(const Device *d, float o[2]) {
+// The texture LOD bias of the scene draws with an offset: log2(input size / output size) - 1 (the MetalFX
+// integration guide of Apple), with the input size equal to the output size. It is added to D3DSAMP_MIPMAPLODBIAS.
+// MetalFX gets back the detail of the sharper mipmap levels from the offsets of the frames.
+#define TAA_LOD_BIAS (-1.0f)
+// the offset of this draw (o, pixels with y down); returns its texture LOD bias (TAA_LOD_BIAS with an offset, or 0)
+static float taa_draw_offset(const Device *d, float o[2]) {
     uint32_t f = d->frame + 1;
     const Surf *r0 = d->rt[0];
-    if (r0 && r0->swap && d->ds && d->enh_done != f) taa_offset(d, f, o);
-    else o[0] = o[1] = 0.0f;
+    if (r0 && r0->swap && d->ds && d->enh_done != f && taa_offset(d, f, o)) return TAA_LOD_BIAS;
+    o[0] = o[1] = 0.0f;
+    return 0.0f;
 }
 
 // ---------------- constants ----------------
@@ -2130,7 +2142,7 @@ static void ps_consts_header(Device *d, PSConsts *k) {
         k->bumplum[i][0] = fbits(S->tss[i][TSS_BUMPENVLSCALE]); k->bumplum[i][1] = fbits(S->tss[i][TSS_BUMPENVLOFFSET]);
         k->bumplum[i][2] = k->bumplum[i][3] = 0.0f;
     }
-    for (int s = 0; s < 16; s++) k->lod_bias[s >> 2][s & 3] = fbits(S->samp[s][SAMP_MIPMAPLODBIAS]);
+    for (int s = 0; s < 16; s++) k->lod_bias[s >> 2][s & 3] = fbits(S->samp[s][SAMP_MIPMAPLODBIAS]) + d->taa_lod;
     memcpy(k->i, S->psi, sizeof k->i);
     memcpy(k->b, S->psb, sizeof k->b);
 }
@@ -2328,9 +2340,17 @@ static int prepare(Device *d, int points, const UpStream *up, uint32_t *instance
     if (x1 <= x0 || y1 <= y0) return 0;   // nothing inside the scissor rectangle
     [e setScissorRect:(MTLScissorRect){(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0)}];
     // the sub-pixel offset of temporal anti-aliasing changes the half-pixel offset of the vertex constants
+    // and adds its texture LOD bias to the pixel constants
     float jt[2];
-    taa_draw_offset(d, jt);
+    float lod = taa_draw_offset(d, jt);
     if (jt[0] != d->taa_jit[0] || jt[1] != d->taa_jit[1]) { d->taa_jit[0] = jt[0]; d->taa_jit[1] = jt[1]; d->vsc_dirty = d->ffc_dirty = 1; }
+    if (lod != d->taa_lod) {
+        d->taa_lod = lod; d->psc_dirty = 1;
+        if (lod != 0.0f && !d->taa_lod_logged) {
+            rt_log("[d3d9] anti-aliasing: frame %u, texture LOD bias %.1f on the scene draws", d->frame + 1, lod);
+            d->taa_lod_logged = 1;
+        }
+    }
     // constants
     __unsafe_unretained id<MTLBuffer> cb; uint32_t co;
     if (ff) {
@@ -3245,7 +3265,8 @@ static uint32_t ms_counts(id<MTLDevice> dev, uint32_t *out) {
     for (int i = 0; i < 4; i++) if ([dev supportsTextureSampleCount:cand[i]]) out[n++] = cand[i];
     return n;
 }
-// display modes: common sizes that fit the screen, and the screen itself (X8R8G8B8, 60 Hz)
+// display modes: common sizes that fit the screen, and the screen itself (X8R8G8B8, 60 Hz); with the Retina resolution
+// (rt_enh.h retina) also the screen in pixels
 #define MAX_MODES 32
 static uint32_t mode_list(uint32_t (*m)[2]) {
     static const uint16_t std[][2] = {{640, 480}, {800, 600}, {1024, 768}, {1152, 864}, {1280, 720}, {1280, 768}, {1280, 800},
@@ -3261,6 +3282,11 @@ static uint32_t mode_list(uint32_t (*m)[2]) {
         m[n][0] = std[i][0]; m[n][1] = std[i][1]; n++;
     }
     if (!native && sw > 0 && sh > 0) { m[n][0] = (uint32_t)sw; m[n][1] = (uint32_t)sh; n++; }
+    if (rt_enh && rt_enh->retina) {
+        int pw = 0, ph = 0;
+        rt_cocoa_screen_pixels(&pw, &ph);
+        if ((pw > sw || ph > sh) && n < MAX_MODES) { m[n][0] = (uint32_t)pw; m[n][1] = (uint32_t)ph; n++; }
+    }
     return n;
 }
 static void fill_caps(uint32_t p, uint32_t type) {

@@ -6,6 +6,14 @@
 // compressed data and decode on the mixing thread as they play. Formats: Ogg Vorbis (stb_vorbis) and RIFF WAVE PCM.
 // Mixing runs on the CoreAudio thread from host data only.
 //
+// Output: the default output unit pulls an AUSpatialMixer (macOS). Its input 0 is the stereo mix of the channels
+// (balance panning for 3D channels), passed through. With Headphone Audio (rt_enh.h hrtf), each 3D channel i plays
+// on its own mono input 1 + i instead, as a point source of the head-related transfer function (HRTF) of the mixer
+// for headphones (kSpatializationAlgorithm_UseOutputType, kSpatialMixerOutputType_Headphones; a personalized HRTF of
+// the user when macOS has one). The direction of the source in the listener frame sets its azimuth and elevation.
+// The attenuation of the distance and the doppler stay those of this file, so the mixer gets a fixed distance at its
+// reference distance (no attenuation).
+//
 // Constants were checked against the game's own fmodex.dll (FMOD_System_GetVersion reports 0x40105): every C
 // entry point validates its object and returns 0x21 (FMOD_ERR_INVALID_HANDLE) for one it doesn't know.
 #define STB_VORBIS_NO_STDIO
@@ -16,6 +24,7 @@
 #undef C
 #undef R
 #include "rt32.h"
+#include "rt_enh.h"
 #include <AudioToolbox/AudioToolbox.h>
 #include <math.h>
 
@@ -98,7 +107,16 @@ static int sys_created, sys_init;
 static float out_rate = 48000;
 static float l_pos[3], l_vel[3], l_fwd[3] = {0, 0, 1}, l_up[3] = {0, 1, 0};
 static float doppler = 1, distfactor = 1, rolloff = 1;
-static AudioUnit unit;
+static AudioUnit unit, mixer;
+static int bus_on[MAXCH];          // render thread: input 1 + i of the mixer is enabled, with the direction of channel i
+static int hrtf_live[MAXCH];       // render thread: channel i plays on input 1 + i in this render cycle
+static int hrtf_logged = -1;       // the Headphone Audio state of the last render cycle (written by the render thread)
+static _Atomic OSStatus render_err;   // the first error of the mixer's render (reported by System_Update)
+// The gain of the HRTF inputs: measured with white noise through the mixer (headphones, a source in front at its
+// reference distance), the sum of the energy of the two ears is 1.113 x the energy of the input, and 2.0 x with the
+// balance panning of input 0 (the full source on both sides). +2.55 dB = 10 log10(2.0 / 1.113) keeps the loudness of
+// a source in front.
+#define HRTF_GAIN_DB 2.55f
 
 static uint32_t snd_handle(int i) { return H_SOUND | (uint32_t)i; }
 static int snd_index(uint32_t h) { uint32_t i = h & 0x0FFFFFFFu; return (h & 0xF0000000u) == H_SOUND && i < MAXSND && snds[i].used && !snds[i].released ? (int)i : -1; }
@@ -140,22 +158,21 @@ static inline int16_t wav_sample(const uint8_t *s, uint32_t bits) {
 static float dot3(const float *a, const float *b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
 static void cross3(const float *a, const float *b, float *o) { o[0] = a[1] * b[2] - a[2] * b[1]; o[1] = a[2] * b[0] - a[0] * b[2]; o[2] = a[0] * b[1] - a[1] * b[0]; }
 
-// 3D: inverse-distance rolloff between min and max distance, a left-handed listener frame (FMOD_INIT_3D_RIGHTHANDED
-// is not set), linear balance panning, doppler from the velocities
-static void spatial(Chan *ch, float *gl, float *gr, float *fmul) {
+// 3D: inverse-distance rolloff between min and max distance (att), a left-handed listener frame
+// (FMOD_INIT_3D_RIGHTHANDED is not set), doppler from the velocities (fmul). loc: the direction to the source in the
+// listener frame (x right, y up, z forward; scaled by the distance); dist: the distance.
+static void spatial(Chan *ch, float *att, float *fmul, float loc[3], float *dist_out) {
     float d[3] = {ch->p[0] - l_pos[0], ch->p[1] - l_pos[1], ch->p[2] - l_pos[2]};
     float dist = sqrtf(dot3(d, d));
     float mind = ch->mind > 0 ? ch->mind : 1, maxd = ch->maxd > mind ? ch->maxd : mind;
     float cd = dist < mind ? mind : dist > maxd ? maxd : dist;
-    float att = mind / (mind + rolloff * (cd - mind));
-    float pan = 0;
-    if (dist > 1e-4f) {
-        float right[3]; cross3(l_up, l_fwd, right);
-        float rl = sqrtf(dot3(right, right));
-        if (rl > 1e-6f) pan = dot3(d, right) / (dist * rl);
-    }
-    *gl = att * (pan > 0 ? 1 - pan : 1);
-    *gr = att * (pan < 0 ? 1 + pan : 1);
+    *att = mind / (mind + rolloff * (cd - mind));
+    float right[3]; cross3(l_up, l_fwd, right);
+    float rl = sqrtf(dot3(right, right)), ul = sqrtf(dot3(l_up, l_up)), fl = sqrtf(dot3(l_fwd, l_fwd));
+    loc[0] = rl > 1e-6f ? dot3(d, right) / rl : 0;
+    loc[1] = ul > 1e-6f ? dot3(d, l_up) / ul : 0;
+    loc[2] = fl > 1e-6f ? dot3(d, l_fwd) / fl : 0;
+    *dist_out = dist;
     *fmul = 1;
     if (doppler > 0 && dist > 1e-4f) {
         float c = 340.0f * distfactor;
@@ -163,6 +180,23 @@ static void spatial(Chan *ch, float *gl, float *gr, float *fmul) {
         float den = c + doppler * vs, num = c + doppler * vl;
         if (den > 1e-3f && num > 0) { *fmul = num / den; if (*fmul > 4) *fmul = 4; if (*fmul < 0.25f) *fmul = 0.25f; }
     }
+}
+// the gains of the balance panning of input 0: linear between the sides, the full source in the middle
+static void balance(Chan *ch, float *gl, float *gr, float *fmul) {
+    float att, loc[3], dist;
+    spatial(ch, &att, fmul, loc, &dist);
+    float pan = dist > 1e-4f ? loc[0] / dist : 0;
+    *gl = att * (pan > 0 ? 1 - pan : 1);
+    *gr = att * (pan < 0 ? 1 + pan : 1);
+}
+// the azimuth (degrees, -180 .. 180, positive to the right; measured with the mixer: +90 is the right ear) and the
+// elevation (degrees, -90 .. 90, positive up) of the source of a 3D channel for the HRTF input
+static void direction(Chan *ch, float *az, float *el, float *att, float *fmul) {
+    float loc[3], dist;
+    spatial(ch, att, fmul, loc, &dist);
+    if (dist <= 1e-4f) { *az = 0; *el = 0; return; }
+    *az = atan2f(loc[0], loc[2]) * (180.0f / (float)M_PI);
+    *el = atan2f(loc[1], sqrtf(loc[0] * loc[0] + loc[2] * loc[2])) * (180.0f / (float)M_PI);
 }
 // stream frame access: refill the channel's decode buffer so frames [i, i+1] are present; 0 when the stream ended
 static int stream_fill(Chan *ch, Snd *s, double want) {
@@ -224,79 +258,185 @@ static void chan_stop_locked(Chan *ch) {
     ch->used = 0; ch->playing = 0; ch->sound = -1; ch->dsp = -1;
     ch->gen++;
 }
-static OSStatus render(void *ref, AudioUnitRenderActionFlags *fl, const AudioTimeStamp *ts, UInt32 bus, UInt32 n, AudioBufferList *io) {
-    (void)ref; (void)fl; (void)ts; (void)bus;
-    float *outl = io->mBuffers[0].mData, *outr = io->mNumberBuffers > 1 ? io->mBuffers[1].mData : NULL;
-    memset(outl, 0, n * sizeof(float)); if (outr) memset(outr, 0, n * sizeof(float));
-    if (rt_paused()) return noErr;   // paused in the background: silence, and no sound moves on
-    pthread_mutex_lock(&mx);
-    for (int i = 0; i < MAXCH; i++) {
-        Chan *ch = &chans[i];
-        if (!ch->used || !ch->playing || ch->paused || ch->sound < 0) continue;
-        Snd *s = &snds[ch->sound];
-        float gl = ch->vol, gr = ch->vol, fm = 1;
-        if (ch->mode & M_3D) { float a, b; spatial(ch, &a, &b, &fm); gl *= a; gr *= b; }
-        double step = ch->freq * fm / out_rate;
-        // lowpass biquad (RBJ), recomputed per buffer from the DSP's parameters
-        int lp = ch->dsp >= 0 && dsps[ch->dsp].type == DSP_LOWPASS && dsps[ch->dsp].cutoff < out_rate * 0.49f;
-        float b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
-        if (lp) {
-            float fc = dsps[ch->dsp].cutoff < 10 ? 10 : dsps[ch->dsp].cutoff;
-            float q = 0.70710678f * (dsps[ch->dsp].resonance < 1 ? 1 : dsps[ch->dsp].resonance);
-            float w = 2 * (float)M_PI * fc / out_rate, cw = cosf(w), al = sinf(w) / (2 * q), a0 = 1 + al;
-            b0 = (1 - cw) / 2 / a0; b1 = (1 - cw) / a0; b2 = b0; a1 = -2 * cw / a0; a2 = (1 - al) / a0;
-        }
-        for (UInt32 k = 0; k < n; k++) {
-            if (s->pcm) {
-                if (ch->pos >= s->frames) {
-                    if ((ch->mode & M_LOOP_NORMAL) && s->frames) ch->pos = fmod(ch->pos, (double)s->frames);
-                    else { ch->playing = 0; break; }
-                }
-            } else if (!stream_fill(ch, s, ch->pos)) { ch->playing = 0; break; }
-            float l, r; frame_at(ch, s, ch->pos, &l, &r);
-            if (ch->mode & M_3D) { float m = (l + r) * 0.5f; l = r = m; }   // 3D: the source is a point
-            if (lp) {
-                float x[2] = {l, r}, y[2];
-                for (int sd = 0; sd < 2; sd++) {   // transposed direct form II
-                    y[sd] = b0 * x[sd] + ch->z[sd][0];
-                    ch->z[sd][0] = b1 * x[sd] - a1 * y[sd] + ch->z[sd][1];
-                    ch->z[sd][1] = b2 * x[sd] - a2 * y[sd];
-                }
-                l = y[0]; r = y[1];
+static int chan_live(const Chan *ch) { return ch->used && ch->playing && !ch->paused && ch->sound >= 0; }
+static int hrtf_on(void) { return rt_enh && rt_enh->hrtf; }
+// mixes n frames of channel ch into outl/outr with the gains gl/gr and the frequency factor fm. mono: the HRTF input
+// (outl only, gain gl). Locked.
+static void chan_mix(Chan *ch, float *outl, float *outr, UInt32 n, float gl, float gr, float fm, int mono) {
+    Snd *s = &snds[ch->sound];
+    double step = ch->freq * fm / out_rate;
+    // lowpass biquad (RBJ), recomputed per buffer from the DSP's parameters
+    int lp = ch->dsp >= 0 && dsps[ch->dsp].type == DSP_LOWPASS && dsps[ch->dsp].cutoff < out_rate * 0.49f;
+    float b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
+    if (lp) {
+        float fc = dsps[ch->dsp].cutoff < 10 ? 10 : dsps[ch->dsp].cutoff;
+        float q = 0.70710678f * (dsps[ch->dsp].resonance < 1 ? 1 : dsps[ch->dsp].resonance);
+        float w = 2 * (float)M_PI * fc / out_rate, cw = cosf(w), al = sinf(w) / (2 * q), a0 = 1 + al;
+        b0 = (1 - cw) / 2 / a0; b1 = (1 - cw) / a0; b2 = b0; a1 = -2 * cw / a0; a2 = (1 - al) / a0;
+    }
+    for (UInt32 k = 0; k < n; k++) {
+        if (s->pcm) {
+            if (ch->pos >= s->frames) {
+                if ((ch->mode & M_LOOP_NORMAL) && s->frames) ch->pos = fmod(ch->pos, (double)s->frames);
+                else { ch->playing = 0; break; }
             }
+        } else if (!stream_fill(ch, s, ch->pos)) { ch->playing = 0; break; }
+        float l, r; frame_at(ch, s, ch->pos, &l, &r);
+        if (ch->mode & M_3D) { float m = (l + r) * 0.5f; l = r = m; }   // 3D: the source is a point
+        if (lp) {
+            float x[2] = {l, r}, y[2];
+            for (int sd = 0; sd < 2; sd++) {   // transposed direct form II
+                y[sd] = b0 * x[sd] + ch->z[sd][0];
+                ch->z[sd][0] = b1 * x[sd] - a1 * y[sd] + ch->z[sd][1];
+                ch->z[sd][1] = b2 * x[sd] - a2 * y[sd];
+            }
+            l = y[0]; r = y[1];
+        }
+        if (mono) outl[k] += l * gl;
+        else {
             outl[k] += l * gl;
             if (outr) outr[k] += r * gr; else outl[k] += r * gr;
-            ch->pos += step;
         }
-        if (!ch->playing) chan_stop_locked(ch);
+        ch->pos += step;
+    }
+    if (!ch->playing) chan_stop_locked(ch);
+}
+// the inputs of the mixer: input 0 the stereo mix of the channels that are not on an HRTF input; input 1 + i channel
+// i while it is on its HRTF input (hrtf_live, set by out_render before the mixer renders)
+static OSStatus bus_render(void *ref, AudioUnitRenderActionFlags *fl, const AudioTimeStamp *ts, UInt32 bus, UInt32 n, AudioBufferList *io) {
+    (void)ref; (void)ts;
+    float *outl = io->mBuffers[0].mData, *outr = io->mNumberBuffers > 1 ? io->mBuffers[1].mData : NULL;
+    memset(outl, 0, n * sizeof(float)); if (outr) memset(outr, 0, n * sizeof(float));
+    if (rt_paused()) { *fl |= kAudioUnitRenderAction_OutputIsSilence; return noErr; }   // paused in the background
+    pthread_mutex_lock(&mx);
+    if (bus == 0) {
+        for (int i = 0; i < MAXCH; i++) {
+            Chan *ch = &chans[i];
+            if (!chan_live(ch) || hrtf_live[i]) continue;
+            float gl = ch->vol, gr = ch->vol, fm = 1;
+            if (ch->mode & M_3D) { float a, b; balance(ch, &a, &b, &fm); gl *= a; gr *= b; }
+            chan_mix(ch, outl, outr, n, gl, gr, fm, 0);
+        }
+    } else if (bus <= MAXCH && hrtf_live[bus - 1]) {
+        Chan *ch = &chans[bus - 1];
+        if (chan_live(ch) && (ch->mode & M_3D)) {
+            float az, el, att, fm;
+            direction(ch, &az, &el, &att, &fm);
+            chan_mix(ch, outl, NULL, n, ch->vol * att, 0, fm, 1);
+        }
     }
     pthread_mutex_unlock(&mx);
+    return noErr;
+}
+// the output unit's input: the direction of each HRTF channel goes to its mixer input, then the mixer renders
+static OSStatus out_render(void *ref, AudioUnitRenderActionFlags *fl, const AudioTimeStamp *ts, UInt32 bus, UInt32 n, AudioBufferList *io) {
+    (void)ref; (void)bus;
+    int on = hrtf_on();
+    OSStatus e = noErr;
+    pthread_mutex_lock(&mx);
+    for (int i = 0; i < MAXCH && !e; i++) {
+        Chan *ch = &chans[i];
+        int live = on && chan_live(ch) && (ch->mode & M_3D);
+        if (live) {
+            float az, el, att, fm;
+            direction(ch, &az, &el, &att, &fm);
+            if ((e = AudioUnitSetParameter(mixer, kSpatialMixerParam_Azimuth, kAudioUnitScope_Input, (UInt32)(1 + i), az, 0)) ||
+                (e = AudioUnitSetParameter(mixer, kSpatialMixerParam_Elevation, kAudioUnitScope_Input, (UInt32)(1 + i), el, 0))) break;
+        }
+        if (live != bus_on[i]) {
+            if ((e = AudioUnitSetParameter(mixer, kSpatialMixerParam_Enable, kAudioUnitScope_Input, (UInt32)(1 + i), live ? 1.0f : 0.0f, 0))) break;
+            bus_on[i] = live;
+        }
+        hrtf_live[i] = live;
+    }
+    pthread_mutex_unlock(&mx);
+    if (!e) e = AudioUnitRender(mixer, fl, ts, 0, n, io);
+    if (e) {
+        if (!render_err) render_err = e;
+        for (UInt32 b = 0; b < io->mNumberBuffers; b++) memset(io->mBuffers[b].mData, 0, io->mBuffers[b].mDataByteSize);
+        *fl |= kAudioUnitRenderAction_OutputIsSilence;
+        return noErr;
+    }
+    __atomic_store_n(&hrtf_logged, on, __ATOMIC_RELAXED);
+    float *outl = io->mBuffers[0].mData, *outr = io->mNumberBuffers > 1 ? io->mBuffers[1].mData : NULL;
     for (UInt32 k = 0; k < n; k++) {
         if (outl[k] > 1) outl[k] = 1; else if (outl[k] < -1) outl[k] = -1;
         if (outr) { if (outr[k] > 1) outr[k] = 1; else if (outr[k] < -1) outr[k] = -1; }
     }
     return noErr;
 }
+static void audio_stop(void) {
+    if (unit) { AudioOutputUnitStop(unit); AudioUnitUninitialize(unit); AudioComponentInstanceDispose(unit); unit = NULL; }
+    if (mixer) { AudioUnitUninitialize(mixer); AudioComponentInstanceDispose(mixer); mixer = NULL; }
+}
 static int audio_start(void) {
     AudioComponentDescription d = {kAudioUnitType_Output, kAudioUnitSubType_DefaultOutput, kAudioUnitManufacturer_Apple, 0, 0};
     AudioComponent comp = AudioComponentFindNext(NULL, &d);
     if (!comp || AudioComponentInstanceNew(comp, &unit)) { rt_log("[fmod] no audio output device"); unit = NULL; return 0; }
+    AudioComponentDescription md = {kAudioUnitType_Mixer, kAudioUnitSubType_SpatialMixer, kAudioUnitManufacturer_Apple, 0, 0};
+    AudioComponent mcomp = AudioComponentFindNext(NULL, &md);
+    if (!mcomp || AudioComponentInstanceNew(mcomp, &mixer)) { rt_log("[fmod] no AUSpatialMixer"); mixer = NULL; audio_stop(); return 0; }
     AudioStreamBasicDescription f = {0};
     f.mSampleRate = out_rate; f.mFormatID = kAudioFormatLinearPCM;
     f.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved;
     f.mChannelsPerFrame = 2; f.mFramesPerPacket = 1; f.mBitsPerChannel = 32; f.mBytesPerFrame = 4; f.mBytesPerPacket = 4;
-    AURenderCallbackStruct cb = {render, NULL};
+    AudioStreamBasicDescription fm = f; fm.mChannelsPerFrame = 1;
+    UInt32 inputs = 1 + MAXCH, maxf = 0, sz = sizeof maxf;
+    UInt32 bypass = kSpatialMixerSourceMode_Bypass, point = kSpatialMixerSourceMode_PointSource;
+    UInt32 alg = kSpatializationAlgorithm_UseOutputType, otype = kSpatialMixerOutputType_Headphones;
+    UInt32 personal = kSpatialMixerPersonalizedHRTFMode_Auto;
+    MixerDistanceParams dp = {1.0f, 1000.0f, 0.0f};   // reference distance 1 m: no attenuation at the fixed distance 1 m
+    AURenderCallbackStruct in_cb = {bus_render, NULL}, out_cb = {out_render, NULL};
+    const char *step = "";
     OSStatus e;
-    if ((e = AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &f, sizeof f)) ||
-        (e = AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, sizeof cb)) ||
-        (e = AudioUnitInitialize(unit)) ||
-        (rt_mute && (e = AudioUnitSetParameter(unit, kHALOutputParam_Volume, kAudioUnitScope_Global, 0, 0.0f, 0))) ||
-        (e = AudioOutputUnitStart(unit))) {
-        rt_log("[fmod] audio output setup failed (OSStatus %d)", (int)e);
-        AudioComponentInstanceDispose(unit); unit = NULL;
-        return 0;
-    }
+#define AU(what, call) (step = what, (e = (call)) != noErr)
+    if (AU("output frames", AudioUnitGetProperty(unit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &maxf, &sz)) ||
+        AU("mixer frames", AudioUnitSetProperty(mixer, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &maxf, sizeof maxf)) ||
+        AU("mixer inputs", AudioUnitSetProperty(mixer, kAudioUnitProperty_ElementCount, kAudioUnitScope_Input, 0, &inputs, sizeof inputs)) ||
+        AU("mixer output format", AudioUnitSetProperty(mixer, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &f, sizeof f)) ||
+        AU("mixer output type", AudioUnitSetProperty(mixer, kAudioUnitProperty_SpatialMixerOutputType, kAudioUnitScope_Global, 0, &otype, sizeof otype)) ||
+        AU("mixer personalized HRTF", AudioUnitSetProperty(mixer, kAudioUnitProperty_SpatialMixerPersonalizedHRTFMode, kAudioUnitScope_Global, 0, &personal, sizeof personal)) ||
+        AU("mixer input 0 format", AudioUnitSetProperty(mixer, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &f, sizeof f)) ||
+        AU("mixer input 0 mode", AudioUnitSetProperty(mixer, kAudioUnitProperty_SpatialMixerSourceMode, kAudioUnitScope_Input, 0, &bypass, sizeof bypass)) ||
+        AU("mixer input 0 callback", AudioUnitSetProperty(mixer, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &in_cb, sizeof in_cb)))
+        goto fail;
+    for (UInt32 b = 1; b < inputs; b++)
+        if (AU("HRTF input format", AudioUnitSetProperty(mixer, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, b, &fm, sizeof fm)) ||
+            AU("HRTF input mode", AudioUnitSetProperty(mixer, kAudioUnitProperty_SpatialMixerSourceMode, kAudioUnitScope_Input, b, &point, sizeof point)) ||
+            AU("HRTF input algorithm", AudioUnitSetProperty(mixer, kAudioUnitProperty_SpatializationAlgorithm, kAudioUnitScope_Input, b, &alg, sizeof alg)) ||
+            AU("HRTF input distance", AudioUnitSetProperty(mixer, kAudioUnitProperty_SpatialMixerDistanceParams, kAudioUnitScope_Input, b, &dp, sizeof dp)) ||
+            AU("HRTF input callback", AudioUnitSetProperty(mixer, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, b, &in_cb, sizeof in_cb)))
+            goto fail;
+    if (AU("mixer initialize", AudioUnitInitialize(mixer))) goto fail;
+    for (UInt32 b = 1; b < inputs; b++)
+        if (AU("HRTF input distance", AudioUnitSetParameter(mixer, kSpatialMixerParam_Distance, kAudioUnitScope_Input, b, 1.0f, 0)) ||
+            AU("HRTF input gain", AudioUnitSetParameter(mixer, kSpatialMixerParam_Gain, kAudioUnitScope_Input, b, HRTF_GAIN_DB, 0)) ||
+            AU("HRTF input enable", AudioUnitSetParameter(mixer, kSpatialMixerParam_Enable, kAudioUnitScope_Input, b, 0.0f, 0)))
+            goto fail;
+    memset(bus_on, 0, sizeof bus_on); memset(hrtf_live, 0, sizeof hrtf_live);
+    if (AU("output format", AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &f, sizeof f)) ||
+        AU("output callback", AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &out_cb, sizeof out_cb)) ||
+        AU("output initialize", AudioUnitInitialize(unit)) ||
+        (rt_mute && AU("output mute", AudioUnitSetParameter(unit, kHALOutputParam_Volume, kAudioUnitScope_Global, 0, 0.0f, 0))) ||
+        AU("output start", AudioOutputUnitStart(unit)))
+        goto fail;
+#undef AU
+    rt_log("[fmod] output: AUSpatialMixer, %u inputs (stereo mix and %d HRTF inputs for headphones), %u frames per slice",
+           (unsigned)inputs, MAXCH, (unsigned)maxf);
     return 1;
+fail:
+    rt_log("[fmod] audio output setup failed at \"%s\" (OSStatus %d)", step, (int)e);
+    audio_stop();
+    return 0;
+}
+// game thread (System_Update): the Headphone Audio state of the mixer and a render error go to the log
+static void audio_report(void) {
+    static int logged = -1;
+    static OSStatus err_logged;
+    int st = __atomic_load_n(&hrtf_logged, __ATOMIC_RELAXED);
+    if (st >= 0 && st != logged) { rt_log("[fmod] Headphone Audio (HRTF) %s", st ? "on" : "off"); logged = st; }
+    OSStatus e = render_err;
+    if (e && e != err_logged) { rt_log("[fmod] the mixer did not render (OSStatus %d); the output is silent", (int)e); err_logged = e; }
 }
 
 // ---------------- System ----------------
@@ -322,7 +462,7 @@ SHIM(fmodex_FMOD_System_Init, 4) {
 }
 SHIM(fmodex_FMOD_System_Release, 1) {
     SYS_OK();
-    if (unit) { AudioOutputUnitStop(unit); AudioUnitUninitialize(unit); AudioComponentInstanceDispose(unit); unit = NULL; }
+    audio_stop();
     pthread_mutex_lock(&mx);
     for (int i = 0; i < MAXCH; i++) chan_stop_locked(&chans[i]);
     for (int i = 0; i < MAXSND; i++) if (snds[i].used) { free(snds[i].pcm); free(snds[i].data); memset(&snds[i], 0, sizeof snds[i]); }
@@ -343,7 +483,7 @@ SHIM(fmodex_FMOD_System_Set3DListenerAttributes, 6) {
     pthread_mutex_lock(&mx); rdvec(ARG(2), l_pos); rdvec(ARG(3), l_vel); rdvec(ARG(4), l_fwd); rdvec(ARG(5), l_up); pthread_mutex_unlock(&mx);
     return FMOD_OK;
 }
-SHIM(fmodex_FMOD_System_Update, 1) { SYS_OK(); return FMOD_OK; }   // 3D state is applied by the mixer as it changes
+SHIM(fmodex_FMOD_System_Update, 1) { SYS_OK(); audio_report(); return FMOD_OK; }   // 3D state is applied by the mixer as it changes
 
 SHIM(fmodex_FMOD_System_CreateSound, 5) {
     SYS_OK();

@@ -680,3 +680,58 @@ The HDR Calibration menu now has the two settings of the Capcom RE Engine (Resid
 - Headless run (25 seconds) with `hdr_max_brightness=20` and `hdr_brightness=0`: the log shows "+10 (4000 nits)", "-10 (50 nits)", "peak 4000 nits (6.67 x SDR white)" and "paper white 50 nits (0.08 x SDR white)".
 - The presentation shader with the new test square compiled (the runs presented frames).
 - Not verified: the test image on the screen. The headless runs did not open the HDR Calibration menu, and screenshots are not permitted.
+
+## 2026-11-20: Unofficial Patch 1.7, texture LOD bias, Retina resolution, Mac menus and icon, headphone audio
+
+### DCoTE Unofficial Patch 1.7
+
+- The user downloaded `DCoTEPatch1.7.zip` (MD5 d3a9971267c1c3b9efece732c3330528, equal to the published value). It contains one file, `DCoTEPatch.exe`, a .NET patcher. It was not run. Its IL was read with System.Reflection.Metadata (a dump tool in the scratch folder).
+- The two shader fixes of the patch ("by Guzz") change bytes of two game files:
+  - Blue light (`Resources/PC/SHADERS/psModulateColorByAlpha.pso`): bytes 432 to 443, the constant `def c0` of the pixel shader, change from -0.009 (`0xBC1374BC`) to -1.0 (`0xBF800000`) in x, y and z.
+  - Sky dome (`Resources/PC/SHADERS/Skydome_NoColor.vso`): byte 1116, the source register of `mad r1.xyz, v?, c6.w, c6`, changes from `v0` to `v1`.
+- Result: the files of the GOG release already have both fixes (-1.0 and `v1`). No change is necessary.
+- The other items of the patch are options and cheats (for example film grain, the legal video, weapons, debug mode). They are not in this task.
+
+### Texture LOD bias with anti-aliasing
+
+- Change (`d3d9_metal.m`, `taa_draw_offset`, `ps_consts_header`): the scene draws with a sub-pixel offset of anti-aliasing add `TAA_LOD_BIAS` (-1.0) to `D3DSAMP_MIPMAPLODBIAS` of all their samplers. The value is the formula of the MetalFX integration guide of Apple, log2(input size / output size) - 1, with the input size equal to the output size. The UI and the post-processing do not change.
+- `taa_offset` now returns 1 when the frame has offsets, so that the bias applies to the same draws as the offset.
+- Verified: the log shows "anti-aliasing: frame 754, texture LOD bias -1.0 on the scene draws".
+
+### Retina resolution
+
+- Finding: the game used the size of the screen in points (1800 × 1125) as its resolution. On a Retina screen (backing scale factor 2), macOS scaled this image up by 2.
+- The game reads its resolution from the registry (`ScreenWidth`, `ScreenHeight`) into a settings object (0x40b440, +8 and +0xc; the defaults are 800 × 600). It writes the object back to the registry (0x40b6d3).
+- The assert text "Resolution has been set too high, the glass shatter routine has overwritten memory" (0x59ef09, 0x59f7ac, 0x59f7d2) is about the mesh of the glass shards: the loops make rings of 17 points around world positions. They do not use the screen resolution (inference from the code).
+- Change (setting **Retina Resolution (restart)**, `retina_resolution`; `rt_enh.h` `retina`):
+  - `enhance.c`, `coc_enh_resolution` (patch 0x40b533): with the setting, the settings object gets the size of the screen in pixels. Without it, a resolution larger than the screen in points becomes the screen in points.
+  - `d3d9_metal.m`, `mode_list`: with the setting, the display modes include the screen in pixels.
+  - `cocoa32.m`, `rt_cocoa_screen_pixels`, `content_points`: the size of the screen in pixels; a window for a client area larger than the screen in points gets its size in points (pixels / backing scale factor).
+- Verified (headless run with the setting): "resolution 3600x2250 (the game's settings: 1800x1125; Retina Resolution on)"; the device, the back buffer and the drawable were 3600 × 2250.
+- Verified (headless run without the setting and with 3600 × 2250 in the registry): "resolution 1800x1125 (the game's settings: 3600x2250; Retina Resolution off)".
+- Measured: with all enhancements on (ambient occlusion high, contact shadows, bloom medium, HDR, GT7 tone mapping, anti-aliasing), 600 frames took 10.86 s and 11.16 s at 3600 × 2250 (55 and 54 frames per second), and 10.0 s at 1800 × 1125 (60 frames per second).
+
+### Mac menus, window size, icon and name
+
+- Change (`cocoa32.m`): the app menu has About, Hide (Command-H), Hide Others (Option-Command-H), Show All and Quit (Command-Q), with the name of the app (CFBundleName). The new Window menu has Minimize (Command-M), Zoom, Window Size 50%, 75% and 100% (of the visible area of the screen, with the aspect ratio of the image; not in full screen) and Bring All to Front.
+- Change (`make_app.py`, `win32.mk`, `Makefile`): the option `--short-name` (APP_SHORT) sets CFBundleName, the name of the app menu. For this game it is "Call of Cthulhu" (15 characters, the limit of Apple). CFBundleDisplayName stays "Call of Cthulhu: Dark Corners of the Earth".
+- Change (`Makefile`): the app icon comes from `goggame-1189711155.ico` of the GOG game folder (256 × 256). The icon of the exe has only 48 × 48. `make_app.py` stops with an error if the icon file does not exist.
+- Verified: Info.plist has CFBundleName "Call of Cthulhu"; the icon has a 256 × 256 source image and all the sizes of an iconset.
+- Not verified: the menus on the screen. The headless runs have no menu bar, and screenshots are not permitted.
+
+### Headphone audio (HRTF)
+
+- Change (`fmodex.c`; setting **Headphone Audio (HRTF)**, `headphone_audio`; `rt_enh.h` `hrtf`):
+  - The output unit now pulls an AUSpatialMixer with 65 inputs. Input 0 is the stereo mix (as before, passed through). With the setting, each 3D channel i plays on its mono input 1 + i, as a point source of the HRTF for headphones (`kSpatializationAlgorithm_UseOutputType`, `kSpatialMixerOutputType_Headphones`, personalized HRTF in the Auto mode).
+  - The azimuth and the elevation come from the direction of the source in the listener frame. The attenuation of the distance and the doppler stay those of `fmodex.c`. The mixer gets a fixed distance at its reference distance.
+  - The HRTF inputs have a gain of +2.55 dB, so that a source in front keeps the loudness of the balance panning.
+  - A setup error stops the audio output with a log message that names the step. A render error gives silence and a log message (System_Update).
+- Measured with an offline test of the mixer (no audio device): azimuth +90 degrees is the right ear (left 0.035, right 1.311 × the input energy), -90 degrees is the left ear, a source behind is 0.33 ×, a source in front is 1.113 ×. The HRTF HQ algorithm and the headphone output type gave the same output.
+- Verified (headless run, muted output, with temporary measurement code that is now removed): the log shows "Headphone Audio (HRTF) on"; the output had signal (RMS 0.06 to 0.26); up to one 3D channel at a time was on an HRTF input in the first level. Most sounds of that level are 2D.
+- Not verified: the sound in headphones (the runs are muted).
+
+### Verification
+
+- `make gen` and `make app` built the app with no new warnings.
+- The headless runs ended without errors. The registry and Enhancements.cfg of the test folder were restored after the runs.
+- The runner with time stamps (a copy of the headless runner) did not stop the game process at the end of the first run. The process was stopped with `pkill`. The next runs stopped it the same way.

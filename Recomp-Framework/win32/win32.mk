@@ -77,11 +77,13 @@ boot: $(BUILD)/$(APP_NAME)
 runtime: $(RT_OBJ) $(GAME_OBJ)
 
 # ---- macOS app (framework/tools/make_app.py): binary, the game image, icon ----
-#   APP_FILE / APP_DISPLAY   the .app's file name / the name in the menu bar and Dock (default APP_NAME)
+#   APP_FILE / APP_DISPLAY   the .app's file name / the name in the Dock and the app switcher (default APP_NAME)
+#   APP_SHORT                the name of the app menu in the menu bar (default APP_DISPLAY)
 #   APP_IMAGE                the executable image to bundle as Resources/$(APP_IMAGE_NAME) (rt_game.image)
 #   APP_ICON                 an image for the icon when the exe's own is too small (optional)
 APP_FILE       ?= $(APP_NAME)
 APP_DISPLAY    ?= $(APP_FILE)
+APP_SHORT      ?= $(APP_DISPLAY)
 BUNDLE_ID      ?= com.example.game-recomp
 APP_CATEGORY   ?= public.app-category.games
 APP_IMAGE      ?= $(GAME_EXE)
@@ -90,7 +92,7 @@ APP_ICON       ?=
 APP_FLAGS      ?=
 app: $(BUILD)/$(APP_NAME)
 	$(PYTHON) $(FW)/tools/make_app.py $(BUILD)/$(APP_NAME) $(GAME_EXE) "$(BUILD)/$(APP_FILE).app" --name "$(APP_NAME)" \
-	    --display-name "$(APP_DISPLAY)" --bundle-id $(BUNDLE_ID) --category $(APP_CATEGORY) \
+	    --display-name "$(APP_DISPLAY)" --short-name "$(APP_SHORT)" --bundle-id $(BUNDLE_ID) --category $(APP_CATEGORY) \
 	    --resource "$(APP_IMAGE)=$(APP_IMAGE_NAME)" --no-vulkan $(if $(APP_ICON),--icon "$(APP_ICON)") $(APP_FLAGS)
 
 clean:
