@@ -1,0 +1,17 @@
+# Guest instructions replaced by C (recomp_w32.py --patches). Each line: address, then the C code of that
+# instruction. The code includes the original instruction's effect. No hash sign in the code: it starts a comment.
+# enhance.c: the enhancement settings in the game's options menus.
+# 0x4b3db0 (push ecx): the start of the string lookup; enhancement string ids return enhance.c's text
+4b3db0 { uint32_t id_ = rds32((uint32_t)(R_esp + 4u)); if (id_ >= 0xE000u && id_ < 0xE100u) { extern uint32_t coc_enh_text(uint32_t); R_eax = coc_enh_text(id_); R_esp += 8; C.eax = R_eax; C.ecx = R_ecx; C.esp = R_esp; C.esi = R_esi; C.edi = R_edi; return; } } PUSHL(R_ecx);
+# 0x411a1f (push "TEXTOPTION"): the OPTIONS menu (esi) after its Sound link: the Enhancements link
+411a1f { C.eax = R_eax; C.ecx = R_ecx; C.esp = R_esp; C.esi = R_esi; C.edi = R_edi; extern void coc_enh_add_link(CPU *, uint32_t); coc_enh_add_link(c, R_esi); } PUSHL(0x62bf20u);
+# 0x410be6 (mov ecx, esi): the INGAMEOPTIONS menu (esi) after its Sound link: the Enhancements link
+410be6 { C.eax = R_eax; C.ecx = R_ecx; C.esp = R_esp; C.esi = R_esi; C.edi = R_edi; extern void coc_enh_add_link(CPU *, uint32_t); coc_enh_add_link(c, R_esi); } R_ecx = (uint32_t)(R_esi);
+# 0x4123f1 (pop edi): the end of the SOUNDOPTIONS builder: the ENHANCEDOPTIONS menu
+4123f1 { C.eax = R_eax; C.ecx = R_ecx; C.esp = R_esp; C.esi = R_esi; C.edi = R_edi; extern void coc_enh_build_menu(CPU *); coc_enh_build_menu(c); } { uint32_t v = POPL(); R_edi = (uint32_t)(v); }
+# 0x4b235c (cmp byte [eax+0x671], bl): the game's SkipVideos flag; with Skip Intro Videos on it reads as set
+4b235c { extern int coc_enh_skip_intro(void); uint8_t a = coc_enh_skip_intro() ? (uint8_t)1u : rd8((uint32_t)(R_eax + 0x671u)), b = (uint8_t)R_ebx, r; r = (uint8_t)(a - b); cf = a < b; of = (((a ^ b) & (a ^ r)) >> 7) & 1; zf = ((r) & 0xFFu) == 0; sf = ((r) >> 7) & 1; pr = (uint8_t)(r); }
+# 0x4c43fa (mov edx, [eax+0x618]): the subtitle layout reads CharacterHeight; enhance.c scales it by Subtitle Size
+4c43fa { extern uint32_t coc_enh_sub_height(uint32_t); R_edx = coc_enh_sub_height(rd32((uint32_t)(R_eax + 0x618u))); }
+# 0x4c44d4 (cmp byte [esi+0x998], 0): a subtitle shows (esi: CoCSubtitles); after a Subtitle Size change the layout runs again
+4c44d4 { C.eax = R_eax; C.ecx = R_ecx; C.esp = R_esp; C.esi = R_esi; C.edi = R_edi; extern void coc_enh_sub_show(CPU *, uint32_t); coc_enh_sub_show(c, R_esi); } { uint8_t a = rd8((uint32_t)(R_esi + 0x998u)), b = (uint8_t)0x0u, r; r = (uint8_t)(a - b); cf = a < b; of = (((a ^ b) & (a ^ r)) >> 7) & 1; zf = ((r) & 0xFFu) == 0; sf = ((r) >> 7) & 1; pr = (uint8_t)(r); }

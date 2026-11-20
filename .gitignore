@@ -1,0 +1,18 @@
+# Never commit game files, translated game code or build output.
+# The translated code is the game's code: each player makes it from their own copy with install.sh.
+gen*/
+build/
+external/
+orig*.exe
+orig*.bin
+orig*.dll
+*.app
+*.log
+*.o
+*.a
+.DS_Store
+__pycache__/
+.venv/
+.claude/
+Recomp-Framework/third_party/ffmpeg/
+Recomp-Framework/third_party/dxvk/
