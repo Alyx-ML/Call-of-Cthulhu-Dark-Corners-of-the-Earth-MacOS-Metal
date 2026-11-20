@@ -3,8 +3,8 @@
 // The settings live in guest memory (RtEnh), so that controls of the game's menu system write them directly. The
 // game's menu builder (CoCMenuBuilder.cpp) gets a menu "ENHANCEDOPTIONS", made with the same calls as its
 // "SOUNDOPTIONS" menu, and the menus "OPTIONS" (main menu) and "INGAMEOPTIONS" (pause menu) get a link to it after
-// their Sound link, and a link to the menu "HDRCALIBRATION" (the peak brightness and paper white of HDR output, with
-// the test image of the runtime) after it. (A link in a menu of the SOUNDOPTIONS kind does not open its menu: Return
+// their Sound link, and a link to the menu "HDRCALIBRATION" (the peak brightness and paper white of HDR output, as
+// the two settings of the Capcom RE Engine, with the test image of the runtime) after it. (A link in a menu of the SOUNDOPTIONS kind does not open its menu: Return
 // there goes back to OPTIONS.) The game's "VIDEOOPTIONS" menu gets the Subtitle Size setting after its own setting.
 // The text
 // of these controls has string IDs from TXT_BASE; the game's string lookup (0x4b3db0, CoCStringManager) gives this
@@ -17,8 +17,8 @@
 // Anisotropic filtering is always 16x and is not in the menu (the file can set another value).
 // Reduced banding and the gamepad are always on and are not in the menu or the file.
 // Defaults: anti-aliasing, ambient occlusion, tone mapping, HDR, contact shadows, bloom, sharp character shadows and skip intro
-// videos off; subtitles at the game's size; the game's field of view and sanity effects; HDR peak brightness 1000
-// nits and paper white 100%.
+// videos off; subtitles at the game's size; the game's field of view and sanity effects; Max Brightness (HDR) 0 (1000
+// nits) and Brightness (HDR) 0 (300 nits).
 #include "rt32.h"
 #include "rt_enh.h"
 #include <errno.h>
@@ -68,7 +68,7 @@ enum { T_TITLE, T_GAME, T_2X, T_AO, T_OFF, T_LOW, T_MEDIUM, T_HIGH, T_ON,
        T_TONEMAP, T_HDR, T_CONTACT, T_SKIP, T_BLOOM, T_SHADOWS, T_SUBS, T_125, T_150, T_175,
        T_CALIB, T_PEAK, T_PAPER, T_FOV, T_110, T_120, T_130, T_140, T_SANITY, T_S75, T_S50, T_S25, T_AA,
        T_NITS0, T_NITS_END = T_NITS0 + RT_ENH_HDR_PEAKS - 1,     // the values of RT_ENH_HDR_PEAK_NITS
-       T_PCT0, T_PCT_END = T_PCT0 + RT_ENH_HDR_PAPERS - 1,       // the values of RT_ENH_HDR_PAPER_PCT
+       T_BRI0, T_BRI_END = T_BRI0 + RT_ENH_HDR_PAPERS - 1,       // the values of RT_ENH_HDR_PAPER_NITS
        T_COUNT };
 static const char *const txt[T_COUNT] = {
     [T_TITLE] = "Enhancements", [T_GAME] = "Game", [T_2X] = "2x", [T_AO] = "Ambient Occlusion", [T_OFF] = "Off", [T_LOW] = "Low",
@@ -76,15 +76,23 @@ static const char *const txt[T_COUNT] = {
     [T_CONTACT] = "Contact Shadows", [T_SKIP] = "Skip Intro Videos", [T_BLOOM] = "Bloom",
     [T_SHADOWS] = "Sharp Character Shadows (restart)",
     [T_SUBS] = "Subtitle Size", [T_125] = "1.25x", [T_150] = "1.5x", [T_175] = "1.75x",
-    [T_CALIB] = "HDR Calibration", [T_PEAK] = "Peak (symbol barely visible)", [T_PAPER] = "Paper White",
+    [T_CALIB] = "HDR Calibration", [T_PEAK] = "Max Brightness (HDR)", [T_PAPER] = "Brightness (HDR)",
     [T_FOV] = "Field of View", [T_110] = "110%", [T_120] = "120%", [T_130] = "130%", [T_140] = "140%",
     [T_SANITY] = "Sanity Effects", [T_S75] = "75%", [T_S50] = "50%", [T_S25] = "25%",
     [T_AA] = "Anti-Aliasing (MetalFX)",
-    [T_NITS0] = "400 nits", "600 nits", "800 nits", "1000 nits", "1200 nits", "1400 nits", "1600 nits", "2000 nits",
-    "3000 nits", "4000 nits",
-    [T_PCT0] = "50%", "75%", "100%", "125%", "150%", "200%",
+    // the steps -10 .. +10 of the two settings of the RE Engine, with their values in nits (rt_enh.h)
+    [T_NITS0] =
+    "-10 (300 nits)", "-9 (400 nits)", "-8 (500 nits)", "-7 (600 nits)", "-6 (700 nits)", "-5 (750 nits)",
+    "-4 (800 nits)", "-3 (850 nits)", "-2 (900 nits)", "-1 (950 nits)", "0 (1000 nits)", "+1 (1100 nits)",
+    "+2 (1200 nits)", "+3 (1400 nits)", "+4 (1600 nits)", "+5 (1800 nits)", "+6 (2000 nits)", "+7 (2500 nits)",
+    "+8 (3000 nits)", "+9 (3500 nits)", "+10 (4000 nits)",
+    [T_BRI0] =
+    "-10 (50 nits)", "-9 (80 nits)", "-8 (120 nits)", "-7 (160 nits)", "-6 (180 nits)", "-5 (200 nits)",
+    "-4 (220 nits)", "-3 (240 nits)", "-2 (260 nits)", "-1 (280 nits)", "0 (300 nits)", "+1 (320 nits)",
+    "+2 (340 nits)", "+3 (380 nits)", "+4 (420 nits)", "+5 (460 nits)", "+6 (500 nits)", "+7 (540 nits)",
+    "+8 (580 nits)", "+9 (610 nits)", "+10 (640 nits)",
 };
-_Static_assert(T_NITS_END == T_NITS0 + 9 && T_PCT_END == T_PCT0 + 5, "the value texts follow rt_enh.h");
+_Static_assert(T_NITS_END == T_NITS0 + 20 && T_BRI_END == T_BRI0 + 20, "the value texts follow rt_enh.h");
 static uint32_t txt_guest[T_COUNT];
 
 // patch at 0x4b3db0: the text of string id `id` (TXT_BASE ..), as the game's lookup returns it (a guest char *)
@@ -111,15 +119,17 @@ static const struct { const char *key; size_t off; int32_t max; int32_t def; } k
     {"bloom", offsetof(RtEnh, bloom), 3, 0},
     {"sharp_character_shadows", offsetof(RtEnh, shadows), 1, 0},
     {"subtitle_size", offsetof(RtEnh, sub_scale), 4, 0},
-    {"hdr_peak", offsetof(RtEnh, hdr_peak), RT_ENH_HDR_PEAKS - 1, 3},          // 1000 nits
-    {"hdr_paper_white", offsetof(RtEnh, hdr_paper), RT_ENH_HDR_PAPERS - 1, 2},  // 100%
+    {"hdr_max_brightness", offsetof(RtEnh, hdr_peak), RT_ENH_HDR_PEAKS - 1, RT_ENH_HDR_DEFAULT},   // 0: 1000 nits
+    {"hdr_brightness", offsetof(RtEnh, hdr_paper), RT_ENH_HDR_PAPERS - 1, RT_ENH_HDR_DEFAULT},     // 0: 300 nits
     {"field_of_view", offsetof(RtEnh, fov), 4, 0},
     {"sanity_effects", offsetof(RtEnh, sanity), 4, 0},
     {"anti_aliasing", offsetof(RtEnh, aa), 1, 0},
 };
 enum { K_ANISO, K_AO, K_TONEMAP, K_HDR, K_CONTACT, K_SKIP, K_BLOOM, K_SHADOWS, K_SUBS, K_PEAK, K_PAPER, K_FOV, K_SANITY, K_AA };
-// keys of earlier versions whose settings are now always on: the loader skips them, the next save leaves them out
-static const char *const retired_keys[] = {"gamepad", "reduced_banding"};
+// keys of earlier versions: settings that are now always on (gamepad, reduced_banding) and the HDR calibration of
+// other steps (hdr_peak: 400 .. 4000 nits; hdr_paper_white: a percentage of the SDR white of macOS). The loader skips
+// them, and the next save leaves them out.
+static const char *const retired_keys[] = {"gamepad", "reduced_banding", "hdr_peak", "hdr_paper_white"};
 #define NKEYS (sizeof keys / sizeof keys[0])
 static int32_t *field(RtEnh *e, size_t i) { return (int32_t *)((char *)e + keys[i].off); }
 static void cfg_path(char *p, size_t n) { snprintf(p, n, "%s/Enhancements.cfg", rt_data_dir); }
@@ -136,7 +146,7 @@ static void cfg_save(void) {
     if (bad || rename(tmp, p) != 0) { rt_log("[enh] can't write %s: %s; the settings are not saved", p, strerror(errno)); remove(tmp); return; }
     saved = *rt_enh;
     if (rt_verbose) rt_log("[enh] settings saved: aniso %d, ao %d, tonemap %d, hdr %d, contact %d, skip_intro %d, "
-                           "bloom %d, shadows %d, subtitle size %d, hdr peak %d, hdr paper white %d, field of view %d, sanity effects %d, anti-aliasing %d",
+                           "bloom %d, shadows %d, subtitle size %d, hdr max brightness %d, hdr brightness %d, field of view %d, sanity effects %d, anti-aliasing %d",
                            rt_enh->aniso,
                            rt_enh->ao, rt_enh->tonemap, rt_enh->hdr, rt_enh->contact, rt_enh->skip_intro, rt_enh->bloom,
                            rt_enh->shadows, rt_enh->sub_scale, rt_enh->hdr_peak, rt_enh->hdr_paper, rt_enh->fov, rt_enh->sanity, rt_enh->aa);
@@ -221,10 +231,10 @@ void coc_enh_init(void) {
     d3d9_enh_shadow_target(512, 512, 23 /* D3DFMT_R5G6B5 */, 4);
     rt_dinput_poll_hook = input_frame;
     static const char *const lvl[] = {"off", "low", "medium", "high"}, *const sub[] = {"game", "1.25x", "1.5x", "1.75x", "2x"};
-    rt_log("[enh] settings: anisotropic filtering %s, ambient occlusion %s, GT7 tone mapping %s, HDR %s (peak %s, paper white "
-           "%s), contact shadows %s, bloom %s, sharp character shadows %s, subtitle size %s, skip intro videos %s, field of view %s, sanity effects %s, anti-aliasing %s",
+    rt_log("[enh] settings: anisotropic filtering %s, ambient occlusion %s, GT7 tone mapping %s, HDR %s (max brightness %s, "
+           "brightness %s), contact shadows %s, bloom %s, sharp character shadows %s, subtitle size %s, skip intro videos %s, field of view %s, sanity effects %s, anti-aliasing %s",
            (const char *[]){"game", "2x", "4x", "8x", "16x"}[rt_enh->aniso], lvl[rt_enh->ao], rt_enh->tonemap ? "on" : "off",
-           rt_enh->hdr ? "on" : "off", txt[T_NITS0 + rt_enh->hdr_peak], txt[T_PCT0 + rt_enh->hdr_paper],
+           rt_enh->hdr ? "on" : "off", txt[T_NITS0 + rt_enh->hdr_peak], txt[T_BRI0 + rt_enh->hdr_paper],
            rt_enh->contact ? "on" : "off", lvl[rt_enh->bloom], rt_enh->shadows ? "on" : "off", sub[rt_enh->sub_scale],
            rt_enh->skip_intro ? "on" : "off", (const char *[]){"game", "110%", "120%", "130%", "140%"}[rt_enh->fov],
            (const char *[]){"game", "75%", "50%", "25%", "off"}[rt_enh->sanity], rt_enh->aa ? "MetalFX" : "off");
@@ -461,7 +471,7 @@ void coc_enh_build_menu(CPU *c) {
     menu = menu_new(c, T_CALIB, S_OPTIONS, 3, 0.2f);
     int peaks[RT_ENH_HDR_PEAKS], papers[RT_ENH_HDR_PAPERS];
     for (int i = 0; i < RT_ENH_HDR_PEAKS; i++) peaks[i] = T_NITS0 + i;
-    for (int i = 0; i < RT_ENH_HDR_PAPERS; i++) papers[i] = T_PCT0 + i;
+    for (int i = 0; i < RT_ENH_HDR_PAPERS; i++) papers[i] = T_BRI0 + i;
     add_enum(c, menu, T_PEAK, peaks, RT_ENH_HDR_PEAKS, K_PEAK);
     add_enum(c, menu, T_PAPER, papers, RT_ENH_HDR_PAPERS, K_PAPER);
     menu_register(c, calib_name_guest(), menu);

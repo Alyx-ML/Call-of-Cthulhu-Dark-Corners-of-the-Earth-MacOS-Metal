@@ -23,8 +23,9 @@ typedef struct RtEnh {
     int32_t shadows;   // 0: off; 1: the shadow targets of d3d9_enh_shadow_target created from now on are larger and keep
                        //    8 bits per channel
     int32_t sub_scale; // game project: the size of the subtitles (0 = the game's size; the game project gives the steps)
-    int32_t hdr_peak;  // HDR output: the peak brightness, an index into RT_ENH_HDR_PEAK_NITS
-    int32_t hdr_paper; // HDR output: paper white (the white of the game's image and UI), an index into RT_ENH_HDR_PAPER_PCT
+    int32_t hdr_peak;  // HDR output: Max Brightness (HDR), the peak brightness, an index into RT_ENH_HDR_PEAK_NITS
+    int32_t hdr_paper; // HDR output: Brightness (HDR), paper white (the white of the game's image and UI), an index into
+                       //    RT_ENH_HDR_PAPER_NITS
     int32_t hdr_test;  // game project: 1 while the HDR calibration menu is on the screen; the presented image then has
                        //    the calibration test image (only with HDR output)
     int32_t fov;       // game project: the field of view of the player camera (0 = the game's; the game project gives
@@ -34,15 +35,22 @@ typedef struct RtEnh {
                        //    project gives the steps)
 } RtEnh;
 
-// The values of hdr_peak in nits (cd/m2). macOS gives the brightness of the screen only as EDR headroom, a factor of
-// the current SDR white. The runtime takes the peak of the screen as 100 nits x the potential EDR headroom (16 on a
-// Liquid Retina XDR display: 1600 nits, its HDR peak), so SDR white is approximately
-// 100 nits x potential headroom / current headroom. A peak above the peak of the screen is clipped by macOS.
-#define RT_ENH_HDR_PEAK_NITS {400, 600, 800, 1000, 1200, 1400, 1600, 2000, 3000, 4000}
-#define RT_ENH_HDR_PEAKS 10
-// The values of hdr_paper: paper white as a percentage of the SDR white of macOS (100 = the white of other apps)
-#define RT_ENH_HDR_PAPER_PCT {50, 75, 100, 125, 150, 200}
-#define RT_ENH_HDR_PAPERS 6
+// The HDR calibration has the two settings of the Capcom RE Engine (Resident Evil Village, Resident Evil 4), with the
+// same 21 steps from -10 to +10 and the same values in nits (cd/m2). Index i is the step i - 10; index 10 (step 0) is
+// the default of both settings.
+// The values of hdr_peak (Max Brightness (HDR)), 300 to 4000 nits.
+#define RT_ENH_HDR_PEAK_NITS {300, 400, 500, 600, 700, 750, 800, 850, 900, 950, 1000, \
+                              1100, 1200, 1400, 1600, 1800, 2000, 2500, 3000, 3500, 4000}
+#define RT_ENH_HDR_PEAKS 21
+// The values of hdr_paper (Brightness (HDR)), 50 to 640 nits.
+#define RT_ENH_HDR_PAPER_NITS {50, 80, 120, 160, 180, 200, 220, 240, 260, 280, 300, \
+                               320, 340, 380, 420, 460, 500, 540, 580, 610, 640}
+#define RT_ENH_HDR_PAPERS 21
+#define RT_ENH_HDR_DEFAULT 10
+// macOS gives the brightness of the screen only as EDR headroom, a factor of the current SDR white. The runtime takes
+// the peak of the screen as 100 nits x the potential EDR headroom (16 on a Liquid Retina XDR display: 1600 nits, its
+// HDR peak), so SDR white is approximately 100 nits x potential headroom / current headroom. The runtime converts
+// the two values from nits to EDR units with this SDR white. macOS clips a peak above the peak of the screen.
 
 extern RtEnh *rt_enh;
 

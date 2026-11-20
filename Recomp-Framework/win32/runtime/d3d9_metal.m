@@ -1849,18 +1849,18 @@ static const char util_msl[] =
     // without tone mapping a color above the peak is scaled down as a whole, so that its hue stays
     "  float xm = max(x.r, max(x.g, x.b));\n"
     "  return to709(xm > k.target ? x * (k.target / xm) : x); }\n"
-    // the HDR calibration test image (EDR units), below the rows of the calibration menu. Left: a square at the
-    // maximum of the screen (64 x SDR white; macOS clips it to the peak of the screen) with a symbol (a ring and a
-    // dot) at the chosen peak. The symbol is visible while the chosen peak is below the peak of the screen and
-    // disappears at the peak of the screen. Right: a bar at paper white (the UI) above ten steps of the game's gray
-    // scale (sRGB 0.1 .. 1.0) through the scene curve.
+    // the HDR calibration test image (EDR units), below the rows of the calibration menu. Left: the test of Max
+    // Brightness (HDR), as in the RE Engine: a square at the chosen peak in a field at the maximum of the screen (64 x
+    // SDR white; macOS clips it to the peak of the screen). The outline of the square is visible while the chosen peak
+    // is below the peak of the screen and disappears at the peak of the screen. Right: the test of Brightness (HDR): a
+    // bar at paper white (the UI) above ten steps of the game's gray scale (sRGB 0.1 .. 1.0) through the scene curve.
     "static float3 calib(float2 p, float3 c, constant TM &k) {\n"
     "  float s = 0.24 * k.h, y0 = 0.6 * k.h, cx = 0.5 * k.w;\n"
     "  if (p.y < y0 || p.y >= y0 + s) return c;\n"
     "  float ax = cx - 1.55 * s, bx = cx - 0.35 * s;\n"
     "  if (p.x >= ax && p.x < ax + s) {\n"
-    "    float r = length(p - float2(ax + 0.5 * s, y0 + 0.5 * s)) / s;\n"
-    "    return float3(abs(r - 0.3) < 0.035 || r < 0.06 ? k.target : 64.0);\n"
+    "    float2 q = abs(p - float2(ax + 0.5 * s, y0 + 0.5 * s)) / s;\n"
+    "    return float3(max(q.x, q.y) < 0.3 ? k.target : 64.0);\n"
     "  }\n"
     "  if (p.x >= bx && p.x < bx + 2.0 * s) {\n"
     "    float q = (p.x - bx) / (0.2 * s);\n"
@@ -3094,21 +3094,21 @@ static uint32_t swap_present(Device *d, Swap *sw, uint32_t srp, uint32_t drp, ui
         PresentTM *k = ring_alloc(d, sizeof(PresentTM), &tb, &to);
         float paper = 1.0f, peak = 1.0f, gt = 2.5f, expo = 2.5f, oscale = 0.4f;   // GT7: SDR output
         if (edr_dt && (tm_mode & 8)) {
-            static const int peaks[RT_ENH_HDR_PEAKS] = RT_ENH_HDR_PEAK_NITS, papers[RT_ENH_HDR_PAPERS] = RT_ENH_HDR_PAPER_PCT;
+            static const int peaks[RT_ENH_HDR_PEAKS] = RT_ENH_HDR_PEAK_NITS, papers[RT_ENH_HDR_PAPERS] = RT_ENH_HDR_PAPER_NITS;
             if (rt_enh->hdr_peak < 0 || rt_enh->hdr_peak >= RT_ENH_HDR_PEAKS || rt_enh->hdr_paper < 0 || rt_enh->hdr_paper >= RT_ENH_HDR_PAPERS)
                 rt_fatal("[d3d9] HDR calibration out of range: peak %d, paper white %d", rt_enh->hdr_peak, rt_enh->hdr_paper);
             float headroom = rt_cocoa_edr_headroom(), potential = rt_cocoa_edr_potential();
             if (!(headroom >= 1.0f) || !(potential >= headroom))
                 rt_fatal("[d3d9] HDR output: the screen gave the EDR headroom %.3f and the potential EDR headroom %.3f", headroom, potential);
             float white = 100.0f * potential / headroom;  // the nits of SDR white (rt_enh.h)
-            paper = (float)papers[rt_enh->hdr_paper] / 100.0f;
+            paper = (float)papers[rt_enh->hdr_paper] / white;
             peak = (float)peaks[rt_enh->hdr_peak] / white;
-            gt = (float)peaks[rt_enh->hdr_peak] / 100.0f; expo = paper * white / 100.0f; oscale = 100.0f / white;   // GT7: HDR output
+            gt = (float)peaks[rt_enh->hdr_peak] / 100.0f; expo = (float)papers[rt_enh->hdr_paper] / 100.0f; oscale = 100.0f / white;   // GT7: HDR output
             if (headroom != d->tm_logged.headroom || potential != d->tm_logged.potential ||
                 peaks[rt_enh->hdr_peak] != d->tm_logged.peak || papers[rt_enh->hdr_paper] != d->tm_logged.paper) {
-                rt_log("[d3d9] HDR output: peak %d nits (%.2f x SDR white), paper white %d%% of SDR white%s; the screen: EDR "
+                rt_log("[d3d9] HDR output: peak %d nits (%.2f x SDR white), paper white %d nits (%.2f x SDR white)%s; the screen: EDR "
                        "headroom %.2f of %.2f, SDR white approximately %.0f nits, peak approximately %.0f nits",
-                       peaks[rt_enh->hdr_peak], peak, papers[rt_enh->hdr_paper], (tm_mode & 1) ? ", GT7 tone mapping" : "",
+                       peaks[rt_enh->hdr_peak], peak, papers[rt_enh->hdr_paper], paper, (tm_mode & 1) ? ", GT7 tone mapping" : "",
                        headroom, potential, white, white * headroom);
                 d->tm_logged.headroom = headroom; d->tm_logged.potential = potential;
                 d->tm_logged.peak = peaks[rt_enh->hdr_peak]; d->tm_logged.paper = papers[rt_enh->hdr_paper];

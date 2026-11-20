@@ -107,16 +107,18 @@ HDR Output needs a display with HDR (EDR) support. HDR Output and GT7 Tone Mappi
 
 The game has a menu **Options > HDR Calibration**. The menu also shows in the pause menu. Set **HDR Output** to On before you use it. The test image shows only with HDR Output on.
 
+The two settings are those of the Capcom RE Engine (Resident Evil Village, Resident Evil 4). They have the same steps (-10 to +10) and the same values in nits.
+
 | Setting | Values | Default |
 |---|---|---|
-| Peak (symbol barely visible) | 400 to 4000 nits | 1000 nits |
-| Paper White | 50% to 200% of the white of macOS | 100% |
+| Max Brightness (HDR) | -10 (300 nits) to +10 (4000 nits) | 0 (1000 nits) |
+| Brightness (HDR) | -10 (50 nits) to +10 (640 nits) | 0 (300 nits) |
 
-1. Find the square on the left of the test image. It has a ring and a dot in it.
-2. Increase **Peak** until the symbol is almost not visible. Then go back one value, so that the symbol is barely visible.
-3. Look at the bar and the gray steps on the right. Set **Paper White** to the brightness that you prefer for the white of the game and the UI. At 100%, the white of the game is equal to the white of other apps.
+1. Find the square on the left of the test image. It has a smaller square in it.
+2. Increase **Max Brightness (HDR)** until the outline of the smaller square is barely visible.
+3. Look at the bar and the gray steps on the right. Set **Brightness (HDR)** to the brightness that you prefer for the white of the game and the UI. The default (300 nits) is a balanced value.
 
-macOS does not give the brightness of the screen in nits. The app takes the peak of the screen as 100 nits × the potential EDR headroom of the screen (1600 nits on a Liquid Retina XDR display).
+macOS does not give the brightness of the screen in nits. The app takes the peak of the screen as 100 nits × the potential EDR headroom of the screen (1600 nits on a Liquid Retina XDR display). The app converts the two settings from nits with this value.
 
 ## Mac features
 

@@ -627,3 +627,56 @@ SDR output, calculated for a gray.
 - One headless run ended at approximately 59 seconds with `SIGKILL`. The log has no error, the system log has no kill record, and there is no crash report. The next run of the same build ran for 70 seconds. The cause is not known.
 - The measurement code was temporary. It is removed.
 - Not verified: the image on the screen (screenshots are not permitted).
+
+## 2026-11-20: HDR calibration of the RE Engine
+
+The HDR Calibration menu now has the two settings of the Capcom RE Engine (Resident Evil Village, Resident Evil 4), with the same steps and the same values in nits.
+
+### Sources
+
+- [KoKlusz HDR Gaming Database, Resident Evil Village (PC) HDR Analysis](https://github.com/KoKlusz/HDR-Gaming-Database/discussions/62) and [Resident Evil 4 (PC) HDR Analysis](https://github.com/KoKlusz/HDR-Gaming-Database/discussions/63), published 2025-10-07, read 2026-11-20: the tables of both settings.
+- [hdrgamer, Resident Evil 4 HDR Settings](https://www.hdrgamer.com/2023/03/resident-evil-4-hdr-settings.html), published 2023-03-24, and [Resident Evil Village PS5 HDR](https://www.hdrgamer.com/2022/01/resident-evil-village-ps5-hdr-peak.html), published 2022-01-15, read 2026-11-20: the same Max Brightness table. The Village table gives the brightness of the test square as equal to the setting.
+- [Steam, Resident Evil 4 discussion](https://steamcommunity.com/app/2050650/discussions/0/3827536762636739149): the first screen is set until the outline of the block is barely visible.
+- These are secondary sources. Capcom does not publish the values.
+
+### The settings
+
+| Step | Max Brightness (HDR), nits | Brightness (HDR), nits |
+|---|---|---|
+| -10 | 300 | 50 |
+| -9 | 400 | 80 |
+| -8 | 500 | 120 |
+| -7 | 600 | 160 |
+| -6 | 700 | 180 |
+| -5 | 750 | 200 |
+| -4 | 800 | 220 |
+| -3 | 850 | 240 |
+| -2 | 900 | 260 |
+| -1 | 950 | 280 |
+| 0 (default) | 1000 | 300 |
+| +1 | 1100 | 320 |
+| +2 | 1200 | 340 |
+| +3 | 1400 | 380 |
+| +4 | 1600 | 420 |
+| +5 | 1800 | 460 |
+| +6 | 2000 | 500 |
+| +7 | 2500 | 540 |
+| +8 | 3000 | 580 |
+| +9 | 3500 | 610 |
+| +10 | 4000 | 640 |
+
+- Change (`rt_enh.h`): `RT_ENH_HDR_PEAK_NITS` has the 21 Max Brightness values. `RT_ENH_HDR_PAPER_NITS` has the 21 Brightness values and replaces `RT_ENH_HDR_PAPER_PCT` (a percentage of the SDR white of macOS). `RT_ENH_HDR_DEFAULT` is the index of step 0.
+- Change (`d3d9_metal.m`): paper white is now in nits. The runtime converts it to EDR units with the SDR white of the screen (100 nits × potential EDR headroom / current EDR headroom), as it does for the peak. The log gives both values in nits and in EDR units.
+- Change (`enhance.c`): the menu rows are **Max Brightness (HDR)** and **Brightness (HDR)**. Each value shows the step and the nits, for example "0 (1000 nits)".
+- Change (`enhance.c`): the Enhancements.cfg keys are now `hdr_max_brightness` and `hdr_brightness` (index 0 to 20, default 10). The old keys `hdr_peak` and `hdr_paper_white` had other steps. The loader skips them, and the next save removes them. Thus an old file gets the defaults for these two settings.
+- Change (`d3d9_metal.m`, `calib`): the first test is now the test square of the RE Engine: a square at the selected peak in a field at the maximum of the screen. The outline of the square disappears when the selected peak is at the peak of the screen. The ring and the dot are removed.
+- Not changed: the second test (the bar at paper white above the ten gray steps). The RE Engine shows red and blue areas on this screen. The sources do not describe how these areas change, so this test is not copied.
+- Not changed: the RE Engine shows the two settings on two screens. This menu shows them on one screen, above the test image.
+
+### Verification
+
+- `make app` built the app. The only warnings are the two known `key_frame` warnings of `wmvcore.c`.
+- Headless run (35 seconds) with an old Enhancements.cfg (`hdr_peak=3`, `hdr_paper_white=2`): no error and no "not a valid setting" message. The log shows "max brightness 0 (1000 nits), brightness 0 (300 nits)" and "peak 1000 nits (1.67 x SDR white), paper white 300 nits (0.50 x SDR white)" with an SDR white of approximately 600 nits. The HDRCALIBRATION menu was registered; the menu code stops with an error if a control does not have 21 values.
+- Headless run (25 seconds) with `hdr_max_brightness=20` and `hdr_brightness=0`: the log shows "+10 (4000 nits)", "-10 (50 nits)", "peak 4000 nits (6.67 x SDR white)" and "paper white 50 nits (0.08 x SDR white)".
+- The presentation shader with the new test square compiled (the runs presented frames).
+- Not verified: the test image on the screen. The headless runs did not open the HDR Calibration menu, and screenshots are not permitted.
