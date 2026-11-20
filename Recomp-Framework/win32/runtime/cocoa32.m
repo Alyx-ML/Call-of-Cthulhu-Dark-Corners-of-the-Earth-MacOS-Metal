@@ -128,7 +128,8 @@ static void input_schedule(uint32_t hwnd) {
 - (CALayer *)makeBackingLayer {
     CAMetalLayer *l = [CAMetalLayer layer];
     l.device = rt_metal_device();
-    l.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    // 10 bits per channel: the presentation dithers the 16-bit back buffer (rt_enh.h reduced banding) into 10 bits
+    l.pixelFormat = MTLPixelFormatBGR10A2Unorm;
     l.framebufferOnly = NO;
     l.maximumDrawableCount = 3;
     // a window or full-screen area of another aspect ratio shows the whole image with black bars
@@ -336,7 +337,7 @@ void rt_cocoa_layer_edr(void *layer_ref, int on, int refresh_only) {
         NSScreen *sc = [dl isKindOfClass:[NSView class]] ? ((NSView *)dl).window.screen : nil;
         if (!refresh_only && !on) {
             l.wantsExtendedDynamicRangeContent = NO;
-            l.pixelFormat = MTLPixelFormatBGRA8Unorm;
+            l.pixelFormat = MTLPixelFormatBGR10A2Unorm;
             l.colorspace = NULL;
         } else if (!refresh_only || l.wantsExtendedDynamicRangeContent) {
             // a window on no screen (a headless run) takes the main screen's color space

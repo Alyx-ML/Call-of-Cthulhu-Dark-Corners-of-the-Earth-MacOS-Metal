@@ -197,11 +197,12 @@ void coc_enh_init(void) {
     // the character shadow projector (512x512 R5G6B5 target, no depth buffer, the light's view-projection matrix in
     // c0..c3): the game draws into these targets during the scene
     d3d9_enh_light_pass(512, 512, 23 /* D3DFMT_R5G6B5 */, 0);
-    // the light of the contact shadows is a fixed light straight above (the world's up axis is +Z: the camera's up
-    // vector had a Z part of 0.92 to 1.0 in a level). The projector of the character shadows is a lamp near the
-    // ground (approximately 1.7 m high) that changes between frames; with it, 25 to 65% of a level frame was in
-    // shadow and the shadows moved from frame to frame.
-    d3d9_enh_light_dir(0.0f, 0.0f, 1.0f);
+    // the light of the contact shadows is the game's own light of its characters: the character shaders
+    // (Skinning_*bone*.vso) light the normal maps with the vector toward the light skinLightDir (c87) at the
+    // character's center skinCenterPos (c86), plus skinLightGradients (c89, c91, c93: its derivatives along world
+    // x, y and z; c90, c92, c94 are the derivatives of the light color) times the offset from the center. In a level
+    // the derivatives were those of a point light approximately 100 units from the center (-(I - L L^T) / r).
+    d3d9_enh_light_vs("skinLightDir", "skinCenterPos", "skinLightGradients", 2);
     // the camera: the game draws the world with vertex shaders and does not set the fixed-function transforms; its
     // world shaders (Static_Lightmapped.vso and others) have the world-view-projection matrix matFinal in c0..c3
     d3d9_enh_camera_vs(0);

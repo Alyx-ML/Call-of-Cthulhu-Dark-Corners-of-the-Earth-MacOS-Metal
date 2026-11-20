@@ -480,3 +480,56 @@ SDR output, calculated for a gray.
 - In the HDR Calibration menu, Right and Left changed the peak (1000, 1200, 1400 nits) and paper white (100%, 125%). Each change was saved to Enhancements.cfg, and the runtime used the new values in the next frame (log: "HDR output: peak 1200 nits (2.00 x SDR white)").
 - The log showed "the HDR Calibration menu is on the screen" when the menu opened, and "off the screen" after Escape.
 - Not verified: the image on the screen (screenshots are not permitted). The layout of the OPTIONS menu with one more row and the position of the test image are not verified on the screen.
+
+## 2026-11-20: Highlights above white, HDR bloom, 10-bit output, contact shadows from the game's lights
+
+### Highlights above white
+
+- Measured with float render targets: the game's post-processing ends with fixed-function texture stages. These stages clamp each result to 1 (Direct3D 9 behavior). Thus the final image of the game is never above white.
+- Measured before the post-processing (at the first copy of the back buffer): the scene is above white in up to 0.37% of the pixels, with a maximum of 1.84 (additive blending).
+- The runtime keeps these values:
+  - The back buffer of the swap chain is RGBA16Float (half float). The other 32-bit color render targets stay RGBA16Unorm. Thus the game's own post-processing does not change.
+  - At the end of the opaque scene, after ambient occlusion, contact shadows and bloom, the runtime copies the back buffer (`tm_pre`). This copy occurs only with HDR output or GT7 tone mapping on.
+  - The presentation shader multiplies the scene by luminance(pre) / luminance(pre clamped to white), in linear light. The factor is 1 where the copy is not above white. The factor keeps the hue of the post-processed image (for example black and white, or sepia).
+- The scene curve now accepts values above white:
+  - HDR output without GT7: white goes to 1 + 0.75 × (peak / paper white − 1). Above white, an exponential curve continues with the same slope and approaches the peak.
+  - GT7: a value above white gets 14.5 × paper white × its luminance. Then the GT7 curve compresses it to the peak.
+- Measured in a level, peak 1000 nits (1.67 × SDR white): with GT7, up to 0.17% of the pixels were above SDR white, with a maximum of 1.666 (the peak). Without GT7, 0.23% of the pixels were above 1.5 (the new white) and reached the peak. No pixel was negative or NaN.
+
+### Bloom in HDR
+
+- The bloom passes no longer clamp to white. With the half-float back buffer, the bloom gets the scene values above white, and the composite stays above white. Thus `tm_pre` contains the bloom above white.
+
+### 10-bit output
+
+- The SDR layer is now BGR10A2Unorm (10 bits per channel). It was BGRA8Unorm. The HDR layer stays RGBA16Float.
+- The dither of the presentation is now one step of the output: 1/1023 for a 10-bit drawable, 1/255 for an 8-bit drawable.
+- `GetFrontBufferData` converts a half-float front buffer to 8 bits (clamped to 0..1).
+- Measured: drawable format 94 (BGR10A2Unorm), back buffer format 115 (RGBA16Float), dither on, in SDR with GT7 on and off.
+
+### Contact shadows from the game's lights
+
+- The constant tables (CTAB) of the game's shaders give the names of the constants. The character shaders (`Skinning_*bone*.vso`) light the normal maps with:
+  - `skinLightDir` (c87): a unit vector toward the light, in world space, at `skinCenterPos` (c86).
+  - `skinLightGradients` (c89, c91, c93): the derivatives of that vector along world x, y and z. c90, c92 and c94 are the derivatives of the light color.
+  - The pixel shader calculates saturate(N·L). Thus c87 points toward the light.
+- Measured in a level: the derivatives agree with a point light: −(I − L Lᵀ) / r. Example: predicted (−0.0062, 0.0022, −0.0043), measured (−0.0068, 0.0020, −0.0040), r approximately 100. Thus r = −2 / trace, and the light is at center + r × L.
+- New runtime function `d3d9_enh_light_vs` (`rt_enh.h`). New shader function `d3d9_shader_const_reg` (`d3d9_shader.c`) reads a constant table. The game project calls `d3d9_enh_light_vs("skinLightDir", "skinCenterPos", "skinLightGradients", 2)` in place of the fixed light above.
+- The light of a frame is the light of the character draw nearest the camera. The light moves 15% of the way to a new light in each frame. A frame with no character draw keeps the last light. Until the first character draw, no frame has contact shadows.
+- Measured: a directional light at the camera (a character draw at the camera position, with no derivatives) and point lights 155 to 570 units from the characters.
+
+### Cause of the contact shadow artifacts
+
+- Measured with the game's light, before this change: 21% to 99.9% of a level frame had more than 20% darkening. In the measured level, the light of the nearest character was 75 units below the center of the character.
+- Measured with the old fixed light straight above: 1% to 26% of a level frame had more than 20% darkening.
+- Cause: the shadow of one light darkened the full color. A surface that faces away from the light, or that the light only grazes, has no light from it. The screen-space ray of such a surface goes into the surface, and Bend shows it as shadow.
+- Correction: the composite (`d3d9_enhance.m`, `enh_fs`) multiplies the strength by N·L. N is the normal from the depth buffer (on each axis, the neighbor with the smaller depth step). L is the direction to the light in view space.
+- Measured after the correction: with the game's light, 0.02% to 2.4% of a level frame has more than 20% darkening. With the fixed light straight above, 0.01% to 1.8%. The shadows that stay are on surfaces that the light reaches.
+
+### Verification
+
+- `make app` built the app with no warnings.
+- Headless runs with `MTL_DEBUG_LAYER=1` had no Metal validation error: a level with HDR output, GT7, ambient occlusion, contact shadows and bloom; a level in SDR with GT7 on and off; the HDR Calibration menu.
+- `d3d9_shader_const_reg` gave the same registers as a separate Python reader for 7 constant names in all 119 shader files of the game. Corrupted copies of each shader (changed words and all truncations) had no error with AddressSanitizer and UndefinedBehaviorSanitizer.
+- The measurement code was temporary. It is removed.
+- Not verified: the image on the screen (screenshots are not permitted). `GetFrontBufferData` with a half-float front buffer did not run in the tests.

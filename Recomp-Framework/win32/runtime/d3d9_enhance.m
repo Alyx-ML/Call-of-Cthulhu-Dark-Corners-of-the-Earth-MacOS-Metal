@@ -64,14 +64,19 @@
 // a soft threshold (threshold 0.75, knee 0.35 of linear white). Six levels down (1/2 to 1/64 of the scene size), six
 // passes up, each adding the up-sampled levels below it; the composite adds the mean of the levels times the
 // intensity (low 0.35, medium 0.7, high 1.2) to the scene in linear light. The levels are RGBA16Float. The threshold
-// and the intensities are UNCONFIRMED tuning.
+// and the intensities are UNCONFIRMED tuning. The passes do not clamp to white: a half-float back buffer (rt_enh.h
+// reduced banding) gives its colors above white to the bloom and keeps the composite above white, for HDR output and
+// tone mapping; a unorm back buffer clamps the composite when it stores it.
 //
 // Settings: XeGTAO falloff range 0.615, sample distribution power 2, depth mip offset 3.30, denoise beta 1.2. The
 // levels low, medium and high use 1 x 2, 2 x 2 and 3 x 3 slices x steps, an effect radius of 0.8, 1.2 and 1.6 m
 // and a final value power of 2.4, 3.0 and 3.6. With the XeGTAO defaults (0.5 m, power 2.2) the mean visibility of
 // a level frame was 0.94 to 0.985; with high it is 0.86 to 0.89 in most level frames (measured on the AO texture).
 // Bend: 60 samples, 4 hard samples, 8 fade samples, surface thickness 0.005, bilinear threshold 0.02, contrast 4. The game has no separate light term, so
-// the contact shadow removes CONTACT_STRENGTH of the color (UNCONFIRMED tuning).
+// the contact shadow removes CONTACT_STRENGTH x N.L of the color (UNCONFIRMED tuning). N.L is the cosine between the
+// surface normal (from the depth buffer) and the direction to the light: a surface that the light does not reach (it
+// faces away from the light) or that the light only grazes keeps its color, because its color has no part of that
+// light that a shadow could remove.
 #import <Metal/Metal.h>
 #include "rt32.h"
 #include "rt_enh.h"
@@ -363,10 +368,32 @@ static const char enh_src[] =
     "  float2 q = float2(float((vid << 1) & 2u), float(vid & 2u));\n"
     "  PV o; o.pos = float4(q * 2.0 - 1.0, 0.0, 1.0); return o;\n"
     "}\n"
-    "struct CC { float beta; uint ao; uint contact; float strength; };\n"
+    // CC.light: the light in view space (a position, w = 1, or a direction, w = 0); mulx .. db: the view position of
+    // a depth value (as vpos); px, py: the size of one pixel in screen coordinates (0 .. 1)
+    "struct CC { float beta; uint ao; uint contact; float strength; float4 light; float mulx, muly, addx, addy, da, db, px, py; };\n"
+    "static float3 cpos(depth2d<float, access::read> dt, int2 q, constant CC &k) {\n"
+    "  q = clamp(q, int2(0), int2(int(dt.get_width()) - 1, int(dt.get_height()) - 1));\n"
+    "  float z = k.db / (dt.read(uint2(q)) - k.da);\n"
+    "  float2 sp = (float2(q) + 0.5) * float2(k.px, k.py);\n"
+    "  return float3((float2(k.mulx, k.muly) * sp + float2(k.addx, k.addy)) * z, z);\n"
+    "}\n"
+    // N.L of the light at a pixel: the normal from the neighbor with the smaller depth step on each axis, toward the
+    // camera; 1 where the normal or the direction to the light has no length
+    "static float contact_nl(depth2d<float, access::read> dt, int2 ip, constant CC &k) {\n"
+    "  float3 p0 = cpos(dt, ip, k), pl = cpos(dt, ip - int2(1, 0), k), pr = cpos(dt, ip + int2(1, 0), k);\n"
+    "  float3 pt = cpos(dt, ip - int2(0, 1), k), pb = cpos(dt, ip + int2(0, 1), k);\n"
+    "  float3 dx = abs(pr.z - p0.z) < abs(p0.z - pl.z) ? pr - p0 : p0 - pl;\n"
+    "  float3 dy = abs(pb.z - p0.z) < abs(p0.z - pt.z) ? pb - p0 : p0 - pt;\n"
+    "  float3 n = cross(dx, dy);\n"
+    "  if (dot(n, p0) > 0.0) n = -n;\n"
+    "  float3 l = k.light.w != 0.0 ? k.light.xyz - p0 : k.light.xyz;\n"
+    "  float nn = dot(n, n), ll = dot(l, l);\n"
+    "  if (!(nn > 1e-24) || !(ll > 1e-24)) return 1.0;\n"
+    "  return saturate(dot(n, l) * rsqrt(nn) * rsqrt(ll));\n"
+    "}\n"
     "fragment float4 enh_fs(PV in [[stage_in]], texture2d<float, access::read> a [[texture(0)]],\n"
     "  texture2d<float, access::read> e [[texture(1)]], texture2d<float, access::read> sh [[texture(2)]],\n"
-    "  constant CC &k [[buffer(0)]], float4 dst [[color(0)]]) {\n"
+    "  depth2d<float, access::read> dt [[texture(3)]], constant CC &k [[buffer(0)]], float4 dst [[color(0)]]) {\n"
     "  int2 ip = int2(in.pos.xy);\n"
     "  float3 m = float3(1.0);\n"
     "  if (k.ao != 0u) {\n"
@@ -375,7 +402,10 @@ static const char enh_src[] =
     "    float3 ka = 2.0404 * al - 0.3324, kb = -4.7951 * al + 0.6417, kc = 2.7552 * al + 0.6903;\n"
     "    m = max(float3(v), ((v * ka + kb) * v + kc) * v);\n"
     "  }\n"
-    "  if (k.contact != 0u) m *= mix(1.0, sh.read(uint2(ip)).r, k.strength);\n"
+    "  if (k.contact != 0u) {\n"
+    "    float sv = sh.read(uint2(ip)).r;\n"
+    "    if (sv < 1.0) m *= mix(1.0, sv, k.strength * contact_nl(dt, ip, k));\n"
+    "  }\n"
     "  return float4(dst.rgb * m, dst.a);\n"
     "}\n"
     // dual Kawase bloom. BP.px: one texel of the source (bloom_pre), half a texel of the output (bloom_down,
@@ -387,8 +417,8 @@ static const char enh_src[] =
     "}\n"
     "constexpr sampler bls(filter::linear, address::clamp_to_edge);\n"
     "struct BP { float2 px; float threshold, knee; float scale, pad0, pad1, pad2; };\n"
-    "static float3 to_lin(float3 c) { c = saturate(c); return select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045); }\n"
-    "static float3 to_srgb(float3 l) { l = saturate(l); return select(1.055 * pow(l, 1.0 / 2.4) - 0.055, l * 12.92, l <= 0.0031308); }\n"
+    "static float3 to_lin(float3 c) { c = max(c, 0.0); return select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045); }\n"
+    "static float3 to_srgb(float3 l) { l = max(l, 0.0); return select(1.055 * pow(l, 1.0 / 2.4) - 0.055, l * 12.92, l <= 0.0031308); }\n"
     "static float karis(float3 c) { return 1.0 / (1.0 + max(max(c.r, c.g), c.b)); }\n"
     "static float3 lt(texture2d<float> t, float2 uv) { return to_lin(t.sample(bls, uv).rgb); }\n"
     "fragment float4 bloom_pre(BV in [[stage_in]], texture2d<float> t [[texture(0)]], constant BP &p [[buffer(0)]]) {\n"
@@ -431,7 +461,7 @@ static const char enh_src[] =
 
 typedef struct { float sx, sy, px, py, mulx, muly, addx, addy, mpx, mpy, da, db, radius, falloff, power, mipoff, beta, pad; } AOC;
 typedef struct { float light[4]; int32_t offset[2]; float far_z, near_z, thickness, bilinear, contrast, pad, da, db, fade_start, fade_end; } SSSP;
-typedef struct { float beta; uint32_t ao, contact; float strength; } CC;
+typedef struct { float beta; uint32_t ao, contact; float strength; float light[4]; float mulx, muly, addx, addy, da, db, px, py; } CC;
 typedef struct { int32_t count[3]; int32_t offset[2]; } SssDispatch;
 
 typedef struct { float px[2]; float threshold, knee, scale, pad0, pad1, pad2; } BP;
@@ -599,7 +629,14 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
         setup(dev);
         id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
         if (!ce) rt_fatal("[d3d9] Metal did not create the enhancement compute encoder");
-        CC k = {1.2f, (uint32_t)(ao != 0), (uint32_t)(contact != 0), CONTACT_STRENGTH};
+        CC k = {1.2f, (uint32_t)(ao != 0), (uint32_t)(contact != 0), CONTACT_STRENGTH, {0, 0, 0, 0},
+                2.0f / P[0], -2.0f / P[5], -1.0f / P[0], 1.0f / P[5], da, db, 1.0f / (float)w, 1.0f / (float)h};
+        // the light in view space: light * view (row vectors)
+        for (int cc = 0; cc < 3; cc++) {
+            float a = 0; for (int j = 0; j < 4; j++) a += s->light[j] * s->view[j * 4 + cc];
+            k.light[cc] = a;
+        }
+        k.light[3] = s->light[3];
         if (ao) {
             tex_of(&E.ao0, w, h, MTLPixelFormatR16Float, 1);
             tex_of(&E.ao1, w, h, MTLPixelFormatR16Float, 1);
@@ -678,6 +715,7 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
         [re setFragmentTexture:t0 atIndex:0];
         [re setFragmentTexture:t1 atIndex:1];
         [re setFragmentTexture:t2 atIndex:2];
+        [re setFragmentTexture:depth atIndex:3];
         [re setFragmentBytes:&k length:sizeof k atIndex:0];
         [re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [re endEncoding];

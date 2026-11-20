@@ -756,6 +756,39 @@ size_t d3d9_shader_length(const uint32_t *t, size_t max) {
     return 0;
 }
 
+// The constant table of the compiler (a comment block "CTAB": D3DXSHADER_CONSTANTTABLE, then the
+// D3DXSHADER_CONSTANTINFO entries of 20 bytes; the offsets count from the start of the table, after "CTAB")
+int d3d9_shader_const_reg(const uint32_t *t, size_t n, const char *name, uint32_t *reg, uint32_t *count) {
+    if (n < 1) return 0;
+    uint32_t ver = t[0];
+    int ps = (ver >> 16) == 0xFFFF, major = (int)((ver >> 8) & 0xFF), minor = (int)(ver & 0xFF);
+    size_t nl = strlen(name);
+    for (size_t pc = 1; pc < n; ) {
+        uint32_t ins = t[pc];
+        if ((ins & 0xFFFF) == OP_END) break;
+        int len = ins_len(ps, major, minor, ins);
+        if (len < 0 || (size_t)len >= n - pc) return 0;
+        if ((ins & 0xFFFF) == OP_COMMENT && len >= 8 && t[pc + 1] == 0x42415443u) {   // "CTAB"
+            const uint8_t *tab = (const uint8_t *)(t + pc + 2);
+            size_t tn = ((size_t)len - 1) * 4;
+            uint32_t h[7];
+            memcpy(h, tab, sizeof h);   // Size, Creator, Version, Constants, ConstantInfo, Flags, Target
+            if (h[4] > tn || h[3] > (tn - h[4]) / 20) return 0;
+            for (uint32_t k = 0; k < h[3]; k++) {
+                const uint8_t *ci = tab + h[4] + (size_t)k * 20;
+                uint32_t no; uint16_t set, idx, cnt;
+                memcpy(&no, ci, 4); memcpy(&set, ci + 4, 2); memcpy(&idx, ci + 6, 2); memcpy(&cnt, ci + 8, 2);
+                if (set != 2 || no >= tn || tn - no <= nl) continue;   // D3DXRS_FLOAT4; the name and its 0 must fit
+                if (memcmp(tab + no, name, nl) || tab[no + nl]) continue;
+                *reg = idx; *count = cnt;
+                return 1;
+            }
+        }
+        pc += 1 + (size_t)len;
+    }
+    return 0;
+}
+
 // ---- test entry points (tests/d3d9_shader_test.m); the device builds its own (d3d9_metal.m) ----
 static void tex_params(Buf *o, const ShaderInfo *s, int call) {
     for (int i = 0; i < 16; i++) if (s->samplers & (1u << i)) {

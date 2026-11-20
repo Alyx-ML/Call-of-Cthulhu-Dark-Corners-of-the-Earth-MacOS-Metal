@@ -88,9 +88,12 @@ The game has a menu **Options > Enhancements**. The menu also shows in the pause
 
 **Options > Video** has the setting **Subtitle Size** (Game, 1.25x, 1.5x, 1.75x, 2x).
 
-These items are always on: 16x anisotropic texture filtering, reduced color banding and game controller support (SDL3).
+These items are always on: 16x anisotropic texture filtering, reduced color banding, 10-bit color output and game controller support (SDL3).
 
 HDR Output needs a display with HDR (EDR) support. HDR Output and GT7 Tone Mapping change the 3D scene. The UI, the text and the menus stay at paper white.
+
+- **Highlights:** the game clamps its final image to white. The app keeps the colors of the scene that are brighter than white (lamps, fire, bloom) from before the game's post-processing. With HDR Output, these highlights go above the white of the game, up to the peak. With GT7 Tone Mapping in SDR, they keep their detail.
+- **Contact shadows** use the lights of the game: the light of the character nearest to the camera. A surface that the light does not reach gets no contact shadow.
 
 ### HDR Calibration
 

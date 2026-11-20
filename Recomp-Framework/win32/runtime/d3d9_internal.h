@@ -36,6 +36,9 @@ int d3d9_translate_shader(const uint32_t *tokens, size_t ntokens, const ShaderVa
 char *d3d9_vs_source(const ShaderInfo *vs, const char *vsin, const char *fetch);
 char *d3d9_ps_source(const ShaderInfo *ps);
 size_t d3d9_shader_length(const uint32_t *tokens, size_t max);   // tokens up to and including the end token, 0 if none
+// the float constant `name` of the shader's constant table (CTAB comment): its first register and its register count;
+// 0 when the shader has no such constant
+int d3d9_shader_const_reg(const uint32_t *tokens, size_t ntokens, const char *name, uint32_t *reg, uint32_t *count);
 
 // constant buffer layouts shared with the MSL prelude (d3d9_prelude.h); the float constants come last, so a draw
 // uploads the header and only the constants its shader reads

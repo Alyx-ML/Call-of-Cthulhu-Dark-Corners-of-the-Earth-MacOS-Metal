@@ -49,6 +49,16 @@ void d3d9_enh_light_pass(uint32_t w, uint32_t h, uint32_t fmt, uint32_t creg);
 // at infinity. With this call every frame with a scene camera has contact shadows. d3d9_enh_light_pass then does not
 // give the light; its render targets still do not end the scene when the game draws into them during the scene.
 void d3d9_enh_light_dir(float x, float y, float z);
+// The light of the game's lit draws instead: the draws into the back buffer whose vertex shader has, in its constant
+// table (CTAB), the float constants dir (a unit vector toward the light, in world space, at the world position pos)
+// and grad (the derivatives of that vector along world x, y and z in the registers grad, grad + stride and
+// grad + 2 x stride). For a point light at the distance r the derivative matrix is -(I - dir dir^T) / r, so
+// r = -2 / its trace, and the light is at pos + r x dir; a trace of 0 or more gives a light at infinity in the
+// direction dir. The light of a frame is the light of the draw nearest the camera. The light moves 15% of the way to
+// a new light in each frame, and a frame with no such draw keeps the last light. Until the first such draw, no frame
+// has contact shadows. Call it before the device is created, and not together with d3d9_enh_light_dir. With this call
+// d3d9_enh_light_pass does not give the light; its render targets still do not end the scene.
+void d3d9_enh_light_vs(const char *dir, const char *pos, const char *grad, uint32_t stride);
 
 // The camera of ambient occlusion and contact shadows: without this call, the fixed-function view and projection
 // transforms of the scene draws. With it, the vertex shader constants creg .. creg + 3 of the opaque draws into the

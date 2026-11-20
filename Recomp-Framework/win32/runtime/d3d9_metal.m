@@ -269,10 +269,14 @@ static const Fmt *fmt_find(uint32_t d3d) {
     return NULL;
 }
 // Storage that differs from the Direct3D format (rt_enh.h). Reduced banding: 32-bit color render targets keep 16 bits
-// per channel; a unorm format keeps the [0, 1] range and the clamping of the 8-bit format. Sharp shadows: the shadow
-// targets of d3d9_enh_shadow_target (R5G6B5) keep 8 bits per channel. The Direct3D format (Tex.fmt) does not change.
+// per channel; a unorm format keeps the [0, 1] range and the clamping of the 8-bit format. The back buffer of a swap
+// chain is half float instead: it also keeps the scene's colors above white (additive blending), which HDR output and
+// tone mapping use (tm_pre). Sharp shadows: the shadow targets of d3d9_enh_shadow_target (R5G6B5) keep 8 bits per
+// channel. The Direct3D format (Tex.fmt) does not change.
 static const Fmt fmt_hp_argb = FMT(21, RGBA16Unorm, Invalid, 8, 0, 0, 1, 1, 1, 0, 0, NOSWZ);
 static const Fmt fmt_hp_xrgb = FMT(22, RGBA16Unorm, Invalid, 8, 0, 0, 1, 1, 0, 0, 0, 1, SWZ(Red, Green, Blue, One));
+static const Fmt fmt_fp_argb = FMT(21, RGBA16Float, Invalid, 8, 0, 0, 1, 1, 1, 0, 0, NOSWZ);
+static const Fmt fmt_fp_xrgb = FMT(22, RGBA16Float, Invalid, 8, 0, 0, 1, 1, 0, 0, 0, 1, SWZ(Red, Green, Blue, One));
 static const Fmt fmt_sh_rgb = FMT(23, BGRA8Unorm, Invalid, 4, 0, 0, 1, 1, 0, 0, 0, 1, SWZ(Red, Green, Blue, One));
 static struct { uint32_t w, h, fmt, scale; } enh_sh;   // d3d9_enh_shadow_target
 void d3d9_enh_shadow_target(uint32_t w, uint32_t h, uint32_t fmt, uint32_t scale) {
@@ -349,6 +353,7 @@ typedef struct Decl {
 @end
 typedef struct PVar { ShaderVariant key; ShaderInfo info; int ok; D3D9Fn *fn[4]; } PVar;
 #define MAX_PVAR 64
+#define ENH_LC_MAX 16
 typedef struct Shader {
     Obj o;
     int ps;
@@ -356,6 +361,8 @@ typedef struct Shader {
     ShaderInfo info;               // translation without a variant (vertex shaders, shader model 2-3 pixel shaders)
     NSMutableDictionary *fns;      // vertex shaders: input layout -> D3D9Fn
     PVar *var; uint32_t nvar;      // pixel shaders: per variant
+    int lv;                        // vertex shaders: 1 when the constants of d3d9_enh_light_vs are in lv_dir, lv_pos, lv_grad
+    uint32_t lv_dir, lv_pos, lv_grad;
 } Shader;
 typedef struct Query {
     Obj o;
@@ -465,6 +472,11 @@ struct Device {
     uint32_t enh_light_frame;      // the frame of the captured light
     EnhScene enh_sc;
     id<MTLTexture> enh_color, enh_depth;
+    // d3d9_enh_light_vs: the lights of this frame's draws (one per world position) and the light of the contact shadows
+    struct { float pos[3], dir[3], r; } enh_lc[ENH_LC_MAX];
+    uint32_t enh_nlc, enh_lc_frame;
+    float enh_lv[4];               // the light (homogeneous world position or direction, as EnhScene.light)
+    int enh_lv_ok;                 // enh_lv holds a light
     // d3d9_enh_camera_vs: the cameras of this frame's opaque back-buffer draws and their draw counts
     struct { float view[16], proj[16]; uint32_t n; } enh_cam[4];
     uint32_t enh_ncam, enh_cam_frame;
@@ -475,6 +487,9 @@ struct Device {
     uint32_t tm_ref_frame;         // the frame of tm_ref
     uint32_t tm_copies;            // the copies into tm_ref in tm_ref_frame
     int tm_ui;                     // the last draw into the back buffer was a UI draw
+    id<MTLTexture> tm_pre;         // the half-float back buffer at the end of the opaque scene, after ambient occlusion,
+                                   //   contact shadows and bloom, before the game's post-processing (enh_apply)
+    uint32_t tm_pre_frame;         // the frame of tm_pre
     struct { float headroom, potential; int peak, paper; } tm_logged;
 };
 
@@ -694,7 +709,7 @@ static LockSt *tex_locks(Tex *t) { return ((TexL *)t)->locks; }
 
 // a texture (or the storage of a standalone surface); not yet a COM object
 static Tex *tex_new(Device *d, uint32_t w, uint32_t h, uint32_t dd, uint32_t levels, uint32_t usage, uint32_t fmt,
-                    uint32_t pool, int cube, int volume, uint32_t ms, uint32_t msq, int standalone, int lockable, uint32_t *err) {
+                    uint32_t pool, int cube, int volume, uint32_t ms, uint32_t msq, int standalone, int lockable, int bb, uint32_t *err) {
     *err = D3DERR_INVALIDCALL;
     const Fmt *f = fmt_find(fmt);
     if (!f) { rt_log("[d3d9] format 0x%x is not supported", fmt); return NULL; }
@@ -727,8 +742,9 @@ static Tex *tex_new(Device *d, uint32_t w, uint32_t h, uint32_t dd, uint32_t lev
             f = &fmt_sh_rgb; t->sc = enh_sh.scale;
             if (rt_verbose) rt_log("[d3d9] shadow target %ux%u (format %u) stored at %ux%u, 8 bits per channel", w, h, fmt, w * t->sc, h * t->sc);
         } else if (rt_enh->banding == 1 && (fmt == 21 || fmt == 22)) {
-            f = fmt == 21 ? &fmt_hp_argb : &fmt_hp_xrgb;
-            if (rt_verbose) rt_log("[d3d9] render target %ux%u (format %u) stored with 16 bits per channel", w, h, fmt);
+            f = bb ? (fmt == 21 ? &fmt_fp_argb : &fmt_fp_xrgb) : (fmt == 21 ? &fmt_hp_argb : &fmt_hp_xrgb);
+            if (rt_verbose) rt_log("[d3d9] %s %ux%u (format %u) stored with 16 bits per channel%s", bb ? "back buffer" : "render target",
+                                   w, h, fmt, bb ? " (half float)" : "");
         }
     }
     t->f = f;
@@ -944,8 +960,8 @@ static void surf_destroy(Obj *o) {
 }
 // a standalone surface (render target, depth stencil, offscreen plain, back buffer)
 static Surf *surf_new(Device *d, uint32_t w, uint32_t h, uint32_t fmt, uint32_t usage, uint32_t pool, uint32_t ms,
-                      uint32_t msq, int lockable, uint32_t *err) {
-    Tex *t = tex_new(d, w, h, 1, 1, usage, fmt, pool, 0, 0, ms, msq, 1, lockable, err);
+                      uint32_t msq, int lockable, int bb, uint32_t *err) {
+    Tex *t = tex_new(d, w, h, 1, 1, usage, fmt, pool, 0, 0, ms, msq, 1, lockable, bb, err);
     if (!t) return NULL;
     t->lockable = lockable;
     t->o.dev = d; t->o.rtype = RTYPE_SURFACE;
@@ -1721,14 +1737,14 @@ static const char util_msl[] =
     "  return float4(t.sample(s, in.uv).rgb, 1.0); }\n"
     // presentation: the gamma ramp (D3DGAMMARAMP, 256 entries per channel, interpolated) in full-screen mode.
     // gamma: bit 0 the ramp applies; bit 1 dither (rt_enh.h reduced banding): a triangular noise of +-1 step of the
-    // 8-bit output, from a hash of the pixel position
-    "static float3 dither8(float2 p) {\n"
+    // output, from a hash of the pixel position; bit 2 the output has 10 bits per channel (else 8)
+    "static float3 dither(float2 p, uint gamma) {\n"
     "  uint2 q = uint2(p);\n"
     "  uint h = q.x * 0x8da6b343u ^ q.y * 0xd8163841u; h ^= h >> 15; h *= 0x2c1b3c6du; h ^= h >> 12;\n"
     "  uint h2 = h * 0x297a2d39u; h2 ^= h2 >> 15;\n"
     "  float3 a = float3(float(h & 0xFFFu), float((h >> 12) & 0xFFFu), float((h >> 20) & 0xFFFu)) / 4096.0;\n"
     "  float3 b = float3(float(h2 & 0xFFFu), float((h2 >> 12) & 0xFFFu), float((h2 >> 20) & 0xFFFu)) / 4096.0;\n"
-    "  return (a - b) / 255.0; }\n"
+    "  return (a - b) / ((gamma & 4u) != 0u ? 1023.0 : 255.0); }\n"
     "fragment float4 present_fs(QV in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]],\n"
     "                           constant float4 *ramp [[buffer(0)]], constant uint &gamma [[buffer(1)]]) {\n"
     "  float3 c = saturate(t.sample(s, in.uv).rgb);\n"
@@ -1738,7 +1754,7 @@ static const char util_msl[] =
     "      r[k] = mix(ramp[i][k], ramp[j][k], f - float(i)); }\n"
     "    c = r;\n"
     "  }\n"
-    "  if ((gamma & 2u) != 0u) c = saturate(c + dither8(in.pos.xy));\n"
+    "  if ((gamma & 2u) != 0u) c = saturate(c + dither(in.pos.xy, gamma));\n"
     "  return float4(c, 1.0); }\n"
     // enhanced presentation (rt_enh.h): HDR expansion and GT7 tone mapping. The GT7 functions are a port of
     // gt7_tone_mapping.cpp v1.0 (Polyphony Digital Inc., MIT License; the notice is at present_tm_consts).
@@ -1785,26 +1801,36 @@ static const char util_msl[] =
     "  return r; }\n"
     "static float3 tm_lin(float3 c) { return select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045); }\n"
     "static float tm_luma(float3 l) { return dot(l, float3(0.2126, 0.7152, 0.0722)); }\n"
-    // the scene: a linear SDR color -> the output color (EDR units for HDR output: 1.0 = SDR white; linear SDR
-    // otherwise). The game's image is SDR: its highlights get back a range above paper white. The expansion acts on
+    // the scene: a linear color -> the output color (EDR units for HDR output: 1.0 = SDR white; linear SDR
+    // otherwise). Its luminance Y is 1 at the white of the game's image and above 1 for the scene's colors above white
+    // (tm_pre). The game's image is SDR: its highlights get back a range above paper white. The expansion acts on
     // luminance and scales the three channels by the same factor, so the hue and the saturation stay those of the
     // game. Below the knee (0.25, sRGB 0.54) the luminance does not change. Units of the curve: 1.0 = paper white.
-    //   HDR output without tone mapping: above the knee the curve
-    //     knee + (rel - knee) * (a u + (1 - a) u^3), u = (Y - knee) / (1 - knee), a = (1 - knee) / (rel - knee)
-    //   has slope 1 at the knee and gives SDR white the peak (rel = peak / paper white).
-    //   With tone mapping: an inverse Reinhard curve with slope 1 at the knee gives SDR white 1 + 19 (1 - knee) times
-    //   paper white, and the GT7 curve then fits it to the peak (SDR white for SDR output).
+    //   HDR output without tone mapping: white gets w1 = 1 + 0.75 (rel - 1), so that a quarter of the range above
+    //   paper white stays for the colors above white (rel = peak / paper white). From the knee to white the curve
+    //     knee + (w1 - knee) * (a u + (1 - a) u^3), u = (Y - knee) / (1 - knee), a = (1 - knee) / (w1 - knee)
+    //   has slope 1 at the knee. Above white, w1 + (rel - w1) (1 - exp(-s (Y - 1) / (rel - w1))) continues it with the
+    //   same slope s and approaches the peak.
+    //   With tone mapping: an inverse Reinhard curve with slope 1 at the knee gives white 1 + 19 (1 - knee) times
+    //   paper white, a color above white gets that times Y, and the GT7 curve then fits the result to the peak (SDR
+    //   white for SDR output).
     "static float3 scene_tm(float3 l, constant TM &k) {\n"
     "  float knee = 0.25;\n"
     "  float Y = tm_luma(l);\n"
     "  float Ye;\n"
     "  if ((k.mode & 8u) != 0u && (k.mode & 1u) == 0u) {\n"
-    "    float u = saturate((Y - knee) / (1.0 - knee));\n"
-    "    float a = min((1.0 - knee) / max(k.rel - knee, 1e-3), 1.0);\n"
-    "    Ye = Y <= knee ? Y : knee + (k.rel - knee) * (a * u + (1.0 - a) * u * u * u);\n"
+    "    float w1 = 1.0 + 0.75 * (k.rel - 1.0);\n"
+    "    float a = min((1.0 - knee) / max(w1 - knee, 1e-3), 1.0);\n"
+    "    if (Y <= knee) Ye = Y;\n"
+    "    else if (Y <= 1.0) { float u = (Y - knee) / (1.0 - knee); Ye = knee + (w1 - knee) * (a * u + (1.0 - a) * u * u * u); }\n"
+    "    else {\n"
+    "      float sl = (w1 - knee) / (1.0 - knee) * (3.0 - 2.0 * a), room = k.rel - w1;\n"
+    "      Ye = room > 1e-4 ? w1 + room * (1.0 - exp(-sl * (Y - 1.0) / room)) : w1;\n"
+    "    }\n"
     "  } else {\n"
     "    float t = min(max(Y - knee, 0.0) / (1.0 - knee), 0.95);\n"
     "    Ye = Y <= knee ? Y : knee + (1.0 - knee) * t / (1.0 - t);\n"
+    "    if (Y > 1.0) Ye *= Y;\n"
     "  }\n"
     "  float3 x = l * (Y > 1e-6 ? Ye / Y : 1.0) * k.paper;\n"
     "  x = float3(0.6274040 * x.r + 0.3292820 * x.g + 0.0433136 * x.b, 0.0690970 * x.r + 0.9195400 * x.g + 0.0113612 * x.b,\n"
@@ -1835,14 +1861,20 @@ static const char util_msl[] =
     "  }\n"
     "  return c; }\n"
     // mode: 1 GT7 tone mapping, 2 the drawable is an EDR layer (extended linear, the screen's primaries), 8 HDR output,
-    // 16 the frame has a scene, 32 the HDR calibration test image.
+    // 16 the frame has a scene, 32 the HDR calibration test image, 64 pre (tm_pre) is the scene of this frame before
+    // the game's post-processing.
     // t is the back buffer; rt is the back buffer at the end of the scene, before the UI of the frame (t itself when
     // the frame has no UI after the scene). The scene gets the scene curve; the UI stays at paper white. A pixel that
     // the UI changed: final + (scene output - paper white x scene) x min(Y final / Y scene, 1). This keeps the curve
     // for an unchanged pixel, scales it with a fade or a dark panel over the scene, and adds UI light at paper white.
+    // The colors above white: the game's post-processing clamps the scene to white. Where pre is above white, the
+    // scene gets the factor luminance(pre) / luminance(pre clamped to white) (linear light). The factor keeps the hue
+    // of the post-processed scene (for example a black-and-white or a sepia effect) and is 1 where pre is not above
+    // white.
     "fragment float4 present_enh_fs(QV in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]],\n"
     "                               constant float4 *ramp [[buffer(0)]], constant uint &gamma [[buffer(1)]],\n"
-    "                               constant TM &k [[buffer(2)]], texture2d<float> rt [[texture(1)]]) {\n"
+    "                               constant TM &k [[buffer(2)]], texture2d<float> rt [[texture(1)]],\n"
+    "                               texture2d<float> pre [[texture(2)]]) {\n"
     "  float3 l = tm_lin(tm_ramp(saturate(t.sample(s, in.uv).rgb), ramp, gamma));\n"
     "  float3 disp = l;\n"
     "  if ((k.mode & 9u) != 0u) {\n"
@@ -1850,7 +1882,12 @@ static const char util_msl[] =
     "      float3 r = tm_lin(tm_ramp(saturate(rt.sample(s, in.uv).rgb), ramp, gamma));\n"
     "      float yr = tm_luma(r);\n"
     "      float w = yr > 1e-6 ? min(tm_luma(l) / yr, 1.0) : 0.0;\n"
-    "      disp = max(l * k.paper + (scene_tm(r, k) - r * k.paper) * w, 0.0);\n"
+    "      float g = 1.0;\n"
+    "      if ((k.mode & 64u) != 0u) {\n"
+    "        float3 q = max(pre.sample(s, in.uv).rgb, 0.0);\n"
+    "        g = max(tm_luma(tm_lin(q)) / max(tm_luma(tm_lin(min(q, 1.0))), 1e-4), 1.0);\n"
+    "      }\n"
+    "      disp = max(l * k.paper + (scene_tm(r * g, k) - r * k.paper) * w, 0.0);\n"
     "    } else {\n"
     "      disp = l * k.paper;\n"
     "    }\n"
@@ -1859,7 +1896,7 @@ static const char util_msl[] =
     "  if ((k.mode & 2u) != 0u) return float4(disp, 1.0);\n"
     "  disp = saturate(disp);\n"
     "  float3 e = select(1.055 * pow(disp, 1.0 / 2.4) - 0.055, disp * 12.92, disp <= 0.0031308);\n"
-    "  if ((gamma & 2u) != 0u) e = saturate(e + dither8(in.pos.xy));\n"
+    "  if ((gamma & 2u) != 0u) e = saturate(e + dither(in.pos.xy, gamma));\n"
     "  return float4(e, 1.0); }\n";
 
 typedef struct { char tag; uint8_t mask, blend, samples; uint16_t fmt[4]; uint16_t dfmt, sfmt; } UtilKey;
@@ -2353,10 +2390,84 @@ static void enh_camera_vote(Device *d, uint32_t f, const float view[16], const f
     memcpy(d->enh_cam[k].view, view, 64); memcpy(d->enh_cam[k].proj, proj, 64); d->enh_cam[k].n = 1;
 }
 static struct { int on; float dir[3]; } enh_ld;
+static struct { int on; char dir[64], pos[64], grad[64]; uint32_t stride; } enh_lvs;
 void d3d9_enh_light_dir(float x, float y, float z) {
     float n = sqrtf(x * x + y * y + z * z);
     if (!(n > 0.0f) || !isfinite(n)) rt_fatal("[d3d9] d3d9_enh_light_dir: the direction (%g, %g, %g) has no length", x, y, z);
+    if (enh_lvs.on) rt_fatal("[d3d9] d3d9_enh_light_dir: d3d9_enh_light_vs already gives the light");
     enh_ld.on = 1; enh_ld.dir[0] = x / n; enh_ld.dir[1] = y / n; enh_ld.dir[2] = z / n;
+}
+void d3d9_enh_light_vs(const char *dir, const char *pos, const char *grad, uint32_t stride) {
+    if (enh_ld.on) rt_fatal("[d3d9] d3d9_enh_light_vs: d3d9_enh_light_dir already gives the light");
+    if (!dir || !pos || !grad || strlen(dir) >= sizeof enh_lvs.dir || strlen(pos) >= sizeof enh_lvs.pos ||
+        strlen(grad) >= sizeof enh_lvs.grad || stride < 1 || stride > 64)
+        rt_fatal("[d3d9] d3d9_enh_light_vs: bad constant names or register stride %u", stride);
+    strcpy(enh_lvs.dir, dir); strcpy(enh_lvs.pos, pos); strcpy(enh_lvs.grad, grad);
+    enh_lvs.stride = stride; enh_lvs.on = 1;
+}
+// a vertex shader of d3d9_enh_light_vs: the registers of its light constants (from its constant table)
+static void enh_light_shader(Shader *s) {
+    uint32_t rd, cd, rp, cp, rg, cg;
+    if (!enh_lvs.on || !d3d9_shader_const_reg(s->tok, s->ntok, enh_lvs.dir, &rd, &cd) ||
+        !d3d9_shader_const_reg(s->tok, s->ntok, enh_lvs.pos, &rp, &cp) || !d3d9_shader_const_reg(s->tok, s->ntok, enh_lvs.grad, &rg, &cg))
+        return;
+    uint32_t gn = 2 * enh_lvs.stride + 1;
+    if (cd < 1 || cp < 1 || cg < gn || rd >= VS_CONST_F || rp >= VS_CONST_F || rg > VS_CONST_F - gn) {
+        rt_log("[d3d9] a vertex shader has the light constants %s c%u, %s c%u, %s c%u (%u registers), outside the constants; its draws give no light",
+               enh_lvs.dir, rd, enh_lvs.pos, rp, enh_lvs.grad, rg, cg);
+        return;
+    }
+    s->lv = 1; s->lv_dir = rd; s->lv_pos = rp; s->lv_grad = rg;
+}
+// a draw with such a shader: its light, once per world position in a frame (at most ENH_LC_MAX)
+static void enh_light_note(Device *d, uint32_t f, const State *S) {
+    const Shader *vs = S->vs;
+    if (d->enh_lc_frame != f) { d->enh_lc_frame = f; d->enh_nlc = 0; }
+    const float *P = S->vsf[vs->lv_pos], *L = S->vsf[vs->lv_dir];
+    for (uint32_t i = 0; i < d->enh_nlc; i++) if (enh_same(d->enh_lc[i].pos, P, 3)) return;
+    if (d->enh_nlc == ENH_LC_MAX) return;
+    float n = sqrtf(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
+    if (!(n > 1e-6f) || !isfinite(n) || !isfinite(P[0]) || !isfinite(P[1]) || !isfinite(P[2])) return;
+    // the trace of the derivative matrix: -2 / r for a point light at distance r
+    float tr = S->vsf[vs->lv_grad][0] + S->vsf[vs->lv_grad + enh_lvs.stride][1] + S->vsf[vs->lv_grad + 2 * enh_lvs.stride][2];
+    float r = tr < 0.0f ? -2.0f / tr : 0.0f;
+    if (!isfinite(r) || r > 1e7f) r = 0.0f;   // a derivative of almost 0: a light at infinity
+    typeof(d->enh_lc[0]) *c = &d->enh_lc[d->enh_nlc++];
+    for (int i = 0; i < 3; i++) { c->pos[i] = P[i]; c->dir[i] = L[i] / n; }
+    c->r = r;
+}
+// the light of the contact shadows for the frame's camera (view): the light of the draw nearest the camera. The light
+// moves 15% of the way to the new light in each frame (a change from a point light to a light at infinity or back
+// is immediate); a frame with no such draw keeps the light. Returns 0 while no frame has had such a draw.
+#define ENH_LV_STEP 0.15f
+static int enh_light_pick(Device *d, uint32_t f, const float view[16]) {
+    if (d->enh_lc_frame != f || !d->enh_nlc) return d->enh_lv_ok;
+    float cam[3];
+    for (int j = 0; j < 3; j++) cam[j] = -(view[12] * view[j * 4] + view[13] * view[j * 4 + 1] + view[14] * view[j * 4 + 2]);
+    uint32_t best = 0; float bd = INFINITY;
+    for (uint32_t i = 0; i < d->enh_nlc; i++) {
+        float dx = d->enh_lc[i].pos[0] - cam[0], dy = d->enh_lc[i].pos[1] - cam[1], dz = d->enh_lc[i].pos[2] - cam[2];
+        float dd = dx * dx + dy * dy + dz * dz;
+        if (dd < bd) { bd = dd; best = i; }
+    }
+    const typeof(d->enh_lc[0]) *c = &d->enh_lc[best];
+    float t[4];
+    if (c->r > 0.0f) { for (int i = 0; i < 3; i++) t[i] = c->pos[i] + c->r * c->dir[i]; t[3] = 1.0f; }
+    else { for (int i = 0; i < 3; i++) t[i] = c->dir[i]; t[3] = 0.0f; }
+    if (!d->enh_lv_ok || t[3] != d->enh_lv[3]) memcpy(d->enh_lv, t, sizeof t);
+    else {
+        for (int i = 0; i < 3; i++) d->enh_lv[i] += (t[i] - d->enh_lv[i]) * ENH_LV_STEP;
+        if (t[3] == 0.0f) {
+            float n = sqrtf(d->enh_lv[0] * d->enh_lv[0] + d->enh_lv[1] * d->enh_lv[1] + d->enh_lv[2] * d->enh_lv[2]);
+            if (n > 1e-6f) for (int i = 0; i < 3; i++) d->enh_lv[i] /= n;
+            else memcpy(d->enh_lv, t, sizeof t);   // opposite directions: the new light
+        }
+    }
+    if (rt_verbose && (!d->enh_lv_ok || d->frame % 600 == 0))
+        rt_log("[d3d9] contact shadow light: %s (%.1f %.1f %.1f), from the nearest of %u lit draws (%.1f from the camera, light distance %.1f)",
+               t[3] != 0.0f ? "point" : "direction", d->enh_lv[0], d->enh_lv[1], d->enh_lv[2], d->enh_nlc, sqrtf(bd), c->r);
+    d->enh_lv_ok = 1;
+    return 1;
 }
 static int enh_is_light_target(const Surf *s) { return enh_lp.w && s && s->w == enh_lp.w && s->h == enh_lp.h && s->tex->fmt == enh_lp.fmt; }
 static float det3(float a0, float a1, float a2, float b0, float b1, float b2, float c0, float c1, float c2) {
@@ -2394,8 +2505,9 @@ static void enh_note_draw(Device *d) {
     if (!d->ds && enh_is_light_target(r0) && S->vs && d->enh_light_frame != f) {
         if (enh_light_of((const float (*)[4])S->vsf[enh_lp.creg], d->enh_sc.light)) d->enh_light_frame = f;
     }
-    if (rt_enh->ao <= 0 && rt_enh->contact <= 0 && rt_enh->bloom <= 0) return;
+    if (rt_enh->ao <= 0 && rt_enh->contact <= 0 && rt_enh->bloom <= 0 && rt_enh->tonemap != 1 && rt_enh->hdr != 1) return;
     if (d->enh_done == f) return;
+    if (rt_enh->contact > 0 && r0->swap && S->vs && S->vs->lv) enh_light_note(d, f, S);
     if (r0->swap && d->ds && S->rs[RS_ZENABLE] && S->rs[RS_ZWRITEENABLE] && !S->rs[RS_ALPHABLENDENABLE]) {
         d->enh_scene = f;
         if (enh_camvs.on) {
@@ -2447,7 +2559,10 @@ static void tm_note(Device *d) {
                (unsigned long)src.width, (unsigned long)src.height);
 }
 // the end of the opaque scene of this frame (a target change, a copy or clear of the back buffer, Present): the
-// ambient occlusion, contact shadow and bloom passes run once, on the GPU after the draws recorded so far
+// ambient occlusion, contact shadow and bloom passes run once, on the GPU after the draws recorded so far. With HDR
+// output or tone mapping, a half-float back buffer is then copied into tm_pre: the game's post-processing ends with
+// fixed-function copies, which clamp the scene to white, and present_enh_fs takes the scene's colors above white
+// from this copy.
 static void enh_apply(Device *d) {
     uint32_t f = d->frame + 1;
     if (!rt_enh || d->enh_scene != f || d->enh_done == f) return;
@@ -2458,7 +2573,7 @@ static void enh_apply(Device *d) {
     if (enh_ld.on) {
         memcpy(d->enh_sc.light, enh_ld.dir, sizeof enh_ld.dir); d->enh_sc.light[3] = 0.0f;
         d->enh_sc.have_light = 1;
-    } else d->enh_sc.have_light = d->enh_light_frame == f;
+    } else if (!enh_lvs.on) d->enh_sc.have_light = d->enh_light_frame == f;
     int ao = rt_enh->ao, contact = rt_enh->contact;
     if (enh_camvs.on && (ao > 0 || contact > 0)) {
         // the camera with the most draws (the level geometry, whose world transform is the identity)
@@ -2477,8 +2592,28 @@ static void enh_apply(Device *d) {
             ao = contact = 0;
         }
     }
+    if (enh_lvs.on) {
+        d->enh_sc.have_light = contact > 0 && enh_light_pick(d, f, d->enh_sc.view);
+        memcpy(d->enh_sc.light, d->enh_lv, sizeof d->enh_lv);
+    }
     d3d9_enh_scene(d->mtl, d->cmd, d->enh_color, d->enh_depth, &d->enh_sc, ao, contact);
     d3d9_enh_bloom(d->mtl, d->cmd, d->enh_color, rt_enh->bloom);
+    id<MTLTexture> c = d->enh_color;
+    if ((rt_enh->tonemap == 1 || rt_enh->hdr == 1) && c.pixelFormat == MTLPixelFormatRGBA16Float && c.sampleCount == 1) {
+        if (!d->tm_pre || d->tm_pre.width != c.width || d->tm_pre.height != c.height) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:c.pixelFormat width:c.width
+                                                                                          height:c.height mipmapped:NO];
+            td.storageMode = MTLStorageModePrivate; td.usage = MTLTextureUsageShaderRead;
+            d->tm_pre = [d->mtl newTextureWithDescriptor:td];
+            if (!d->tm_pre) rt_fatal("[d3d9] out of GPU memory for the scene copy of HDR output (%lux%lu)",
+                                     (unsigned long)c.width, (unsigned long)c.height);
+        }
+        [get_blit(d) copyFromTexture:c toTexture:d->tm_pre];
+        d->tm_pre_frame = f;
+        if (rt_verbose && d->frame % 600 == 0)
+            rt_log("[d3d9] HDR output and tone mapping: frame %u, the scene before post-processing copied (%lux%lu)", d->frame,
+                   (unsigned long)c.width, (unsigned long)c.height);
+    }
     d->enh_color = d->enh_depth = nil;
 }
 // indexed: idx/ioff/i32 the index source (CPU pointer for fans), first = start index; else first = start vertex
@@ -2701,7 +2836,7 @@ static void swap_destroy(Obj *o) {
 static uint32_t swap_make_bb(Device *d, Swap *sw) {
     uint32_t err;
     Surf *bb = surf_new(d, sw->pp[0], sw->pp[1], sw->pp[2], USAGE_RENDERTARGET, POOL_DEFAULT, sw->pp[4] == 1 ? d->caps_ms_counts[sw->pp[5]] : sw->pp[4],
-                        sw->pp[5], (sw->pp[11] & 1) != 0, &err);
+                        sw->pp[5], (sw->pp[11] & 1) != 0, 1, &err);
     if (!bb) return err;
     bb->o.com.refs = 0; bb->o.priv = 1;   // owned by the swap chain
     bb->swap = sw;
@@ -2813,8 +2948,10 @@ static uint32_t swap_present(Device *d, Swap *sw, uint32_t srp, uint32_t drp, ui
     int scaled = (sr[2] - sr[0]) != drc[2] - drc[0] || (sr[3] - sr[1]) != drc[3] - drc[1];
     // the gamma ramp applies in full-screen mode (D3D9 ignores it for windowed swap chains)
     uint32_t gamma = !sw->pp[8] && !gamma_identity(sw->ramp);
-    // reduced banding (rt_enh.h): a back buffer of 16 bits per channel is dithered into an 8-bit drawable
-    if (bt->f->mtl == MTLPixelFormatRGBA16Unorm && dt.pixelFormat == MTLPixelFormatBGRA8Unorm) gamma |= 2u;
+    // reduced banding (rt_enh.h): a back buffer of 16 bits per channel is dithered into an 8-bit or a 10-bit drawable
+    if ((bt->f->mtl == MTLPixelFormatRGBA16Unorm || bt->f->mtl == MTLPixelFormatRGBA16Float) &&
+        (dt.pixelFormat == MTLPixelFormatBGRA8Unorm || dt.pixelFormat == MTLPixelFormatBGR10A2Unorm))
+        gamma |= dt.pixelFormat == MTLPixelFormatBGR10A2Unorm ? 6u : 2u;
     __unsafe_unretained id<MTLBuffer> rb; uint32_t ro;
     float *ramp = ring_alloc(d, 256 * 16, &rb, &ro);
     for (int i = 0; i < 256; i++) for (int c = 0; c < 3; c++) ramp[i * 4 + c] = sw->ramp[c * 256 + i] / 65535.0f;
@@ -2853,9 +2990,13 @@ static uint32_t swap_present(Device *d, Swap *sw, uint32_t srp, uint32_t drp, ui
         uint32_t f = d->frame + 1;
         int ref = sw == d->swap && d->tm_ui && d->tm_ref_frame == f && d->tm_ref && d->tm_ref.width == img.width && d->tm_ref.height == img.height;
         if (sw == d->swap && d->tm_scene == f) tm_mode |= 16u;
+        // the scene of this frame before the game's post-processing (enh_apply)
+        int pre = sw == d->swap && d->tm_pre_frame == f && d->tm_pre && d->tm_pre.width == img.width && d->tm_pre.height == img.height;
+        if (pre) tm_mode |= 64u;
         present_tm_consts(k, tm_mode, paper, peak, DW, DH);
         [e setFragmentBuffer:tb offset:to atIndex:2];
         [e setFragmentTexture:ref ? d->tm_ref : img atIndex:1];
+        [e setFragmentTexture:pre ? d->tm_pre : img atIndex:2];
     }
     util_quad(d, e, tm_mode ? 'H' : 'P', 0, dt.pixelFormat, img, scaled ? d->samp_lin : d->samp_pt, sr, bb->w, bb->h, drc, DW, DH, rb, ro, &gamma);
     // the D3D9 cursor (SetCursorProperties / ShowCursor) follows the mouse
@@ -3259,7 +3400,7 @@ static uint32_t dev_reset(Device *d, const uint32_t *pp, uint32_t focus) {
     if (d->auto_ds) { Surf *s = d->auto_ds; d->auto_ds = NULL; priv_unref(&s->o); }
     if (pp[9]) {
         uint32_t ms = pp[4] == 1 ? d->caps_ms_counts[pp[5]] : pp[4];
-        Surf *s = surf_new(d, pp[0], pp[1], pp[10], USAGE_DEPTHSTENCIL, POOL_DEFAULT, ms, pp[5], 0, &err);
+        Surf *s = surf_new(d, pp[0], pp[1], pp[10], USAGE_DEPTHSTENCIL, POOL_DEFAULT, ms, pp[5], 0, 0, &err);
         if (!s) return err;
         s->o.com.refs = 0; s->o.priv = 1;   // owned by the device
         d->auto_ds = s;
@@ -3541,7 +3682,7 @@ static uint32_t create_tex(Device *d, uint32_t w, uint32_t h, uint32_t dd, uint3
     wr32(out, 0);
     if (shared || pool > POOL_SCRATCH) return D3DERR_INVALIDCALL;
     uint32_t err;
-    Tex *t = tex_new(d, w, h, dd, levels, usage, fmt, pool, cube, volume, 1, 0, 0, 0, &err);
+    Tex *t = tex_new(d, w, h, dd, levels, usage, fmt, pool, cube, volume, 1, 0, 0, 0, 0, &err);
     if (!t) return err;
     obj_wrap(&t->o, volume ? &c_voltex : cube ? &c_cube : &c_texture, d, tex_destroy);
     t->o.rtype = volume ? RTYPE_VOLUMETEXTURE : cube ? RTYPE_CUBETEXTURE : RTYPE_TEXTURE;
@@ -3581,7 +3722,7 @@ static uint32_t create_surf(Device *d, uint32_t w, uint32_t h, uint32_t fmt, uin
     uint32_t count;
     if (shared || !ms_valid(d, mst, q, &count)) return D3DERR_INVALIDCALL;
     uint32_t err;
-    Surf *s = surf_new(d, w, h, fmt, usage, pool, count, q, lockable, &err);
+    Surf *s = surf_new(d, w, h, fmt, usage, pool, count, q, lockable, 0, &err);
     if (!s) return err;
     wr32(out, s->o.com.guest);
     return D3D_OK;
@@ -3619,6 +3760,7 @@ static uint32_t front_data(Device *d, Swap *sw, Surf *t) {
     uint32_t w = bt->w < t->w ? bt->w : t->w, h = bt->h < t->h ? bt->h : t->h;
     if (bt->w != t->w || bt->h != t->h) LOG_ONCE("[d3d9] GetFrontBufferData: %ux%u front buffer copied into a %ux%u surface", bt->w, bt->h, t->w, t->h);
     uint32_t bpp = bt->f->bpp, spitch = bt->w * bpp;
+    int half = sw->front.pixelFormat == MTLPixelFormatRGBA16Float;
     id<MTLBuffer> b = [d->mtl newBufferWithLength:(NSUInteger)spitch * bt->h options:MTLResourceStorageModeShared];
     if (!b) return E_OUTOFMEMORY_;
     [get_blit(d) copyFromTexture:sw->front sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(bt->w, bt->h, 1)
@@ -3630,7 +3772,15 @@ static uint32_t front_data(Device *d, Swap *sw, Surf *t) {
         const uint8_t *i = src + (size_t)y * spitch;
         for (uint32_t x = 0; x < w; x++) {
             if (bpp == 4) { memcpy(o + x * 4, i + x * 4, 4); o[x * 4 + 3] = 0xFF; }
-            else if (bpp == 8) {   // RGBA16Unorm (rt_enh.h reduced banding) -> B, G, R, A bytes
+            else if (bpp == 8 && half) {   // RGBA16Float (rt_enh.h reduced banding, a back buffer) -> B, G, R, A bytes
+                __fp16 v[4]; memcpy(v, i + x * 8, 8);
+                for (int c = 0; c < 3; c++) {
+                    float fv = (float)v[c];
+                    fv = fv > 0.0f ? (fv < 1.0f ? fv : 1.0f) : 0.0f;   // NaN -> 0
+                    o[x * 4 + 2 - c] = (uint8_t)(fv * 255.0f + 0.5f);
+                }
+                o[x * 4 + 3] = 0xFF;
+            } else if (bpp == 8) {   // RGBA16Unorm (rt_enh.h reduced banding) -> B, G, R, A bytes
                 uint16_t v[4]; memcpy(v, i + x * 8, 8);
                 for (int c = 0; c < 3; c++) o[x * 4 + 2 - c] = (uint8_t)(((uint32_t)v[c] * 255u + 32767u) / 65535u);
                 o[x * 4 + 3] = 0xFF;
@@ -4111,7 +4261,10 @@ static uint32_t create_shader(Device *d, uint32_t p, uint32_t out, int ps) {
     if (ps) {
         s->var = calloc(MAX_PVAR, sizeof *s->var);
         if (!s->var) { free(s->info.msl); free(s->tok); free(s); return E_OUTOFMEMORY_; }
-    } else s->fns = [NSMutableDictionary new];
+    } else {
+        s->fns = [NSMutableDictionary new];
+        enh_light_shader(s);
+    }
     obj_wrap(&s->o, ps ? &c_ps : &c_vs, d, shader_destroy);
     wr32(out, s->o.com.guest);
     return D3D_OK;
