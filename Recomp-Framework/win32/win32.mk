@@ -50,7 +50,8 @@ W32_RT_C ?= rt32.c imports.c kernel32.c crt.c user32.c misc.c registry.c com32.c
 W32_RT_M ?= cocoa32.m d3d9_metal.m d3d9_enhance.m
 include $(W32)/ffmpeg.mk
 RT_OBJ   = $(patsubst %.c,$(BUILD)/w32/%.o,$(W32_RT_C)) $(patsubst %.m,$(BUILD)/w32/%.o,$(W32_RT_M))
-GAME_OBJ = $(patsubst %.c,$(BUILD)/game/%.o,$(GAME_SRC))
+# GAME_SRC may have Objective-C files (.m): they are compiled with ARC, as the runtime's
+GAME_OBJ = $(patsubst %.c,$(BUILD)/game/%.o,$(filter %.c,$(GAME_SRC))) $(patsubst %.m,$(BUILD)/game/%.o,$(filter %.m,$(GAME_SRC)))
 $(BUILD)/w32/%.o: $(W32)/runtime/%.c $(W32_HDR)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -64,6 +65,9 @@ $(BUILD)/w32/%.o: $(W32)/runtime/%.m $(W32_HDR)
 $(BUILD)/game/%.o: %.c $(W32_HDR)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD)/game/%.o: %.m $(W32_HDR)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -fobjc-arc -c $< -o $@
 
 FRAMEWORKS ?= -framework CoreFoundation -framework AppKit -framework QuartzCore -framework Metal -framework MetalFX -framework MetalKit \
               -framework AudioToolbox -framework CoreAudio -framework GameController

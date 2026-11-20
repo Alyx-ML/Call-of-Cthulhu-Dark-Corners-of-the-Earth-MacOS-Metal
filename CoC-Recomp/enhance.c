@@ -13,14 +13,15 @@
 // camera projections (0x4347e9), and the intensity of the visual sanity effects (0x55d88e, 0x55e01d, 0x55f08d, 0x55f35d,
 // 0x55f58f).
 //
-// The settings are saved to Enhancements.cfg in the data folder (key=value lines) when a value changes.
+// The settings are saved to Enhancements.cfg in the data folder (key=value lines) when a value changes. The launcher
+// window (launcher.m) reads and writes the same file before the game starts (coc_enh_read, coc_enh_write, enhance.h).
 // Anisotropic filtering is always 16x and is not in the menu (the file can set another value).
 // Reduced banding and the gamepad are always on and are not in the menu or the file.
 // Defaults: headphone audio, anti-aliasing, ambient occlusion, tone mapping, HDR, contact shadows, bloom, sharp character
 // shadows and skip intro videos off; subtitles at the game's size; the game's field of view and sanity effects; Max Brightness (HDR) 0 (1000
 // nits) and Brightness (HDR) 0 (300 nits).
 #include "rt32.h"
-#include "rt_enh.h"
+#include "enhance.h"
 #include <errno.h>
 #include <stddef.h>
 #include <string.h>
@@ -109,7 +110,7 @@ uint32_t coc_enh_text(uint32_t id) {
 // ---- the settings ----
 static uint32_t enh_guest;               // guest address of the RtEnh
 static RtEnh saved;                      // the values in Enhancements.cfg
-static const struct { const char *key; size_t off; int32_t max; int32_t def; } keys[] = {
+const CocEnhKey coc_enh_keys[] = {
     {"anisotropic_filtering", offsetof(RtEnh, aniso), 4, 4},   // not in the menu: 16x unless the file sets another value
     {"ambient_occlusion", offsetof(RtEnh, ao), 3, 0},
     {"tone_mapping", offsetof(RtEnh, tonemap), 1, 0},
@@ -132,20 +133,37 @@ enum { K_ANISO, K_AO, K_TONEMAP, K_HDR, K_CONTACT, K_SKIP, K_BLOOM, K_SHADOWS, K
 // other steps (hdr_peak: 400 .. 4000 nits; hdr_paper_white: a percentage of the SDR white of macOS). The loader skips
 // them, and the next save leaves them out.
 static const char *const retired_keys[] = {"gamepad", "reduced_banding", "hdr_peak", "hdr_paper_white"};
-#define NKEYS (sizeof keys / sizeof keys[0])
+#define NKEYS (sizeof coc_enh_keys / sizeof coc_enh_keys[0])
+static const CocEnhKey *const keys = coc_enh_keys;
+const size_t coc_enh_nkeys = NKEYS;
 static int32_t *field(RtEnh *e, size_t i) { return (int32_t *)((char *)e + keys[i].off); }
-static void cfg_path(char *p, size_t n) { snprintf(p, n, "%s/Enhancements.cfg", rt_data_dir); }
+static int32_t cfield(const RtEnh *e, size_t i) { return *(const int32_t *)((const char *)e + keys[i].off); }
+static int cfg_path(char *p, size_t n) { int r = snprintf(p, n, "%s/Enhancements.cfg", rt_data_dir); return r > 0 && (size_t)r < n; }
+
+int coc_enh_write(const RtEnh *e, char *problem, size_t n) {
+    char p[1200], tmp[1210];
+    if (!cfg_path(p, sizeof p) || snprintf(tmp, sizeof tmp, "%s.tmp", p) >= (int)sizeof tmp) {
+        snprintf(problem, n, "The path of the settings file is too long.");
+        return 0;
+    }
+    FILE *f = fopen(tmp, "w");
+    if (!f) { snprintf(problem, n, "The settings file %s cannot be written (%s).", tmp, strerror(errno)); return 0; }
+    int bad = fprintf(f, "# Call of Cthulhu DCoTE recompilation: enhancement settings (Options > Enhancements)\n") < 0;
+    for (size_t i = 0; i < NKEYS; i++) bad |= fprintf(f, "%s=%d\n", keys[i].key, cfield(e, i)) < 0;
+    int e1 = errno;
+    if (fclose(f) != 0) { bad = 1; e1 = errno; }
+    if (bad) { snprintf(problem, n, "The settings file %s cannot be written (%s).", tmp, strerror(e1)); remove(tmp); return 0; }
+    if (rename(tmp, p) != 0) {
+        snprintf(problem, n, "The settings file %s cannot be replaced (%s).", p, strerror(errno));
+        remove(tmp);
+        return 0;
+    }
+    return 1;
+}
 
 static void cfg_save(void) {
-    char p[1200], tmp[1210];
-    cfg_path(p, sizeof p);
-    snprintf(tmp, sizeof tmp, "%s.tmp", p);
-    FILE *f = fopen(tmp, "w");
-    if (!f) { rt_log("[enh] can't write %s: %s; the settings are not saved", tmp, strerror(errno)); return; }
-    int bad = fprintf(f, "# Call of Cthulhu DCoTE recompilation: enhancement settings (Options > Enhancements)\n") < 0;
-    for (size_t i = 0; i < NKEYS; i++) bad |= fprintf(f, "%s=%d\n", keys[i].key, *field(rt_enh, i)) < 0;
-    bad |= fclose(f) != 0;
-    if (bad || rename(tmp, p) != 0) { rt_log("[enh] can't write %s: %s; the settings are not saved", p, strerror(errno)); remove(tmp); return; }
+    char problem[1400];
+    if (!coc_enh_write(rt_enh, problem, sizeof problem)) { rt_log("[enh] %s The settings are not saved.", problem); return; }
     saved = *rt_enh;
     if (rt_verbose) rt_log("[enh] settings saved: aniso %d, ao %d, tonemap %d, hdr %d, contact %d, skip_intro %d, "
                            "bloom %d, shadows %d, subtitle size %d, hdr max brightness %d, hdr brightness %d, field of view %d, sanity effects %d, anti-aliasing %d, headphone audio %d, raw mouse input %d",
@@ -153,19 +171,21 @@ static void cfg_save(void) {
                            rt_enh->ao, rt_enh->tonemap, rt_enh->hdr, rt_enh->contact, rt_enh->skip_intro, rt_enh->bloom,
                            rt_enh->shadows, rt_enh->sub_scale, rt_enh->hdr_peak, rt_enh->hdr_paper, rt_enh->fov, rt_enh->sanity, rt_enh->aa, rt_enh->hrtf, rt_enh->raw_mouse);
 }
-static void cfg_load(void) {
-    for (size_t i = 0; i < NKEYS; i++) *field(rt_enh, i) = keys[i].def;
-    rt_enh->banding = 1;                 // reduced banding: always on
-    rt_enh->pad = 1;                     // gamepad input (SDL3): always on
+int coc_enh_read(RtEnh *e, char *problem, size_t n) {
+    memset(e, 0, sizeof *e);
+    for (size_t i = 0; i < NKEYS; i++) *field(e, i) = keys[i].def;
+    e->banding = 1;                      // reduced banding: always on
+    e->pad = 1;                          // gamepad input (SDL3): always on
     char p[1200];
-    cfg_path(p, sizeof p);
+    if (!cfg_path(p, sizeof p)) { snprintf(problem, n, "The path of the settings file is too long."); return 0; }
     FILE *f = fopen(p, "r");
     if (!f) {
-        if (errno != ENOENT) rt_log("[enh] can't read %s: %s; the settings are the defaults", p, strerror(errno));
-        saved = *rt_enh;
-        return;
+        if (errno == ENOENT) return 1;
+        snprintf(problem, n, "The settings file %s cannot be read (%s). The settings are the defaults.", p, strerror(errno));
+        rt_log("[enh] %s", problem);
+        return 0;
     }
-    char line[256]; int ln = 0;
+    char line[256]; int ln = 0, first_bad = 0, nbad = 0;
     while (fgets(line, sizeof line, f)) {
         ln++;
         char *s = line; while (*s == ' ' || *s == '\t') s++;
@@ -180,11 +200,28 @@ static void cfg_load(void) {
         long v = eq ? strtol(eq + 1, &end, 10) : -1;
         if (i == NKEYS || !end || end == eq + 1 || (*end && *end != '\n' && *end != '\r') || v < 0 || v > keys[i].max) {
             rt_log("[enh] %s line %d is not a valid setting; the line is ignored", p, ln);
+            if (!nbad++) first_bad = ln;
             continue;
         }
-        *field(rt_enh, i) = (int32_t)v;
+        *field(e, i) = (int32_t)v;
     }
+    int read_err = ferror(f) ? errno : 0;
     fclose(f);
+    if (read_err) {
+        snprintf(problem, n, "The settings file %s cannot be read (%s).", p, strerror(read_err));
+        rt_log("[enh] %s", problem);
+        return 0;
+    }
+    if (nbad) {
+        snprintf(problem, n, "%d line%s of the settings file %s %s not a valid setting (the first: line %d). The game "
+                 "ignores %s.", nbad, nbad == 1 ? "" : "s", p, nbad == 1 ? "is" : "are", first_bad, nbad == 1 ? "it" : "them");
+        return 0;
+    }
+    return 1;
+}
+static void cfg_load(void) {
+    char problem[1400];
+    coc_enh_read(rt_enh, problem, sizeof problem);   // its problems are logged; the values are the valid ones
     saved = *rt_enh;
 }
 

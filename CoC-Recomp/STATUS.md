@@ -775,3 +775,47 @@ The HDR Calibration menu now has the two settings of the Capcom RE Engine (Resid
 
 - `make gen` and `make app` built the app. The only warnings are the two known `key_frame` warnings of `wmvcore.c`.
 - The headless runs ended without errors. The Enhancements.cfg of the test folder was restored after the runs.
+
+## 2026-11-20: Launcher window
+
+The app opens a launcher window before the game starts. The window is adapted from the launcher window of the Prototype Mac port (`runtime/loader/rt_launcher.m` of that project). It has the same layout, controls and behavior, with the settings, the game folder check and the look of this game.
+
+### Behavior
+
+- The window shows the game folder and its status, 13 enhancement settings in three groups (Graphics, Sound and mouse, Game), Restore Defaults and Play.
+- The HDR calibration (Max Brightness (HDR), Brightness (HDR)) and anisotropic filtering are not in the window. Play keeps their values in `Enhancements.cfg`.
+- The folder check (`game_problem` in `game.c`): the folder must contain `Engine/CoCMainWin32.exe` with the SHA-256 of the GOG release. If the player selects the `Engine` folder, the window tells the player to select the folder that contains it.
+- The window shows first the folder of the last Play (NSUserDefaults key `GameFolder`). If that folder cannot be used and the folder of the build (`COC_BUILD_GAME_DIR`) can be used, the window shows the folder of the build.
+- When the folder can be used, the header shows the icon of the GOG release from that folder (`goggame-1189711155.ico`). The repository and the app contain no game art.
+- Play writes `Enhancements.cfg`, remembers the folder and starts the game. A closed window or Quit ends the process with exit status 0.
+- The launcher window does not open when the folder is given (the second argument or `COCDCOTE_GAME_DIR`) or with `RT_HEADLESS`.
+
+### Change from the Prototype launcher
+
+The Prototype launcher calls `finishLaunching` only when the game starts. Before that call, AppKit does not answer accessibility requests (`AXUIElementCopyAttributeValue` returned `kAXErrorCannotComplete`, -25204, for the window of this launcher). Thus VoiceOver could not read the window. This launcher calls `finishLaunching` before it shows the window. The quit Apple event (Quit in the Dock) then goes to the handler of AppKit, which ends the process.
+
+### Changed files
+
+- `launcher.m`, `launcher.h` (new): the launcher window.
+- `enhance.h` (new), `enhance.c`: the settings table (`coc_enh_keys`) and the read and write functions of `Enhancements.cfg` (`coc_enh_read`, `coc_enh_write`) are shared with the launcher. The game reads and writes the file with the same functions.
+- `game.c`: the data folder is set before the game folder; the launcher window gives the game folder.
+- `Makefile`: `launcher.m` is in `GAME_SRC`.
+- `Recomp-Framework/win32/win32.mk`: `GAME_SRC` can contain Objective-C files (`.m`). They are compiled with ARC.
+
+### Verification
+
+- `make app` built the app with no new warnings. `launcher.m`, `enhance.c` and `game.c` also compiled with `-Wall -Wextra` with no warnings.
+- A headless run started the game as before (the settings, the Metal device, the interface in 4:3).
+- The launcher window was tested through the accessibility tree (no screen capture), with a test home folder:
+  - The window showed the values of the test `Enhancements.cfg`, the game folder with the Ready status, and the GOG icon.
+  - Restore Defaults set all 13 menus to the default values.
+  - Three menus were changed, then Play. `Enhancements.cfg` had the new values and kept the other values. The game log showed the new values. The Metal device started.
+  - With the `Engine` folder as the remembered folder, the window showed the game folder.
+- The test preferences and the test `Enhancements.cfg` were restored after the tests.
+
+### Not verified
+
+- The error messages of the folder check for a folder selected with Choose Folder… (the test stopped before this step).
+- Quit in the Dock and Command-Q while the window is open.
+- The look of the window on the screen (no screen capture).
+- VoiceOver with the window.

@@ -47,7 +47,8 @@ The installer stops if the file has a different value.
 
 5. When the installer asks for the game folder, drag the game folder into the Terminal window. Then push Return.
 6. Wait until the installer shows `Done`. On the test Mac, the build took less than 1 minute. A slower Mac takes more time.
-7. Open **Call of Cthulhu DCoTE** in the Applications folder.
+7. Open **Call of Cthulhu DCoTE** in the Applications folder. The launcher window opens.
+8. Click **Play**.
 
 You can also give the game folder directly:
 
@@ -61,7 +62,7 @@ To install the app in a different folder, use `--dest`:
 bash install.sh --dest ~/Applications "/path/to/Call of Cthulhu - DCotE"
 ```
 
-The app reads the game data from the game folder. Do not move or delete the game folder after the install. If you move the game folder, run the installer again.
+The app reads the game data from the game folder. Do not delete the game folder after the install. If you move the game folder, select the new folder in the launcher window with **Choose Folder…**.
 
 ## Saved games and settings
 
@@ -72,6 +73,19 @@ The app keeps saved games, game options and the enhancement settings in this fol
 ```
 
 The installer does not change this folder.
+
+## Launcher window
+
+The launcher window opens each time you open the app. In the launcher window, you can:
+
+- Select the game folder with **Choose Folder…**. A green mark shows that the folder can be used. A yellow mark shows the problem of the folder.
+- Change the enhancement settings. These are the settings of **Options > Enhancements**. The HDR calibration is only in the game.
+- Set the enhancement settings in the window to the default values with **Restore Defaults**.
+- Start the game with **Play**. The game uses the settings of the window.
+
+To quit without playing, close the window.
+
+The launcher window remembers the game folder of the last **Play**. If that folder cannot be used, the window shows the game folder that the installer used.
 
 ## Enhancements
 
@@ -142,14 +156,14 @@ macOS does not give the brightness of the screen in nits. The app takes the peak
 - **"is not the supported version":** the `CoCMainWin32.exe` in your game folder is not the GOG release. Only the GOG release is supported.
 - **"Homebrew was not found":** install Homebrew from https://brew.sh. Then start the installer again.
 - **The look direction is inverted:** the game has its own setting. Go to **Options > Controls > Advanced** and change the invert setting.
-- **The app does not find the game:** the game folder moved. Start the installer again with the new folder.
+- **The launcher window shows a problem with the game folder:** the game folder moved, or the selected folder is not the game folder. Click **Choose Folder…** and select the game folder (the folder that contains the `Engine` folder).
 
 ## Repository contents
 
 | Folder or file | Contents |
 |---|---|
 | `install.sh` | The installer. It checks the game, installs the build tools, builds the app and installs it. |
-| `CoC-Recomp/` | The game project: start code, the Enhancements menu, the game controller input and the instruction patches. `STATUS.md` records the work and the verification. |
+| `CoC-Recomp/` | The game project: start code, the launcher window, the Enhancements menu, the game controller input and the instruction patches. `STATUS.md` records the work and the verification. |
 | `Recomp-Framework/` | The recompiler and the Windows runtime for macOS (Win32, Direct3D 9 to Metal, audio, video). The license is MIT (`Recomp-Framework/LICENSE`). |
 
 The build output (`CoC-Recomp/gen`, `CoC-Recomp/build`) contains the translated game code. Do not share it or the built app.

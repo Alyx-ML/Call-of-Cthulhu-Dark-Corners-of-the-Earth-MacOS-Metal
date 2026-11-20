@@ -8,7 +8,7 @@ APP_FILE  = Call of Cthulhu DCoTE
 APP_DISPLAY = Call of Cthulhu: Dark Corners of the Earth
 APP_SHORT = Call of Cthulhu
 BUNDLE_ID = com.nightsight.cocdcote-recomp
-GAME_SRC  = game.c enhance.c pad.c
+GAME_SRC  = game.c enhance.c pad.c launcher.m
 PATCHES   = patches.txt
 # SDL3 (gamepad input, pad.c): linked from SDL3_PREFIX and bundled in Contents/Frameworks; the binary loads the
 # bundled copy (@rpath = @executable_path/../Frameworks)
