@@ -6,6 +6,7 @@
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
 #include "rt32.h"
+#include "rt_enh.h"
 
 void rt_post_message(uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp);
 uint8_t rt_keys[256];                 // VK -> down
@@ -164,7 +165,24 @@ static void input_schedule(uint32_t hwnd) {
 - (void)mouseMoved:(NSEvent *)e {
     // trackpads report fractional movement: keep the remainder so that slow movement is not lost (main thread only)
     static double fx, fy;
-    fx += e.deltaX; fy += e.deltaY;
+    static int raw_logged, raw_missing_logged;
+    double mdx = e.deltaX, mdy = e.deltaY;
+    // raw mouse input (rt_enh.h): the movement of the mouse before the pointer acceleration of macOS. An event without
+    // a CGEvent gives no movement (the log tells it once).
+    CGEventRef ce = rt_enh && rt_enh->raw_mouse == 1 ? e.CGEvent : NULL;
+    if (rt_enh && rt_enh->raw_mouse == 1 && !ce) {
+        if (!raw_missing_logged) { rt_log("[cocoa] raw mouse input: a mouse event has no CGEvent; its movement is not given to the game"); raw_missing_logged = 1; }
+        mdx = mdy = 0.0;
+    } else if (ce) {
+        double rx = CGEventGetDoubleValueField(ce, kCGEventUnacceleratedPointerMovementX);
+        double ry = CGEventGetDoubleValueField(ce, kCGEventUnacceleratedPointerMovementY);
+        if (!raw_logged) {
+            rt_log("[cocoa] raw mouse input: first movement %.2f, %.2f (with pointer acceleration %.2f, %.2f)", rx, ry, mdx, mdy);
+            raw_logged = 1;
+        }
+        mdx = rx; mdy = ry;
+    }
+    fx += mdx; fy += mdy;
     int ix = (int)fx, iy = (int)fy;
     fx -= ix; fy -= iy;
     __atomic_add_fetch(&rt_mouse_dx, ix, __ATOMIC_RELAXED); __atomic_add_fetch(&rt_mouse_dy, iy, __ATOMIC_RELAXED);

@@ -66,7 +66,7 @@ extern void (*rt_dinput_poll_hook)(void);   // dinput8.c
 #define TXT_BASE 0xE000u
 enum { T_TITLE, T_GAME, T_2X, T_AO, T_OFF, T_LOW, T_MEDIUM, T_HIGH, T_ON,
        T_TONEMAP, T_HDR, T_CONTACT, T_SKIP, T_BLOOM, T_SHADOWS, T_SUBS, T_125, T_150, T_175,
-       T_CALIB, T_PEAK, T_PAPER, T_FOV, T_110, T_120, T_130, T_140, T_SANITY, T_S75, T_S50, T_S25, T_AA, T_HRTF,
+       T_CALIB, T_PEAK, T_PAPER, T_FOV, T_110, T_120, T_130, T_140, T_SANITY, T_S75, T_S50, T_S25, T_AA, T_HRTF, T_RAWMOUSE,
        T_NITS0, T_NITS_END = T_NITS0 + RT_ENH_HDR_PEAKS - 1,     // the values of RT_ENH_HDR_PEAK_NITS
        T_BRI0, T_BRI_END = T_BRI0 + RT_ENH_HDR_PAPERS - 1,       // the values of RT_ENH_HDR_PAPER_NITS
        T_COUNT };
@@ -79,7 +79,7 @@ static const char *const txt[T_COUNT] = {
     [T_CALIB] = "HDR Calibration", [T_PEAK] = "Max Brightness (HDR)", [T_PAPER] = "Brightness (HDR)",
     [T_FOV] = "Field of View", [T_110] = "110%", [T_120] = "120%", [T_130] = "130%", [T_140] = "140%",
     [T_SANITY] = "Sanity Effects", [T_S75] = "75%", [T_S50] = "50%", [T_S25] = "25%",
-    [T_AA] = "Anti-Aliasing (MetalFX)", [T_HRTF] = "Headphone Audio (HRTF)",
+    [T_AA] = "Anti-Aliasing (MetalFX)", [T_HRTF] = "Headphone Audio (HRTF)", [T_RAWMOUSE] = "Raw Mouse Input",
     // the steps -10 .. +10 of the two settings of the RE Engine, with their values in nits (rt_enh.h)
     [T_NITS0] =
     "-10 (300 nits)", "-9 (400 nits)", "-8 (500 nits)", "-7 (600 nits)", "-6 (700 nits)", "-5 (750 nits)",
@@ -125,8 +125,9 @@ static const struct { const char *key; size_t off; int32_t max; int32_t def; } k
     {"sanity_effects", offsetof(RtEnh, sanity), 4, 0},
     {"anti_aliasing", offsetof(RtEnh, aa), 1, 0},
     {"headphone_audio", offsetof(RtEnh, hrtf), 1, 0},
+    {"raw_mouse_input", offsetof(RtEnh, raw_mouse), 1, 0},
 };
-enum { K_ANISO, K_AO, K_TONEMAP, K_HDR, K_CONTACT, K_SKIP, K_BLOOM, K_SHADOWS, K_SUBS, K_PEAK, K_PAPER, K_FOV, K_SANITY, K_AA, K_HRTF };
+enum { K_ANISO, K_AO, K_TONEMAP, K_HDR, K_CONTACT, K_SKIP, K_BLOOM, K_SHADOWS, K_SUBS, K_PEAK, K_PAPER, K_FOV, K_SANITY, K_AA, K_HRTF, K_RAWMOUSE };
 // keys of earlier versions: settings that are now always on (gamepad, reduced_banding) and the HDR calibration of
 // other steps (hdr_peak: 400 .. 4000 nits; hdr_paper_white: a percentage of the SDR white of macOS). The loader skips
 // them, and the next save leaves them out.
@@ -147,10 +148,10 @@ static void cfg_save(void) {
     if (bad || rename(tmp, p) != 0) { rt_log("[enh] can't write %s: %s; the settings are not saved", p, strerror(errno)); remove(tmp); return; }
     saved = *rt_enh;
     if (rt_verbose) rt_log("[enh] settings saved: aniso %d, ao %d, tonemap %d, hdr %d, contact %d, skip_intro %d, "
-                           "bloom %d, shadows %d, subtitle size %d, hdr max brightness %d, hdr brightness %d, field of view %d, sanity effects %d, anti-aliasing %d, headphone audio %d",
+                           "bloom %d, shadows %d, subtitle size %d, hdr max brightness %d, hdr brightness %d, field of view %d, sanity effects %d, anti-aliasing %d, headphone audio %d, raw mouse input %d",
                            rt_enh->aniso,
                            rt_enh->ao, rt_enh->tonemap, rt_enh->hdr, rt_enh->contact, rt_enh->skip_intro, rt_enh->bloom,
-                           rt_enh->shadows, rt_enh->sub_scale, rt_enh->hdr_peak, rt_enh->hdr_paper, rt_enh->fov, rt_enh->sanity, rt_enh->aa, rt_enh->hrtf);
+                           rt_enh->shadows, rt_enh->sub_scale, rt_enh->hdr_peak, rt_enh->hdr_paper, rt_enh->fov, rt_enh->sanity, rt_enh->aa, rt_enh->hrtf, rt_enh->raw_mouse);
 }
 static void cfg_load(void) {
     for (size_t i = 0; i < NKEYS; i++) *field(rt_enh, i) = keys[i].def;
@@ -230,15 +231,21 @@ void coc_enh_init(void) {
     // the same six 512x512 R5G6B5 targets hold the character shadows: with Sharp Character Shadows they are stored at
     // 2048x2048 with 8 bits per channel
     d3d9_enh_shadow_target(512, 512, 23 /* D3DFMT_R5G6B5 */, 4);
+    // the interface: the game draws its menus, text, panels and subtitle bands with the vertex shader Font.vsh
+    // (HfeRenderer/PcShaders), whose screen position is v0.xy * postDest + postDest.zw with postDest in c95, and its
+    // pointer with pretransformed vertices. On a screen wider than 4:3 these draws are drawn in the centered 4:3 area;
+    // a draw that covers the full width (a background, a fade, the band behind the subtitles) keeps the full width.
+    d3d9_enh_ui_vs("Font.vsh", 95);
     rt_dinput_poll_hook = input_frame;
     static const char *const lvl[] = {"off", "low", "medium", "high"}, *const sub[] = {"game", "1.25x", "1.5x", "1.75x", "2x"};
     rt_log("[enh] settings: anisotropic filtering %s, ambient occlusion %s, GT7 tone mapping %s, HDR %s (max brightness %s, "
-           "brightness %s), contact shadows %s, bloom %s, sharp character shadows %s, subtitle size %s, skip intro videos %s, field of view %s, sanity effects %s, anti-aliasing %s, headphone audio %s",
+           "brightness %s), contact shadows %s, bloom %s, sharp character shadows %s, subtitle size %s, skip intro videos %s, field of view %s, sanity effects %s, anti-aliasing %s, headphone audio %s, raw mouse input %s",
            (const char *[]){"game", "2x", "4x", "8x", "16x"}[rt_enh->aniso], lvl[rt_enh->ao], rt_enh->tonemap ? "on" : "off",
            rt_enh->hdr ? "on" : "off", txt[T_NITS0 + rt_enh->hdr_peak], txt[T_BRI0 + rt_enh->hdr_paper],
            rt_enh->contact ? "on" : "off", lvl[rt_enh->bloom], rt_enh->shadows ? "on" : "off", sub[rt_enh->sub_scale],
            rt_enh->skip_intro ? "on" : "off", (const char *[]){"game", "110%", "120%", "130%", "140%"}[rt_enh->fov],
-           (const char *[]){"game", "75%", "50%", "25%", "off"}[rt_enh->sanity], rt_enh->aa ? "MetalFX" : "off", rt_enh->hrtf ? "HRTF" : "off");
+           (const char *[]){"game", "75%", "50%", "25%", "off"}[rt_enh->sanity], rt_enh->aa ? "MetalFX" : "off", rt_enh->hrtf ? "HRTF" : "off",
+           rt_enh->raw_mouse ? "on" : "off");
 }
 
 // ---- the field of view and the aspect ratio ----
@@ -362,7 +369,7 @@ void coc_enh_add_link(CPU *c, uint32_t menu) {
     CALL(G_CTL_LINK, ctl, 1, calib_name_guest(), 0);
 }
 
-#define ENH_SETTINGS 11                  // the settings in the Enhancements menu (coc_enh_build_menu)
+#define ENH_SETTINGS 12                  // the settings in the Enhancements menu (coc_enh_build_menu)
 static void add_enum(CPU *c, uint32_t menu, int label, const int *values, int nvalues, size_t key) {
     uint32_t ctl = CALL(G_MENU_ADD, menu, S_TEXTOPTIONENUM);
     if (!ctl) rt_fatal("[enh] the menu system did not add an Enhancements control");
@@ -458,6 +465,7 @@ void coc_enh_build_menu(CPU *c) {
     add_enum(c, menu, T_SANITY, (const int[]){T_GAME, T_S75, T_S50, T_S25, T_OFF}, 5, K_SANITY);
     add_enum(c, menu, T_AA, (const int[]){T_OFF, T_ON}, 2, K_AA);
     add_enum(c, menu, T_HRTF, (const int[]){T_OFF, T_ON}, 2, K_HRTF);
+    add_enum(c, menu, T_RAWMOUSE, (const int[]){T_OFF, T_ON}, 2, K_RAWMOUSE);
     add_enum(c, menu, T_AO, (const int[]){T_OFF, T_LOW, T_MEDIUM, T_HIGH}, 4, K_AO);
     add_enum(c, menu, T_TONEMAP, (const int[]){T_OFF, T_ON}, 2, K_TONEMAP);
     add_enum(c, menu, T_HDR, (const int[]){T_OFF, T_ON}, 2, K_HDR);

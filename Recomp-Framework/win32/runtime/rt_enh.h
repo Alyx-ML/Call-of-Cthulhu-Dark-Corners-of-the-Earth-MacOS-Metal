@@ -1,6 +1,6 @@
 // Enhancement settings that the runtime applies on top of the game (anisotropic filtering, ambient occlusion,
 // tone mapping, HDR output and its calibration, contact shadows, bloom, reduced banding, sharp shadows, temporal
-// anti-aliasing, headphone audio; and
+// anti-aliasing, headphone audio, raw mouse input, the interface in 4:3; and
 // settings that the game project applies: gamepad input, intro videos, subtitle size, field of view, sanity effects).
 //
 // The game project owns the settings: it allocates RtEnh in guest memory, so that controls of the game's own
@@ -35,6 +35,8 @@ typedef struct RtEnh {
                        //    project gives the steps)
     int32_t hrtf;      // 0: 3D sounds with balance panning; 1: 3D sounds through the head-related transfer function (HRTF)
                        //    of macOS for headphones (fmodex.c)
+    int32_t raw_mouse; // 0: the mouse movement of the pointer (with the pointer acceleration of macOS); 1: the
+                       //    unaccelerated movement of the mouse (kCGEventUnacceleratedPointerMovementX and Y, cocoa32.m)
 } RtEnh;
 
 // The HDR calibration has the two settings of the Capcom RE Engine (Resident Evil Village, Resident Evil 4), with the
@@ -75,6 +77,17 @@ void d3d9_enh_light_dir(float x, float y, float z);
 // has contact shadows. Call it before the device is created, and not together with d3d9_enh_light_dir. With this call
 // d3d9_enh_light_pass does not give the light; its render targets still do not end the scene.
 void d3d9_enh_light_vs(const char *dir, const char *pos, const char *grad, uint32_t stride);
+
+// The interface in 4:3: the 2D draws of the game's interface are the draws with a vertex shader whose debug
+// information (DBUG) names the source file `source` (the file name without its path, for example "Font.vsh"), and the
+// draws with pretransformed vertices. For a shader of `source`, the screen x of a vertex (0 = left, 1 = right) is
+// position.x * c[creg].x + c[creg].z, with the position element (FLOAT2 to FLOAT4, SHORT2 or SHORT4) of stream 0; for
+// pretransformed vertices it is x / the width of the back buffer. On a back buffer wider than 4:3, such a draw into
+// the back buffer is drawn in the centered 4:3 area of the back buffer (its viewport and its scissor rectangle are
+// scaled horizontally by 4:3 / the aspect ratio of the back buffer, about the center). A draw whose vertices cover the
+// full width (from 0 to 1) keeps the full width (backgrounds, fades, the bands behind the subtitles). Without this
+// call every draw keeps the full width. Call it before the game creates its vertex shaders.
+void d3d9_enh_ui_vs(const char *source, uint32_t creg);
 
 // The size in pixels of the back buffer of the device (its last Reset or creation); 0 x 0 before the device exists.
 void d3d9_enh_back_buffer(uint32_t *w, uint32_t *h);

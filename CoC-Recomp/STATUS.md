@@ -741,3 +741,37 @@ The HDR Calibration menu now has the two settings of the Capcom RE Engine (Resid
 - The user decided that the game must not render at the Retina resolution. The setting **Retina Resolution (restart)** and its code are removed: `coc_enh_resolution` and the patch 0x40b533 (`enhance.c`, `patches.txt`), the field `retina` (`rt_enh.h`), the display mode of the screen in pixels (`d3d9_metal.m`, `mode_list`), and `rt_cocoa_screen_pixels` and `content_points` (`cocoa32.m`).
 - The game again uses its own resolution (the screen in points, 1800 × 1125 on the test Mac). The Enhancements menu has 11 settings.
 - Verified: `make gen` and `make app` built the app (only the two known `key_frame` warnings of `wmvcore.c`). A headless run of 30 seconds had no error: the device was 1800 × 1125, and the log showed "menu ENHANCEDOPTIONS registered (11 settings)".
+
+## 2026-11-20: Interface in 4:3, raw mouse input, Game Mode
+
+### Interface in 4:3
+
+- Cause: the game places its interface as parts of the screen width and height. The game was made for 4:3 screens. On the 1800 × 1125 back buffer (16:10), the menus, the text and the pointer were 20% too wide.
+- Measured (headless runs with temporary logging, now removed): the game draws the interface with the vertex shader `Font.vsh`. The screen position of a vertex is `v0.xy * postDest.xy + postDest.zw`, with `postDest` in c95 and a SHORT4 position. The pointer is a draw with pretransformed vertices (32 × 32 pixels). Other 2D draws (the copy of the post-processed scene with `ScreenQuadScaled.vsh`, two fixed-function full-screen quads in each frame) do not use these shaders.
+- Measured interface draws: full-screen backgrounds of the Options menus (0 to 1), the menu panel (0.28 to 0.72), menu text, subtitle text (from 0.125), and the bands behind the subtitles (0 to 1).
+- Change (`d3d9_metal.m`, `rt_enh.h`: `d3d9_enh_ui_vs`; `enhance.c`: `d3d9_enh_ui_vs("Font.vsh", 95)`):
+  - The runtime identifies the shaders of `d3d9_enh_ui_vs` by the source file name in their debug information (DBUG).
+  - For each draw with such a shader, or with pretransformed vertices, into a back buffer wider than 4:3, the runtime reads the screen x of the vertices. When the vertices do not cover the full width, the viewport and the scissor rectangle of the draw are scaled horizontally by 4:3 / the aspect ratio (0.8333 at 16:10), about the center. The half-pixel offset uses the scaled viewport.
+  - A draw that covers the full width (from 0 to 1) keeps the full width: the menu backgrounds, the fades and the bands behind the subtitles.
+- The game moves its own pointer with the DirectInput mouse movement (the sum at +0x240 and +0x244 of its mouse object, 0x40caf0). The game does not import `GetCursorPos`. The pointer is drawn in 4:3 with the menus, so the pointer and the menu items stay aligned.
+- Verified (headless runs): the log shows "interface in 4:3: ... 0.8333 of the width of the 1800x1125 back buffer". In the Options menu, the two full-screen background draws kept the full width. The panel, the 10 text draws and the pointer were drawn in 4:3. In a level, the subtitle text was drawn in 4:3 and the bands behind it kept the full width. The pause menu was drawn in 4:3. With `MTL_DEBUG_LAYER=1`, the Metal validation layer reported no error in the Options menu.
+- Not verified: the image on the screen (screenshots are not permitted). The inventory, the journal and the loading screens were not opened in the test runs. A screen of the game that puts text on a full-screen image keeps the image at the full width and draws the text in 4:3.
+
+### Raw mouse input
+
+- Investigation of the game: the mouse read (0x40caa1) gets the DirectInput movement. The input bindings (0x40d0f0) keep the last value and the current value. The value function (0x40cfe0) returns the current value. Its callers send the value as an action event (0x43a3f0). These steps do not average or filter the movement. The later steps to the camera were not traced. A headless test with an injected movement did not reach player control (the level started with a cut scene), so the response of the camera was not measured.
+- Cause on macOS: the runtime gave the game `NSEvent.deltaX` and `deltaY`. These are the movements of the pointer, with the pointer acceleration of macOS.
+- Change (`cocoa32.m`; setting **Raw Mouse Input**, `raw_mouse_input`; `rt_enh.h` `raw_mouse`): with the setting, the movement is `kCGEventUnacceleratedPointerMovementX` and `kCGEventUnacceleratedPointerMovementY` of the event (CoreGraphics, `CGEventTypes.h` of the macOS 27.3 SDK). The first movement is written to the log, with the accelerated values. The default is Off. The Enhancements menu has 12 settings.
+- Verified: a headless run with `raw_mouse_input=1` showed "raw mouse input on" and "12 settings".
+- Not verified: the movement of a real mouse or trackpad with the setting. The headless runs have no mouse events. The unaccelerated values have the units of the device, so the game's mouse sensitivity can need a different value.
+
+### Game Mode
+
+- Change (`make_app.py`): for the category `public.app-category.games`, Info.plist has `LSSupportsGameMode` = true. Apple ([WWDC25 session 209](https://developer.apple.com/videos/play/wwdc2025/209/)) gives this key to let macOS turn on Game Mode for the game. On a Mac, Game Mode is on only in full screen.
+- Verified: `plutil -p` of the built Info.plist shows `LSSupportsGameMode => true`.
+- Not verified: Game Mode on the screen. The headless runs are not in full screen. The [macOS Tahoe 26 release notes](https://developer.apple.com/go/?id=macos-26-rn) say that Game Mode does not turn on for a binary started directly from Terminal.
+
+### Verification
+
+- `make gen` and `make app` built the app. The only warnings are the two known `key_frame` warnings of `wmvcore.c`.
+- The headless runs ended without errors. The Enhancements.cfg of the test folder was restored after the runs.

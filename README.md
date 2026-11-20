@@ -83,6 +83,7 @@ The game has a menu **Options > Enhancements**. The menu also shows in the pause
 | Sanity Effects | Game, 75%, 50%, 25%, Off |
 | Anti-Aliasing (MetalFX) | Off, On |
 | Headphone Audio (HRTF) | Off, On |
+| Raw Mouse Input | Off, On |
 | Ambient Occlusion | Off, Low, Medium, High |
 | GT7 Tone Mapping | Off, On |
 | HDR Output | Off, On |
@@ -95,6 +96,8 @@ The game has a menu **Options > Enhancements**. The menu also shows in the pause
 
 These items are always on: 16x anisotropic texture filtering, reduced color banding, 10-bit color output and game controller support (SDL3).
 
+The game made its menus, text and pointer for 4:3 screens. On a wider screen, the app draws them in the centered 4:3 area, so that they keep their shape. Backgrounds and fades that fill the screen, and the bands behind the subtitles, keep the full width.
+
 HDR Output needs a display with HDR (EDR) support. HDR Output and GT7 Tone Mapping change the 3D scene. The UI, the text and the menus stay at paper white.
 
 - **Highlights:** the game clamps its final image to white. The app keeps the colors of the scene that are brighter than white (lamps, fire, bloom) from before the game's post-processing. With HDR Output, these highlights go above the white of the game, up to the peak. With GT7 Tone Mapping in SDR, they keep their detail.
@@ -103,6 +106,7 @@ HDR Output needs a display with HDR (EDR) support. HDR Output and GT7 Tone Mappi
 - **Field of View** multiplies the field of view of the player camera (the game: 55 degrees vertical). Cut scenes keep their field of view. All cameras use the aspect ratio of the window, so that the 3D image is not too wide.
 - **Sanity Effects** sets the strength of the visual sanity effects of the game: Black And White, Blurred Vision, Vertigo Blur, Screen Distort and Camera Motion Blur. Off removes them. The sounds and the sanity value of the game do not change.
 - **Anti-Aliasing (MetalFX)** smooths the edges of the 3D scene with the MetalFX temporal scaler of macOS at the full resolution of the window. With anti-aliasing, the textures of the 3D scene use sharper mipmap levels (a texture LOD bias of -1, as the MetalFX guide of Apple recommends).
+- **Raw Mouse Input** gives the game the movement of the mouse without the pointer acceleration of macOS. The same mouse movement then always turns the view by the same angle. The mouse sensitivity can feel different. If necessary, change the mouse sensitivity of the game.
 - **Headphone Audio (HRTF)** plays the 3D sounds of the game through the spatial audio of macOS for headphones (the head-related transfer function of the AUSpatialMixer, with your personalized spatial audio profile when macOS has one). Use it with headphones. Without it, 3D sounds use left-right panning.
 - **Contact shadows** use the lights of the game: the light of the character nearest to the camera. A surface that the light does not reach gets no contact shadow.
 
@@ -126,6 +130,7 @@ macOS does not give the brightness of the screen in nits. The app takes the peak
 ## Mac features
 
 - **Full screen:** use **View > Enter Full Screen** (Control-Command-F) or the green window button. The image keeps its aspect ratio.
+- **Game Mode:** the app is a game for macOS. macOS can turn on Game Mode when the game is in full screen.
 - **Window size:** when the game is not in full screen, use **Window > Window Size 50%**, **75%** or **100%** (of the screen), or drag the edge of the window. **Window > Minimize** (Command-M) and **Zoom** are also in the menu.
 - **App menu:** **About**, **Hide** (Command-H), **Hide Others** (Option-Command-H), **Show All** and **Quit** (Command-Q). The menu bar shows the name "Call of Cthulhu".
 - **Frame rate:** the game runs at 60 frames per second, also on a 120 Hz (ProMotion) display. The scripts of the game fail above 60 frames per second. The app presents each frame at an equal interval.

@@ -363,6 +363,8 @@ typedef struct Shader {
     PVar *var; uint32_t nvar;      // pixel shaders: per variant
     int lv;                        // vertex shaders: 1 when the constants of d3d9_enh_light_vs are in lv_dir, lv_pos, lv_grad
     uint32_t lv_dir, lv_pos, lv_grad;
+    int ui;                        // vertex shaders: 1 for a shader of d3d9_enh_ui_vs (its screen position in c[ui_creg])
+    uint32_t ui_creg;
 } Shader;
 typedef struct Query {
     Obj o;
@@ -498,6 +500,10 @@ struct Device {
     float taa_lod;                 // the texture LOD bias of temporal anti-aliasing in the pixel constants uploaded last
                                    //    (ps_consts_header): TAA_LOD_BIAS for a scene draw with an offset, otherwise 0
     int taa_lod_logged;            // the first draw with the LOD bias is in the log
+    // the interface in 4:3 (d3d9_enh_ui_vs): the horizontal scale of this draw and of the uploaded vertex constants
+    // (pos_fixup), 1 = the full width
+    float ui_k, ui_k_up;
+    int ui_logged;                 // the first draw in 4:3 is in the log
     uint32_t taa_frame;            // the last frame with anti-aliasing
     float taa_vp[16];              // the view-projection of the camera of the last anti-aliasing frame
     int taa_vp_ok;                 // taa_vp holds a camera
@@ -2031,7 +2037,8 @@ static float taa_draw_offset(const Device *d, float o[2]) {
 // ---------------- constants ----------------
 static void pos_fixup(Device *d, float *f) {
     State *S = &d->st;
-    float w = (float)S->vp[2], h = (float)S->vp[3], zr = fbits(S->vp[5]) - fbits(S->vp[4]);
+    // the half-pixel offset is that of the viewport of the draw (in 4:3 for the interface: d3d9_enh_ui_vs)
+    float w = (float)S->vp[2] * d->ui_k, h = (float)S->vp[3], zr = fbits(S->vp[5]) - fbits(S->vp[4]);
     // with the sub-pixel offset of temporal anti-aliasing (taa_jit, in pixels with y down)
     f[0] = w > 0 ? ((63.0f / 64.0f) + 2.0f * d->taa_jit[0]) / w : 0.0f;
     f[1] = h > 0 ? -((63.0f / 64.0f) + 2.0f * d->taa_jit[1]) / h : 0.0f;
@@ -2214,7 +2221,7 @@ static Tex *bound_tex(Device *d, int s) {
     Tex *t = (Tex *)o;
     return t->mtl ? t : NULL;
 }
-typedef struct { __unsafe_unretained id<MTLBuffer> buf; uint32_t off; uint32_t stride; int on; } UpStream;
+typedef struct { __unsafe_unretained id<MTLBuffer> buf; uint32_t off; uint32_t stride; int on; uint32_t len; const uint8_t *cpu; } UpStream;
 
 // everything a draw needs; 0: skip the draw (the reason was logged)
 static int prepare(Device *d, int points, const UpStream *up, uint32_t *instances, int indexed) {
@@ -2328,12 +2335,19 @@ static int prepare(Device *d, int points, const UpStream *up, uint32_t *instance
     [e setBlendColorRed:bf[0] green:bf[1] blue:bf[2] alpha:bf[3]];
     // viewport and scissor rectangle in Direct3D pixels; the storage of the target can be larger (Tex.sc)
     int64_t sc = d->rt[0]->tex->sc;
-    [e setViewport:(MTLViewport){(double)S->vp[0] * sc, (double)S->vp[1] * sc, (double)S->vp[2] * sc, (double)S->vp[3] * sc, fbits(S->vp[4]), fbits(S->vp[5])}];
+    // an interface draw in 4:3 (d3d9_enh_ui_vs): the viewport and the scissor rectangle are scaled horizontally by
+    // ui_k about the center of the target
+    double uk = d->ui_k, ucx = (double)d->pass_w * 0.5;
+    double vx = (double)S->vp[0] * sc, vw = (double)S->vp[2] * sc;
+    if (uk != 1.0) { vx = ucx + (vx - ucx) * uk; vw *= uk; }
+    [e setViewport:(MTLViewport){vx, (double)S->vp[1] * sc, vw, (double)S->vp[3] * sc, fbits(S->vp[4]), fbits(S->vp[5])}];
     int64_t x0 = 0, y0 = 0, x1 = d->pass_w, y1 = d->pass_h;
     if (S->rs[RS_SCISSORTESTENABLE]) {
-        if (S->scissor[0] * sc > x0) x0 = S->scissor[0] * sc;
+        int64_t sx0 = (int64_t)S->scissor[0] * sc, sx1 = (int64_t)S->scissor[2] * sc;
+        if (uk != 1.0) { sx0 = (int64_t)floor(ucx + ((double)sx0 - ucx) * uk); sx1 = (int64_t)ceil(ucx + ((double)sx1 - ucx) * uk); }
+        if (sx0 > x0) x0 = sx0;
         if (S->scissor[1] * sc > y0) y0 = S->scissor[1] * sc;
-        if (S->scissor[2] * sc < x1) x1 = S->scissor[2] * sc;
+        if (sx1 < x1) x1 = sx1;
         if (S->scissor[3] * sc < y1) y1 = S->scissor[3] * sc;
     }
     if (x1 <= x0 || y1 <= y0) return 0;   // nothing inside the scissor rectangle
@@ -2343,6 +2357,7 @@ static int prepare(Device *d, int points, const UpStream *up, uint32_t *instance
     float jt[2];
     float lod = taa_draw_offset(d, jt);
     if (jt[0] != d->taa_jit[0] || jt[1] != d->taa_jit[1]) { d->taa_jit[0] = jt[0]; d->taa_jit[1] = jt[1]; d->vsc_dirty = d->ffc_dirty = 1; }
+    if (d->ui_k != d->ui_k_up) { d->ui_k_up = d->ui_k; d->vsc_dirty = d->ffc_dirty = 1; }
     if (lod != d->taa_lod) {
         d->taa_lod = lod; d->psc_dirty = 1;
         if (lod != 0.0f && !d->taa_lod_logged) {
@@ -2711,6 +2726,88 @@ static void enh_apply(Device *d) {
     }
     d->enh_color = d->enh_depth = nil;
 }
+// The interface in 4:3 (rt_enh.h, d3d9_enh_ui_vs).
+static struct { int on; char src[64]; uint32_t creg; } enh_ui;
+void d3d9_enh_ui_vs(const char *source, uint32_t creg) {
+    if (!source || !source[0] || strlen(source) >= sizeof enh_ui.src || creg >= VS_CONST_F)
+        rt_fatal("[d3d9] d3d9_enh_ui_vs: bad source file name or register c%u", creg);
+    strcpy(enh_ui.src, source); enh_ui.creg = creg; enh_ui.on = 1;
+}
+// a vertex shader of d3d9_enh_ui_vs: its debug information (the DBUG comment before the instructions) names the source
+// file enh_ui.src, after a path separator or at the start, and followed by a NUL
+static void enh_ui_shader(Shader *s) {
+    if (!enh_ui.on) return;
+    size_t L = strlen(enh_ui.src);
+    for (uint32_t i = 1; i < s->ntok && (s->tok[i] & 0xFFFFu) == 0xFFFEu; ) {
+        uint32_t len = (s->tok[i] >> 16) & 0x7FFFu;
+        if ((uint64_t)i + 1 + len > s->ntok) return;
+        if (len >= 1 && s->tok[i + 1] == 0x47554244u) {   // 'DBUG'
+            const char *b = (const char *)&s->tok[i + 2];
+            size_t n = (size_t)(len - 1) * 4;
+            for (size_t j = 0; j + L < n; j++)
+                if ((j == 0 || b[j - 1] == '\\' || b[j - 1] == '/') && !memcmp(b + j, enh_ui.src, L) && b[j + L] == 0) {
+                    s->ui = 1; s->ui_creg = enh_ui.creg;
+                    return;
+                }
+        }
+        i += 1 + len;
+    }
+}
+// The horizontal scale of a draw: 4:3 / the aspect ratio of the back buffer for an interface draw into a back buffer
+// wider than 4:3 that does not cover its full width; else 1. An interface draw has a vertex shader of d3d9_enh_ui_vs
+// (screen x = position.x * c[creg].x + c[creg].z, 0 to 1) or pretransformed vertices (screen x in pixels). Its width
+// comes from the position element of stream 0 of its vertices.
+#define UI_ASPECT (4.0 / 3.0)
+static float ui_draw_scale(Device *d, uint32_t n, int indexed, uint32_t first, int32_t base, int i32, const uint8_t *icpu,
+                           const UpStream *up) {
+    State *S = &d->st;
+    Surf *r0 = d->rt[0];
+    if (!enh_ui.on || !r0 || !r0->swap || r0->swap != d->swap || !r0->w || !r0->h) return 1.0f;
+    double aspect = (double)r0->w / (double)r0->h;
+    if (aspect <= UI_ASPECT + 1e-6) return 1.0f;
+    Shader *vs = S->vs;
+    if (vs && !vs->ui) return 1.0f;
+    Decl *dc = S->decl;
+    if (!dc) return 1.0f;
+    int pos = -1;
+    for (uint32_t i = 0; i < dc->n; i++)
+        if (dc->el[i].stream == 0 && dc->el[i].index == 0 && dc->el[i].usage == (vs ? DU_POSITION : DU_POSITIONT)) { pos = (int)i; break; }
+    if (pos < 0) return 1.0f;   // a fixed-function draw without pretransformed vertices: not an interface draw
+    int type = dc->el[pos].type;
+    if (type != DT_FLOAT2 && type != DT_FLOAT3 && type != DT_FLOAT4 && type != DT_SHORT2 && type != DT_SHORT4) return 1.0f;
+    uint32_t eoff = dc->el[pos].offset, esz = (type == DT_SHORT2 || type == DT_SHORT4) ? 2 : 4;
+    const uint8_t *vb; uint64_t vlen; uint32_t stride;
+    if (up && up->on) { vb = up->cpu; vlen = up->len; stride = up->stride; }
+    else {
+        VB *b = S->stream[0].vb;
+        if (!b || S->stream[0].off > b->len) return 1.0f;
+        vb = (const uint8_t *)G2H(b->st.g) + S->stream[0].off; vlen = b->len - S->stream[0].off; stride = S->stream[0].stride;
+    }
+    if (!stride) return 1.0f;
+    double sx = vs ? S->vsf[vs->ui_creg][0] : 1.0 / (double)r0->w, ox = vs ? S->vsf[vs->ui_creg][2] : 0.0;
+    double x0 = INFINITY, x1 = -INFINITY;
+    for (uint32_t i = 0; i < n; i++) {
+        int64_t v;
+        if (indexed) v = (int64_t)base + (i32 ? ((const uint32_t *)icpu)[first + i] : ((const uint16_t *)icpu)[first + i]);
+        else v = (int64_t)first + i;
+        if (v < 0 || (uint64_t)v * stride + eoff + esz > vlen) return 1.0f;   // outside the vertices: drawn as the game gives it
+        const uint8_t *q = vb + (size_t)v * stride + eoff;
+        double x;
+        if (esz == 2) { int16_t t; memcpy(&t, q, 2); x = t; } else { float t; memcpy(&t, q, 4); x = t; }
+        x = x * sx + ox;
+        if (x < x0) x0 = x;
+        if (x > x1) x1 = x;
+    }
+    if (!(x0 <= x1) || (x0 <= 0.001 && x1 >= 0.999)) return 1.0f;   // no vertices, or the full width
+    float k = (float)(UI_ASPECT / aspect);
+    if (!d->ui_logged) {
+        rt_log("[d3d9] interface in 4:3: frame %u, the interface draws use %.4f of the width of the %ux%u back buffer, centered",
+               d->frame + 1, k, r0->w, r0->h);
+        d->ui_logged = 1;
+    }
+    return k;
+}
+
 // indexed: idx/ioff/i32 the index source (CPU pointer for fans), first = start index; else first = start vertex
 static uint32_t draw(Device *d, uint32_t pt, uint32_t prims, int indexed, uint32_t first, int32_t base,
                      __unsafe_unretained id<MTLBuffer> ibuf, uint32_t ioff, int i32, const uint8_t *icpu, const UpStream *up) {
@@ -2720,6 +2817,7 @@ static uint32_t draw(Device *d, uint32_t pt, uint32_t prims, int indexed, uint32
     if (prims > 0x555555u) return D3DERR_INVALIDCALL;
     uint32_t inst = 1;
     tm_note(d);
+    d->ui_k = ui_draw_scale(d, n, indexed, first, base, i32, icpu, up);
     if (!prepare(d, pt == 1, up, &inst, indexed)) { d->stat_skipped++; return D3D_OK; }
     d->stat_draws++;
     enh_note_draw(d);
@@ -3580,6 +3678,7 @@ METHOD(d3d_CreateDevice) {
     d->o.last_public = dev_last_public;
     d->d3d = (Obj *)self; priv_ref(d->d3d);
     d->adapter = a; d->devtype = type; d->focus = focus; d->behavior = beh;
+    d->ui_k = d->ui_k_up = 1.0f;
     uint32_t pp[14], err = D3DERR_NOTAVAILABLE;
     if (!dev_init_metal(d) || (err = pp_check(d, gpp, focus, pp)) || (err = dev_reset(d, pp, focus))) {
         obj_release(&d->o);
@@ -4296,7 +4395,7 @@ static uint32_t draw_up(Device *d, uint32_t pt, uint32_t prims, uint32_t data, u
     UpStream up;
     void *vp = ring_alloc(d, (uint32_t)vbytes, &up.buf, &up.off);
     memcpy(vp, G2H(data), (size_t)vbytes);
-    up.stride = stride; up.on = 1;
+    up.stride = stride; up.on = 1; up.len = (uint32_t)vbytes; up.cpu = vp;
     uint32_t r;
     if (indexed) {
         if (!idx || (ifmt != FMT_INDEX16 && ifmt != FMT_INDEX32)) return D3DERR_INVALIDCALL;
@@ -4417,6 +4516,7 @@ static uint32_t create_shader(Device *d, uint32_t p, uint32_t out, int ps) {
     } else {
         s->fns = [NSMutableDictionary new];
         enh_light_shader(s);
+        enh_ui_shader(s);
     }
     obj_wrap(&s->o, ps ? &c_ps : &c_vs, d, shader_destroy);
     wr32(out, s->o.com.guest);

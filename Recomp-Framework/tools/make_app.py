@@ -100,6 +100,8 @@ with open(os.path.join(contents, "Info.plist"), "wb") as f:
         # online services of older games often use plain http://
         "NSAppTransportSecurity": {"NSAllowsArbitraryLoads": True},
         "NSSupportsAutomaticGraphicsSwitching": True,
+        # a game: macOS can turn on Game Mode while the app is in full screen
+        **({"LSSupportsGameMode": True} if category == "public.app-category.games" else {}),
     }, f)
 
 # icon: the exe's own application icon -> .iconset -> .icns
