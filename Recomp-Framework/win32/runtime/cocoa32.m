@@ -416,7 +416,13 @@ void rt_cocoa_run(void (*fn)(void)) {
         game_main = fn;
         pthread_t t; pthread_attr_t a; pthread_attr_init(&a);
         pthread_attr_setstacksize(&a, 256u << 20);   // translated frames are large; the guest recurses deeply at load
-        pthread_create(&t, &a, game_thread, NULL);
+        // the game thread draws the frames: the QoS class of user-interactive work. With the default class, its
+        // timed waits (the frame pacing of d3d9_metal.m) ended 1 to 3.6 ms late (measured).
+        int qe = pthread_attr_set_qos_class_np(&a, QOS_CLASS_USER_INTERACTIVE, 0);
+        if (qe != 0) rt_fatal("[cocoa] pthread_attr_set_qos_class_np failed (%d)", qe);
+        int ce = pthread_create(&t, &a, game_thread, NULL);
+        if (ce != 0) rt_fatal("[cocoa] the game thread was not created (%d)", ce);
+        pthread_attr_destroy(&a);
         [NSApp run];
     }
 }

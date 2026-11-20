@@ -65,7 +65,7 @@ $(BUILD)/game/%.o: %.c $(W32_HDR)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-FRAMEWORKS ?= -framework CoreFoundation -framework AppKit -framework QuartzCore -framework Metal -framework MetalKit \
+FRAMEWORKS ?= -framework CoreFoundation -framework AppKit -framework QuartzCore -framework Metal -framework MetalFX -framework MetalKit \
               -framework AudioToolbox -framework CoreAudio -framework GameController
 # LDLIBS: a game project's extra libraries; POSTLINK: a command run on the linked binary ($@), e.g. install_name_tool
 LDLIBS   ?=

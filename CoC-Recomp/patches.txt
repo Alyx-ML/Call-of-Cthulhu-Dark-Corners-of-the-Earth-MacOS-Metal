@@ -17,3 +17,15 @@
 4c44d4 { C.eax = R_eax; C.ecx = R_ecx; C.esp = R_esp; C.esi = R_esi; C.edi = R_edi; extern void coc_enh_sub_show(CPU *, uint32_t); coc_enh_sub_show(c, R_esi); } { uint8_t a = rd8((uint32_t)(R_esi + 0x998u)), b = (uint8_t)0x0u, r; r = (uint8_t)(a - b); cf = a < b; of = (((a ^ b) & (a ^ r)) >> 7) & 1; zf = ((r) & 0xFFu) == 0; sf = ((r) >> 7) & 1; pr = (uint8_t)(r); }
 # 0x412101 (mov ecx, esi): the VIDEOOPTIONS menu (esi) after its one setting: the Subtitle Size setting
 412101 { C.eax = R_eax; C.ecx = R_ecx; C.esp = R_esp; C.esi = R_esi; C.edi = R_edi; extern void coc_enh_add_video(CPU *, uint32_t); coc_enh_add_video(c, R_esi); } R_ecx = (uint32_t)(R_esi);
+# 0x4352c0 (mov eax, [esp+4]): the player camera's field of view (CoCPlayerFovManager, in degrees); enhance.c scales it by Field of View
+4352c0 { extern uint32_t coc_enh_player_fov(uint32_t); R_eax = coc_enh_player_fov(rds32((uint32_t)(R_esp + 0x4u))); }
+# 0x4347e9 (push ecx): the aspect ratio of a camera's perspective projection (the game: 1.3256); enhance.c gives the back buffer's
+4347e9 { extern uint32_t coc_enh_aspect(uint32_t); PUSHL(coc_enh_aspect(R_ecx)); }
+# 0x55d88e, 0x55e01d, 0x55f08d, 0x55f35d (mov edx, [eax]): Black And White, Blurred Vision, Vertigo Blur and Screen Distort
+# give their intensity ([esp+4], 0 to 1) to the camera effect; enhance.c scales it by Sanity Effects
+55d88e { extern uint32_t coc_enh_sanity(uint32_t); wrs32((uint32_t)(R_esp + 0x4u), coc_enh_sanity(rds32((uint32_t)(R_esp + 0x4u)))); } R_edx = (uint32_t)(rd32((uint32_t)(R_eax)));
+55e01d { extern uint32_t coc_enh_sanity(uint32_t); wrs32((uint32_t)(R_esp + 0x4u), coc_enh_sanity(rds32((uint32_t)(R_esp + 0x4u)))); } R_edx = (uint32_t)(rd32((uint32_t)(R_eax)));
+55f08d { extern uint32_t coc_enh_sanity(uint32_t); wrs32((uint32_t)(R_esp + 0x4u), coc_enh_sanity(rds32((uint32_t)(R_esp + 0x4u)))); } R_edx = (uint32_t)(rd32((uint32_t)(R_eax)));
+55f35d { extern uint32_t coc_enh_sanity(uint32_t); wrs32((uint32_t)(R_esp + 0x4u), coc_enh_sanity(rds32((uint32_t)(R_esp + 0x4u)))); } R_edx = (uint32_t)(rd32((uint32_t)(R_eax)));
+# 0x55f58f (mov ecx, [esp+0x1c]): the intensity that Camera Motion Blur gives to its camera effect; enhance.c scales it
+55f58f { extern uint32_t coc_enh_sanity(uint32_t); R_ecx = coc_enh_sanity(rds32((uint32_t)(R_esp + 0x1cu))); }

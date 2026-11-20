@@ -1,6 +1,7 @@
 // Enhancement settings that the runtime applies on top of the game (anisotropic filtering, ambient occlusion,
-// tone mapping, HDR output and its calibration, contact shadows, bloom, reduced banding, sharp shadows; and
-// settings that the game project applies: gamepad input, intro videos, subtitle size).
+// tone mapping, HDR output and its calibration, contact shadows, bloom, reduced banding, sharp shadows, temporal
+// anti-aliasing; and
+// settings that the game project applies: gamepad input, intro videos, subtitle size, field of view, sanity effects).
 //
 // The game project owns the settings: it allocates RtEnh in guest memory, so that controls of the game's own
 // menus can write the fields directly, and sets rt_enh before the first frame. While rt_enh is NULL the runtime
@@ -26,6 +27,11 @@ typedef struct RtEnh {
     int32_t hdr_paper; // HDR output: paper white (the white of the game's image and UI), an index into RT_ENH_HDR_PAPER_PCT
     int32_t hdr_test;  // game project: 1 while the HDR calibration menu is on the screen; the presented image then has
                        //    the calibration test image (only with HDR output)
+    int32_t fov;       // game project: the field of view of the player camera (0 = the game's; the game project gives
+                       //    the steps)
+    int32_t aa;        // 0: off; 1: MetalFX temporal anti-aliasing of the 3D scene
+    int32_t sanity;    // game project: the intensity of the game's visual sanity effects (0 = the game's; the game
+                       //    project gives the steps)
 } RtEnh;
 
 // The values of hdr_peak in nits (cd/m2). macOS gives the brightness of the screen only as EDR headroom, a factor of
@@ -60,6 +66,9 @@ void d3d9_enh_light_dir(float x, float y, float z);
 // d3d9_enh_light_pass does not give the light; its render targets still do not end the scene.
 void d3d9_enh_light_vs(const char *dir, const char *pos, const char *grad, uint32_t stride);
 
+// The size in pixels of the back buffer of the device (its last Reset or creation); 0 x 0 before the device exists.
+void d3d9_enh_back_buffer(uint32_t *w, uint32_t *h);
+
 // The camera of ambient occlusion and contact shadows: without this call, the fixed-function view and projection
 // transforms of the scene draws. With it, the vertex shader constants creg .. creg + 3 of the opaque draws into the
 // back buffer: a world-view-projection matrix (one row per register, clip = position * M) whose world transform is
@@ -89,4 +98,10 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
 // Dual Kawase bloom (level 1..3, 0 = off) of the scene in color: render passes on cb that add the bloom to color in
 // place. Returns 1 when color was changed.
 int d3d9_enh_bloom(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> color, int level);
+// MetalFX temporal anti-aliasing of the scene in color (with its depth buffer): color is replaced by the output of
+// MetalFX. reproj: the rows of inverse(this frame's view-projection) x the last frame's view-projection (row vectors),
+// or NULL when the motion of the camera is not known (zero motion). jx, jy: the sub-pixel offset of this frame's scene
+// draws in pixels (y down). reset: the history of MetalFX starts again. Returns 1 when color was changed.
+int d3d9_enh_taa(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTexture> depth, const float *reproj,
+                 float jx, float jy, int reset);
 #endif

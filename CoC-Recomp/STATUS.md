@@ -568,3 +568,62 @@ SDR output, calculated for a gray.
 - Two headless level runs (45 and 55 seconds) with HDR output, GT7, ambient occlusion high, contact shadows and bloom high. The second run had `MTL_DEBUG_LAYER=1` and no Metal validation error.
 - The measurement code was temporary. It is removed.
 - Not verified: the image on the screen (screenshots are not permitted).
+
+## 2026-11-20: Frame pacing at 60 Hz, field of view, sanity effect strength, MetalFX anti-aliasing
+
+### Frame rate and frame pacing
+
+- Measured before the change: on a ProMotion display, the runtime presented 120 frames per second. The game asks for a full-screen refresh rate of 60 Hz (`RefreshRate` 60, `D3DPRESENT_INTERVAL_ONE`).
+- The frame rate stays at 60. The scripts of the game fail above 60 frames per second (crashes in the prologue basement and in the house library, from player reports). The GOG release limits the game to 60 frames per second for this reason (notes of the DCoTE Unofficial Patch v1.7, https://www.moddb.com/games/call-of-cthulhu-dark-corners-of-the-earth/downloads/dcote-unofficial-patch-v17; https://steamcommunity.com/app/22340/discussions/0/620695877170217098; https://steamcommunity.com/app/22340/discussions/0/600765934005656804).
+- Change (`d3d9_metal.m`, `pace_setup`, `pace_drawable`, `pace_wait`):
+  - When the game asks for a full-screen refresh rate and a presentation interval that is not `D3DPRESENT_INTERVAL_IMMEDIATE`, the runtime presents at that rate.
+  - Each frame starts on a fixed time grid with a step of 1 / rate. When `nextDrawable` waits more than 0.5 ms, the grid moves later. The grid does not move earlier.
+  - The drawable is presented with `presentDrawable:afterMinimumDuration:` (1 / rate).
+- `CAMetalDisplayLink` was tested first. In a headless run it gave 3 updates and then no more updates, and the game stopped. It is not used.
+- Change (`cocoa32.m`): the game thread has the QoS class `QOS_CLASS_USER_INTERACTIVE`. With the default QoS class, the timed waits of the pacing ended 1 to 3.6 ms late (measured).
+- Measured after the change, in the menus and in a level: 60.0 frames per second; frame times 15.7 to 17.7 ms; 0 to 1 of 240 frames more than 1 ms from 16.7 ms.
+
+### Field of view
+
+- All cameras of the game give the aspect ratio 1.3256 to `D3DXMatrixPerspectiveFovRH` (0x4347c0). On the 1800 × 1125 back buffer (1.6), the 3D image was 21% too wide.
+- Change (patch 0x4347e9, `coc_enh_aspect`): the aspect ratio is the aspect ratio of the back buffer. The vertical field of view does not change.
+- Change (patch 0x4352c0, `coc_enh_player_fov`): the setting **Field of View** (Game, 110%, 120%, 130%, 140%) multiplies the field of view of the player camera (`CoCPlayerFovManager`; the game: 55 degrees vertical). Cut scenes and the other cameras keep their field of view.
+- Measured: the log shows "camera aspect ratio 1.6000 (the back buffer 1800x1125; the game gave 1.3256)". With 120%, the player field of view changed from 55 to 66 degrees and from 39.5 to 47.4 degrees.
+
+### Sanity effects
+
+- The game has five visual sanity effects: Black And White (0x55d850), Blurred Vision (0x55e000), Vertigo Blur (0x55f070), Screen Distort (0x55f340) and Camera Motion Blur (0x55f4c0). Each Start function gives an intensity from 0 to 1 to the camera effect of its id (1, 9, 0xe, 0xd, 0xc) through the set-intensity function 0x4649c0. Each Stop function gives 0.
+- Change (patches 0x55d88e, 0x55e01d, 0x55f08d, 0x55f35d, 0x55f58f; `coc_enh_sanity`): the setting **Sanity Effects** (Game, 75%, 50%, 25%, Off) multiplies this intensity. Off gives 0, as Stop does. The sounds, the sanity value and the other sanity effects do not change.
+- Verified with temporary test code in a level: Start of Black And White with the intensity 1.0 gave the camera effect the intensity 0.5 at 50%, and 0 after Stop. At Off, Black And White and Camera Motion Blur got 0.
+- Not verified: a sanity event in normal play. The reachable part of the first level had no sanity event in the test time.
+
+### Anti-aliasing
+
+- The setting **Anti-Aliasing (MetalFX)** (Off, On) is new. MetalFX is a part of macOS. SMAA T2x was not selected: it needs the SMAA reference source and its look-up tables, which must be downloaded.
+- Change (`d3d9_metal.m`, `taa_offset`, `enh_apply`; `d3d9_enhance.m`, `d3d9_enh_taa`):
+  - The MetalFX temporal scaler runs at the size of the back buffer (input size = output size).
+  - The draws into the back buffer with a depth buffer, before the end of the opaque scene, move by a sub-pixel offset: the Halton (2, 3) sequence, 8 phases. The offset is added to the half-pixel offset of the vertex constants. The post-processing and the UI do not move.
+  - The motion vectors come from the depth buffer and the camera of this frame and of the last frame. They are in pixels (y down), from the pixel to its position in the last frame.
+  - The output of MetalFX replaces the back buffer before the bloom.
+- Limit: the game's vertex shaders do not give the positions of the last frame. An object that moves by itself (a character, a door) gets the motion of the camera only. At such pixels MetalFX finds that the history does not agree with the frame and uses less history.
+- Measured in a level with an almost static camera (a 256 × 256 area at the center, 15 frames): the mean change from frame to frame was 0.0048 at the input of MetalFX and 0.00034 at the output (14 times less). With the sign of the MetalFX jitter reversed for a test, the output change was 0.00058. Thus the sign of the documented convention is correct.
+- Measured: 60.0 frames per second with anti-aliasing, ambient occlusion high, contact shadows, bloom high, HDR output and GT7.
+- `win32.mk` links `MetalFX.framework`.
+
+### Not done
+
+- Screen-space reflections on water and wet surfaces:
+  - The first level has no water draws. The water shaders (`WaterDefault`, `Fresnel`, `WaterFog`) are loaded, but no draw uses them (measured in a 60 second level run).
+  - The game has no material or shader for wet surfaces. A wet surface uses the same shader as a dry surface.
+  - The design needs the data of a water draw: its textures, its depth writes and its blend state. This needs a saved game at a place with water.
+- Engine bug fixes from the community lists:
+  - The 60 Hz limit is done.
+  - The DCoTE Unofficial Patch v1.7 has fixes for the blue light shader of the reef and for the sky dome shader. To read these fixes, the patch must be downloaded.
+
+### Verification
+
+- `make gen` and `make app` built the app. The only warnings are the two known `key_frame` warnings of `wmvcore.c`.
+- Headless level runs of 40 to 70 seconds with all settings on: no error, 60.0 frames per second, a physical footprint of 776 MB that did not increase.
+- One headless run ended at approximately 59 seconds with `SIGKILL`. The log has no error, the system log has no kill record, and there is no crash report. The next run of the same build ran for 70 seconds. The cause is not known.
+- The measurement code was temporary. It is removed.
+- Not verified: the image on the screen (screenshots are not permitted).

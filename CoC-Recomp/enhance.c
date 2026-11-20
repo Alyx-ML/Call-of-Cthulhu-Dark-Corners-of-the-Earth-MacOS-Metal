@@ -9,13 +9,16 @@
 // The text
 // of these controls has string IDs from TXT_BASE; the game's string lookup (0x4b3db0, CoCStringManager) gives this
 // file's text for them. patches.txt has the hook points: the five menu hooks, the intro videos (0x4b235c) and the
-// subtitle size (0x4c43fa, 0x4c44d4).
+// subtitle size (0x4c43fa, 0x4c44d4), the field of view of the player camera (0x4352c0) and the aspect ratio of the
+// camera projections (0x4347e9), and the intensity of the visual sanity effects (0x55d88e, 0x55e01d, 0x55f08d, 0x55f35d,
+// 0x55f58f).
 //
 // The settings are saved to Enhancements.cfg in the data folder (key=value lines) when a value changes.
 // Anisotropic filtering is always 16x and is not in the menu (the file can set another value).
 // Reduced banding and the gamepad are always on and are not in the menu or the file.
-// Defaults: ambient occlusion, tone mapping, HDR, contact shadows, bloom, sharp character shadows and skip intro
-// videos off; subtitles at the game's size; HDR peak brightness 1000 nits and paper white 100%.
+// Defaults: anti-aliasing, ambient occlusion, tone mapping, HDR, contact shadows, bloom, sharp character shadows and skip intro
+// videos off; subtitles at the game's size; the game's field of view and sanity effects; HDR peak brightness 1000
+// nits and paper white 100%.
 #include "rt32.h"
 #include "rt_enh.h"
 #include <errno.h>
@@ -63,7 +66,7 @@ extern void (*rt_dinput_poll_hook)(void);   // dinput8.c
 #define TXT_BASE 0xE000u
 enum { T_TITLE, T_GAME, T_2X, T_AO, T_OFF, T_LOW, T_MEDIUM, T_HIGH, T_ON,
        T_TONEMAP, T_HDR, T_CONTACT, T_SKIP, T_BLOOM, T_SHADOWS, T_SUBS, T_125, T_150, T_175,
-       T_CALIB, T_PEAK, T_PAPER,
+       T_CALIB, T_PEAK, T_PAPER, T_FOV, T_110, T_120, T_130, T_140, T_SANITY, T_S75, T_S50, T_S25, T_AA,
        T_NITS0, T_NITS_END = T_NITS0 + RT_ENH_HDR_PEAKS - 1,     // the values of RT_ENH_HDR_PEAK_NITS
        T_PCT0, T_PCT_END = T_PCT0 + RT_ENH_HDR_PAPERS - 1,       // the values of RT_ENH_HDR_PAPER_PCT
        T_COUNT };
@@ -74,6 +77,9 @@ static const char *const txt[T_COUNT] = {
     [T_SHADOWS] = "Sharp Character Shadows (restart)",
     [T_SUBS] = "Subtitle Size", [T_125] = "1.25x", [T_150] = "1.5x", [T_175] = "1.75x",
     [T_CALIB] = "HDR Calibration", [T_PEAK] = "Peak (symbol barely visible)", [T_PAPER] = "Paper White",
+    [T_FOV] = "Field of View", [T_110] = "110%", [T_120] = "120%", [T_130] = "130%", [T_140] = "140%",
+    [T_SANITY] = "Sanity Effects", [T_S75] = "75%", [T_S50] = "50%", [T_S25] = "25%",
+    [T_AA] = "Anti-Aliasing (MetalFX)",
     [T_NITS0] = "400 nits", "600 nits", "800 nits", "1000 nits", "1200 nits", "1400 nits", "1600 nits", "2000 nits",
     "3000 nits", "4000 nits",
     [T_PCT0] = "50%", "75%", "100%", "125%", "150%", "200%",
@@ -107,8 +113,11 @@ static const struct { const char *key; size_t off; int32_t max; int32_t def; } k
     {"subtitle_size", offsetof(RtEnh, sub_scale), 4, 0},
     {"hdr_peak", offsetof(RtEnh, hdr_peak), RT_ENH_HDR_PEAKS - 1, 3},          // 1000 nits
     {"hdr_paper_white", offsetof(RtEnh, hdr_paper), RT_ENH_HDR_PAPERS - 1, 2},  // 100%
+    {"field_of_view", offsetof(RtEnh, fov), 4, 0},
+    {"sanity_effects", offsetof(RtEnh, sanity), 4, 0},
+    {"anti_aliasing", offsetof(RtEnh, aa), 1, 0},
 };
-enum { K_ANISO, K_AO, K_TONEMAP, K_HDR, K_CONTACT, K_SKIP, K_BLOOM, K_SHADOWS, K_SUBS, K_PEAK, K_PAPER };
+enum { K_ANISO, K_AO, K_TONEMAP, K_HDR, K_CONTACT, K_SKIP, K_BLOOM, K_SHADOWS, K_SUBS, K_PEAK, K_PAPER, K_FOV, K_SANITY, K_AA };
 // keys of earlier versions whose settings are now always on: the loader skips them, the next save leaves them out
 static const char *const retired_keys[] = {"gamepad", "reduced_banding"};
 #define NKEYS (sizeof keys / sizeof keys[0])
@@ -127,9 +136,10 @@ static void cfg_save(void) {
     if (bad || rename(tmp, p) != 0) { rt_log("[enh] can't write %s: %s; the settings are not saved", p, strerror(errno)); remove(tmp); return; }
     saved = *rt_enh;
     if (rt_verbose) rt_log("[enh] settings saved: aniso %d, ao %d, tonemap %d, hdr %d, contact %d, skip_intro %d, "
-                           "bloom %d, shadows %d, subtitle size %d, hdr peak %d, hdr paper white %d", rt_enh->aniso,
+                           "bloom %d, shadows %d, subtitle size %d, hdr peak %d, hdr paper white %d, field of view %d, sanity effects %d, anti-aliasing %d",
+                           rt_enh->aniso,
                            rt_enh->ao, rt_enh->tonemap, rt_enh->hdr, rt_enh->contact, rt_enh->skip_intro, rt_enh->bloom,
-                           rt_enh->shadows, rt_enh->sub_scale, rt_enh->hdr_peak, rt_enh->hdr_paper);
+                           rt_enh->shadows, rt_enh->sub_scale, rt_enh->hdr_peak, rt_enh->hdr_paper, rt_enh->fov, rt_enh->sanity, rt_enh->aa);
 }
 static void cfg_load(void) {
     for (size_t i = 0; i < NKEYS; i++) *field(rt_enh, i) = keys[i].def;
@@ -212,11 +222,71 @@ void coc_enh_init(void) {
     rt_dinput_poll_hook = input_frame;
     static const char *const lvl[] = {"off", "low", "medium", "high"}, *const sub[] = {"game", "1.25x", "1.5x", "1.75x", "2x"};
     rt_log("[enh] settings: anisotropic filtering %s, ambient occlusion %s, GT7 tone mapping %s, HDR %s (peak %s, paper white "
-           "%s), contact shadows %s, bloom %s, sharp character shadows %s, subtitle size %s, skip intro videos %s",
+           "%s), contact shadows %s, bloom %s, sharp character shadows %s, subtitle size %s, skip intro videos %s, field of view %s, sanity effects %s, anti-aliasing %s",
            (const char *[]){"game", "2x", "4x", "8x", "16x"}[rt_enh->aniso], lvl[rt_enh->ao], rt_enh->tonemap ? "on" : "off",
            rt_enh->hdr ? "on" : "off", txt[T_NITS0 + rt_enh->hdr_peak], txt[T_PCT0 + rt_enh->hdr_paper],
            rt_enh->contact ? "on" : "off", lvl[rt_enh->bloom], rt_enh->shadows ? "on" : "off", sub[rt_enh->sub_scale],
-           rt_enh->skip_intro ? "on" : "off");
+           rt_enh->skip_intro ? "on" : "off", (const char *[]){"game", "110%", "120%", "130%", "140%"}[rt_enh->fov],
+           (const char *[]){"game", "75%", "50%", "25%", "off"}[rt_enh->sanity], rt_enh->aa ? "MetalFX" : "off");
+}
+
+// ---- the field of view and the aspect ratio ----
+// The game's camera (0x4347c0: field of view in degrees, aspect ratio) makes its projection with
+// D3DXMatrixPerspectiveFovRH. All the game's cameras give it the aspect ratio 1.3256 (approximately 4:3), whatever the
+// back buffer is: on a 16:10 back buffer (1800 x 1125) the 3D image was 21% wider than it should be (measured: field
+// of view 55 degrees vertical, aspect 1.3256). The aspect ratio is now that of the back buffer. The vertical field of
+// view does not change, so a wider screen shows more at the sides.
+// The player camera (CoCPlayerFovManager, 0x549209 -> 0x4352c0) gets its field of view (the game: 55 degrees, 1 to
+// 120) times the Field of View setting. Cut scenes and the game's other cameras keep their field of view.
+static const float fov_scale[] = {1.0f, 1.1f, 1.2f, 1.3f, 1.4f};
+
+// patch at 0x4352c0: the field of view (degrees, as float bits) that the player camera sets
+uint32_t coc_enh_player_fov(uint32_t bits) {
+    if (!rt_enh || rt_enh->fov == 0) return bits;
+    float f;
+    memcpy(&f, &bits, sizeof f);
+    if (!(f > 0.0f && f <= 120.0f)) rt_fatal("[enh] the player camera set the field of view %g (the game: 1 to 120)", f);
+    f *= fov_scale[rt_enh->fov];
+    memcpy(&bits, &f, sizeof bits);
+    return bits;
+}
+
+// patch at 0x4347e9: the aspect ratio (float bits) of a camera projection
+uint32_t coc_enh_aspect(uint32_t bits) {
+    uint32_t w, h;
+    d3d9_enh_back_buffer(&w, &h);
+    if (!w || !h) rt_fatal("[enh] a camera projection was made before the device had a back buffer");
+    float a = (float)w / (float)h, g;
+    memcpy(&g, &bits, sizeof g);
+    static float logged;
+    if (a != logged) { rt_log("[enh] camera aspect ratio %.4f (the back buffer %ux%u; the game gave %.4f)", a, w, h, g); logged = a; }
+    memcpy(&bits, &a, sizeof bits);
+    return bits;
+}
+
+// ---- the visual sanity effects ----
+// The insanity effects of the game (CoCInsanityEffect classes) with a picture: Black And White (0x55d850), Blurred
+// Vision (0x55e000), Vertigo Blur (0x55f070), Screen Distort (0x55f340) and Camera Motion Blur (0x55f4c0). Each Start
+// (vtable slot 9) gets an intensity from 0 to 1 and gives it to the camera effect of its id (1, 9, 0xe, 0xd, 0xc) with
+// that effect's set-intensity function (vtable +0x10, 0x4649c0). Stop gives 0. The patches multiply the intensity just
+// before it goes to the camera effect: Sanity Effects 75%, 50% and 25% make the effects weaker, Off gives 0 (as Stop).
+// The game's sounds, sanity value and other insanity effects do not change.
+static const float sanity_scale[] = {1.0f, 0.75f, 0.5f, 0.25f, 0.0f};
+
+// patches at 0x55d88e, 0x55e01d, 0x55f08d, 0x55f35d (the intensity argument of Start) and 0x55f58f (the intensity that
+// Camera Motion Blur gives): the intensity (float bits) that the camera effect gets
+uint32_t coc_enh_sanity(uint32_t bits) {
+    if (!rt_enh || rt_enh->sanity == 0) return bits;
+    float f;
+    memcpy(&f, &bits, sizeof f);
+    float r = f * sanity_scale[rt_enh->sanity];
+    static int logged = -1;
+    if (f > 0.0f && logged != rt_enh->sanity) {
+        rt_log("[enh] sanity effect intensity %.3f -> %.3f (Sanity Effects %s)", f, r, txt[(int[]){T_GAME, T_S75, T_S50, T_S25, T_OFF}[rt_enh->sanity]]);
+        logged = rt_enh->sanity;
+    }
+    memcpy(&bits, &r, sizeof bits);
+    return bits;
 }
 
 // ---- the menus ----
@@ -281,7 +351,7 @@ void coc_enh_add_link(CPU *c, uint32_t menu) {
     CALL(G_CTL_LINK, ctl, 1, calib_name_guest(), 0);
 }
 
-#define ENH_SETTINGS 7                   // the settings in the Enhancements menu (coc_enh_build_menu)
+#define ENH_SETTINGS 10                  // the settings in the Enhancements menu (coc_enh_build_menu)
 static void add_enum(CPU *c, uint32_t menu, int label, const int *values, int nvalues, size_t key) {
     uint32_t ctl = CALL(G_MENU_ADD, menu, S_TEXTOPTIONENUM);
     if (!ctl) rt_fatal("[enh] the menu system did not add an Enhancements control");
@@ -373,6 +443,9 @@ static void menu_register(CPU *c, uint32_t name, uint32_t menu) {
 // patch at 0x4123f1 (the end of the SOUNDOPTIONS builder): the Enhancements menu and the HDR Calibration menu
 void coc_enh_build_menu(CPU *c) {
     uint32_t menu = menu_new(c, T_TITLE, S_OPTIONS, ENH_SETTINGS + 1, -1.0f);   // the settings and the Back row
+    add_enum(c, menu, T_FOV, (const int[]){T_GAME, T_110, T_120, T_130, T_140}, 5, K_FOV);
+    add_enum(c, menu, T_SANITY, (const int[]){T_GAME, T_S75, T_S50, T_S25, T_OFF}, 5, K_SANITY);
+    add_enum(c, menu, T_AA, (const int[]){T_OFF, T_ON}, 2, K_AA);
     add_enum(c, menu, T_AO, (const int[]){T_OFF, T_LOW, T_MEDIUM, T_HIGH}, 4, K_AO);
     add_enum(c, menu, T_TONEMAP, (const int[]){T_OFF, T_ON}, 2, K_TONEMAP);
     add_enum(c, menu, T_HDR, (const int[]){T_OFF, T_ON}, 2, K_HDR);

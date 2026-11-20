@@ -78,6 +78,9 @@ The game has a menu **Options > Enhancements**. The menu also shows in the pause
 
 | Setting | Values |
 |---|---|
+| Field of View | Game, 110%, 120%, 130%, 140% |
+| Sanity Effects | Game, 75%, 50%, 25%, Off |
+| Anti-Aliasing (MetalFX) | Off, On |
 | Ambient Occlusion | Off, Low, Medium, High |
 | GT7 Tone Mapping | Off, On |
 | HDR Output | Off, On |
@@ -95,6 +98,9 @@ HDR Output needs a display with HDR (EDR) support. HDR Output and GT7 Tone Mappi
 - **Highlights:** the game clamps its final image to white. The app keeps the colors of the scene that are brighter than white (lamps, fire, bloom) from before the game's post-processing. With HDR Output, these highlights go above the white of the game, up to the peak. With GT7 Tone Mapping in SDR, they keep their detail.
 - **GT7 Tone Mapping** is the tone mapping of Gran Turismo 7 (Polyphony Digital, MIT license), with the parameters of the reference. In SDR, the white of the game is at 250 nits of the reference. With HDR Output, the white of the game is at paper white and the highlights go up to the peak.
 - **Bloom** has no threshold: it mixes a wide blur of the scene into the scene (Low 4%, Medium 8%, High 15%). Bright areas spread light into their surroundings.
+- **Field of View** multiplies the field of view of the player camera (the game: 55 degrees vertical). Cut scenes keep their field of view. All cameras use the aspect ratio of the window, so that the 3D image is not too wide.
+- **Sanity Effects** sets the strength of the visual sanity effects of the game: Black And White, Blurred Vision, Vertigo Blur, Screen Distort and Camera Motion Blur. Off removes them. The sounds and the sanity value of the game do not change.
+- **Anti-Aliasing (MetalFX)** smooths the edges of the 3D scene with the MetalFX temporal scaler of macOS at the full resolution of the window.
 - **Contact shadows** use the lights of the game: the light of the character nearest to the camera. A surface that the light does not reach gets no contact shadow.
 
 ### HDR Calibration
@@ -115,6 +121,7 @@ macOS does not give the brightness of the screen in nits. The app takes the peak
 ## Mac features
 
 - **Full screen:** use **View > Enter Full Screen** (Control-Command-F) or the green window button. The image keeps its aspect ratio.
+- **Frame rate:** the game runs at 60 frames per second, also on a 120 Hz (ProMotion) display. The scripts of the game fail above 60 frames per second. The app presents each frame at an equal interval.
 - **Pause in the background:** when you switch to a different app, the game stops and the sound stops. The game continues when you go back.
 - **Game controllers:** controllers that macOS and SDL3 support work.
 

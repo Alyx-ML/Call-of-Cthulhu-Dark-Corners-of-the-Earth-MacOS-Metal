@@ -1,8 +1,10 @@
-// Direct3D 9 on Metal: scene enhancements of rt_enh.h (ambient occlusion, contact shadows and bloom).
+// Direct3D 9 on Metal: scene enhancements of rt_enh.h (ambient occlusion, contact shadows, temporal anti-aliasing and
+// bloom).
 //
-// d3d9_metal.m calls d3d9_enh_scene and then d3d9_enh_bloom once per frame, after the game's 3D scene and before its
-// post-processing (see enh_apply there). The ambient occlusion and contact shadow passes read the scene depth buffer
-// and multiply the back buffer in place; the bloom pass adds to the back buffer in place.
+// d3d9_metal.m calls d3d9_enh_scene, d3d9_enh_taa and then d3d9_enh_bloom once per frame, after the game's 3D scene
+// and before its post-processing (see enh_apply there). The ambient occlusion and contact shadow passes read the
+// scene depth buffer and multiply the back buffer in place; the anti-aliasing pass replaces the back buffer with the
+// output of MetalFX; the bloom pass adds to the back buffer in place.
 //
 // Ambient occlusion: a Metal port of XeGTAO (ground-truth ambient occlusion, Jimenez et al. 2016, in the XeGTAO
 // form of Intel):
@@ -72,6 +74,14 @@
 // keeps the composite above white, for HDR output and tone mapping; a unorm back buffer clamps the composite when it
 // stores it.
 //
+// Temporal anti-aliasing: the MetalFX temporal scaler at the size of the back buffer (input size = output size), as
+// in Apple's "Applying temporal antialiasing and upscaling using MetalFX". d3d9_metal.m moves the 3D scene draws of each
+// frame by a sub-pixel offset (the Halton (2, 3) sequence, 8 phases) and gives that offset here. The motion vectors come
+// from the depth buffer and the camera of this frame and the last frame (taa_motion): the movement of the camera only.
+// The game's vertex shaders give no position of the last frame, so an object that moves by itself (a character, a
+// door) gets the motion of the static world behind it at that pixel; MetalFX then finds that the history color does not
+// agree and uses less history for those pixels. The kernel also copies the depth to R32Float for MetalFX.
+//
 // Settings: XeGTAO falloff range 0.615, sample distribution power 2, depth mip offset 3.30, denoise beta 1.2. The
 // levels low, medium and high use 1 x 2, 2 x 2 and 3 x 3 slices x steps, an effect radius of 0.8, 1.2 and 1.6 m
 // and a final value power of 2.4, 3.0 and 3.6. With the XeGTAO defaults (0.5 m, power 2.2) the mean visibility of
@@ -82,6 +92,7 @@
 // faces away from the light) or that the light only grazes keeps its color, because its color has no part of that
 // light that a shadow could remove.
 #import <Metal/Metal.h>
+#import <MetalFX/MetalFX.h>
 #include "rt32.h"
 #include "rt_enh.h"
 #include <math.h>
@@ -457,6 +468,24 @@ static const char enh_src[] =
     "  return float4(up8(t, in.uv, p.px), 0.0);\n"
     "}\n"
     // the composite: the scene pixel is read in place (framebuffer fetch)
+    // temporal anti-aliasing: TC.r = the rows of inverse(this frame's view-projection) x the last frame's view-projection
+    // (row vectors); TC.jclip = the sub-pixel offset of this frame in clip space; valid = 0: no camera motion is known
+    "struct TC { float4 r[4]; float2 size, jclip; uint valid, pad0, pad1, pad2; };\n"
+    "kernel void taa_motion(depth2d<float, access::read> dt [[texture(0)]], texture2d<float, access::write> mv [[texture(1)]],\n"
+    "  texture2d<float, access::write> dz [[texture(2)]], constant TC &k [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {\n"
+    "  if (gid.x >= uint(k.size.x) || gid.y >= uint(k.size.y)) return;\n"
+    "  float z = dt.read(gid);\n"
+    "  dz.write(float4(z, 0.0, 0.0, 0.0), gid);\n"
+    "  float2 m = float2(0.0);\n"
+    "  if (k.valid != 0u) {\n"
+    // the pixel center in clip space without the offset of this frame
+    "    float2 ndc = float2((float(gid.x) + 0.5) / k.size.x * 2.0 - 1.0, 1.0 - (float(gid.y) + 0.5) / k.size.y * 2.0) - k.jclip;\n"
+    "    float4 p = ndc.x * k.r[0] + ndc.y * k.r[1] + z * k.r[2] + k.r[3];\n"
+    // the motion in pixels (y down) to the position of the last frame
+    "    if (p.w > 1e-6) { float2 q = p.xy / p.w; m = float2((q.x - ndc.x) * 0.5 * k.size.x, (ndc.y - q.y) * 0.5 * k.size.y); }\n"
+    "  }\n"
+    "  mv.write(float4(m, 0.0, 0.0), gid);\n"
+    "}\n"
     "fragment float4 bloom_comp(BV in [[stage_in]], texture2d<float> t [[texture(0)]], constant BP &p [[buffer(0)]],\n"
     "  float4 dst [[color(0)]]) {\n"
     "  return float4(to_srgb(mix(to_lin(dst.rgb), up8(t, in.uv, p.px) * p.inv, p.k)), dst.a);\n"
@@ -468,6 +497,7 @@ typedef struct { float beta; uint32_t ao, contact; float strength; float light[4
 typedef struct { int32_t count[3]; int32_t offset[2]; } SssDispatch;
 
 typedef struct { float px[2]; float k, inv; } BP;
+typedef struct { float r[4][4]; float size[2], jclip[2]; uint32_t valid, pad[3]; } TC;
 
 static const uint32_t ao_slices[4] = {0, 1, 2, 3}, ao_steps[4] = {0, 2, 2, 3};
 // the strength of each level: the effect radius in meters and the XeGTAO final value power
@@ -483,6 +513,10 @@ static struct {
     id<MTLTexture> hilbert, depths, mip[AO_MIPS], ao0, ao1, edges, shadow;
     id<MTLRenderPipelineState> bloom_pre, bloom_down, bloom_up, bloom_comp; MTLPixelFormat bloom_comp_fmt;
     id<MTLTexture> bloom_lv[BLOOM_LEVELS];
+    id<MTLComputePipelineState> taa_motion;
+    id<MTLFXTemporalScaler> taa; NSUInteger taa_w, taa_h; MTLPixelFormat taa_fmt;
+    id<MTLTexture> taa_mv, taa_dz, taa_out;
+    int logged_taa, logged_taa_ms;
     int logged_ao, logged_sss, logged_cam, logged_ms, logged_bloom, logged_bloom_ms;
 } E;
 
@@ -534,6 +568,7 @@ static void setup(id<MTLDevice> dev) {
     E.sss = kernel_of(@"sss_main", nil);
     if (E.sss.maxTotalThreadsPerThreadgroup < SSS_WAVE) rt_fatal("[d3d9] the contact shadow kernel cannot run %d threads in a group", SSS_WAVE);
     E.hilbert = hilbert_texture();
+    E.taa_motion = kernel_of(@"taa_motion", nil);
 }
 static id<MTLTexture> tex_of(id<MTLTexture> __strong *slot, NSUInteger w, NSUInteger h, MTLPixelFormat fmt, NSUInteger mips) {
     id<MTLTexture> t = *slot;
@@ -819,6 +854,78 @@ int d3d9_enh_bloom(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
         p.px[0] = 0.5f / (float)w; p.px[1] = 0.5f / (float)h;
         p.k = bloom_intensity[level]; p.inv = 1.0f / (float)BLOOM_LEVELS;
         bloom_pass(cb, E.bloom_comp, E.bloom_lv[0], color, &p, 1);
+    }
+    return 1;
+}
+
+// ---- temporal anti-aliasing (MetalFX) ----
+static id<MTLTexture> taa_tex(NSUInteger w, NSUInteger h, MTLPixelFormat fmt, MTLTextureUsage need, const char *what) {
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:w height:h mipmapped:NO];
+    td.storageMode = MTLStorageModePrivate;
+    td.usage = need | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    id<MTLTexture> t = [E.dev newTextureWithDescriptor:td];
+    if (!t) rt_fatal("[d3d9] out of GPU memory for the anti-aliasing %s texture (%lux%lu)", what, (unsigned long)w, (unsigned long)h);
+    return t;
+}
+static void taa_setup(NSUInteger w, NSUInteger h, MTLPixelFormat fmt) {
+    if (E.taa && E.taa_w == w && E.taa_h == h && E.taa_fmt == fmt) return;
+    if (![MTLFXTemporalScalerDescriptor supportsDevice:E.dev]) rt_fatal("[d3d9] this GPU does not support the MetalFX temporal scaler (anti-aliasing)");
+    float mn = [MTLFXTemporalScalerDescriptor supportedInputContentMinScaleForDevice:E.dev];
+    if (!(mn <= 1.0f)) rt_fatal("[d3d9] the MetalFX temporal scaler of this GPU needs a scale of at least %g; anti-aliasing needs 1", mn);
+    MTLFXTemporalScalerDescriptor *dd = [MTLFXTemporalScalerDescriptor new];
+    dd.inputWidth = w; dd.inputHeight = h; dd.outputWidth = w; dd.outputHeight = h;
+    dd.colorTextureFormat = fmt; dd.outputTextureFormat = fmt;
+    dd.depthTextureFormat = MTLPixelFormatR32Float; dd.motionTextureFormat = MTLPixelFormatRG16Float;
+    dd.autoExposureEnabled = NO;
+    dd.requiresSynchronousInitialization = YES;
+    id<MTLFXTemporalScaler> sc = [dd newTemporalScalerWithDevice:E.dev];
+    if (!sc) rt_fatal("[d3d9] the MetalFX temporal scaler (anti-aliasing) was not created for %lux%lu, format %lu",
+                      (unsigned long)w, (unsigned long)h, (unsigned long)fmt);
+    E.taa = sc; E.taa_w = w; E.taa_h = h; E.taa_fmt = fmt;
+    E.taa_mv = taa_tex(w, h, MTLPixelFormatRG16Float, sc.motionTextureUsage, "motion");
+    E.taa_dz = taa_tex(w, h, MTLPixelFormatR32Float, sc.depthTextureUsage, "depth");
+    E.taa_out = taa_tex(w, h, fmt, sc.outputTextureUsage, "output");
+    sc.motionVectorScaleX = 1.0f; sc.motionVectorScaleY = 1.0f;
+    sc.inputContentWidth = w; sc.inputContentHeight = h;
+    sc.depthReversed = NO;
+    rt_log("[d3d9] MetalFX temporal anti-aliasing %lux%lu, format %lu", (unsigned long)w, (unsigned long)h, (unsigned long)fmt);
+}
+int d3d9_enh_taa(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTexture> depth, const float *reproj,
+                 float jx, float jy, int reset) {
+    NSUInteger w = color.width, h = color.height;
+    if (color.sampleCount > 1 || depth.sampleCount > 1 || depth.width != w || depth.height != h) {
+        if (!E.logged_taa_ms) rt_log("[d3d9] anti-aliasing: the scene is multisampled or its depth buffer (%lux%lu) differs from the "
+                                     "back buffer (%lux%lu); such frames have no anti-aliasing", (unsigned long)depth.width,
+                                     (unsigned long)depth.height, (unsigned long)w, (unsigned long)h);
+        E.logged_taa_ms = 1;
+        return 0;
+    }
+    @autoreleasepool {
+        setup(dev);
+        taa_setup(w, h, color.pixelFormat);
+        id<MTLFXTemporalScaler> sc = E.taa;
+        if ((color.usage & sc.colorTextureUsage) != sc.colorTextureUsage)
+            rt_fatal("[d3d9] anti-aliasing: the back buffer texture lacks the usage 0x%lx that MetalFX needs", (unsigned long)sc.colorTextureUsage);
+        TC k; memset(&k, 0, sizeof k);
+        if (reproj) { memcpy(k.r, reproj, sizeof k.r); k.valid = 1; }
+        k.size[0] = (float)w; k.size[1] = (float)h;
+        k.jclip[0] = 2.0f * jx / (float)w; k.jclip[1] = -2.0f * jy / (float)h;
+        id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+        ce.label = @"Anti-aliasing motion";
+        [ce setComputePipelineState:E.taa_motion];
+        [ce setTexture:depth atIndex:0]; [ce setTexture:E.taa_mv atIndex:1]; [ce setTexture:E.taa_dz atIndex:2];
+        [ce setBytes:&k length:sizeof k atIndex:0];
+        [ce dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [ce endEncoding];
+        sc.colorTexture = color; sc.depthTexture = E.taa_dz; sc.motionTexture = E.taa_mv; sc.outputTexture = E.taa_out;
+        sc.jitterOffsetX = jx; sc.jitterOffsetY = jy;
+        sc.reset = reset ? YES : NO;
+        [sc encodeToCommandBuffer:cb];
+        id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+        be.label = @"Anti-aliasing output";
+        [be copyFromTexture:E.taa_out toTexture:color];
+        [be endEncoding];
+        if (!E.logged_taa) { rt_log("[d3d9] anti-aliasing: first frame (jitter %.3f %.3f, %s)", jx, jy, reproj ? "camera motion" : "no camera motion"); E.logged_taa = 1; }
     }
     return 1;
 }

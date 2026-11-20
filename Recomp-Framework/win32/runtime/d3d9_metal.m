@@ -383,6 +383,8 @@ typedef struct Swap {
     uint16_t ramp[768];
     int implicit;
     int edr;                       // the layer was switched to EDR output (rt_enh.h hdr)
+    uint32_t pace_rate;            // frame pacing (pace_*): frames per second, 0 = no pacing
+    uint64_t pace_due;             // the time (CLOCK_UPTIME_RAW, ns) at which the next frame starts
 } Swap;
 
 typedef struct { uint32_t idx; uint32_t data[26]; uint8_t enabled; } Light;
@@ -491,6 +493,11 @@ struct Device {
                                    //   contact shadows and bloom, before the game's post-processing (enh_apply)
     uint32_t tm_pre_frame;         // the frame of tm_pre
     struct { float headroom, potential; int peak, paper; } tm_logged;
+    // temporal anti-aliasing (rt_enh.h aa): the 3D scene draws of a frame move by a sub-pixel offset (taa_offset)
+    float taa_jit[2];              // the offset (pixels, y down) in the vertex constants uploaded last (pos_fixup)
+    uint32_t taa_frame;            // the last frame with anti-aliasing
+    float taa_vp[16];              // the view-projection of the camera of the last anti-aliasing frame
+    int taa_vp_ok;                 // taa_vp holds a camera
 };
 
 // ---------------- submission ----------------
@@ -1985,12 +1992,38 @@ static void clear_quad(Device *d, uint32_t flags, const float *col, float z, uin
     [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
 }
 
+// ---------------- temporal anti-aliasing (rt_enh.h aa) ----------------
+// MetalFX (d3d9_enh_taa) needs the 3D scene of each frame at a different sub-pixel position. The offset of frame f is
+// the Halton (2, 3) point of index f mod 8 + 1, minus 0.5 (8 phases, the MetalFX count for a scale of 1). A frame
+// after a frame without anti-aliasing gets no offset (MetalFX starts its history again in that frame). The draws into
+// the back buffer with a depth buffer, before the end of the opaque scene (enh_apply), move by the offset; the
+// post-processing and the UI after it do not.
+#define TAA_PHASES 8
+static float taa_halton(uint32_t i, uint32_t b) {
+    float r = 0.0f, f = 1.0f / (float)b;
+    while (i > 0) { r += f * (float)(i % b); i /= b; f /= (float)b; }
+    return r;
+}
+static void taa_offset(const Device *d, uint32_t f, float o[2]) {
+    o[0] = o[1] = 0.0f;
+    if (!rt_enh || rt_enh->aa != 1 || d->taa_frame == 0 || d->taa_frame != f - 1) return;
+    uint32_t i = f % TAA_PHASES + 1;
+    o[0] = taa_halton(i, 2) - 0.5f; o[1] = taa_halton(i, 3) - 0.5f;
+}
+static void taa_draw_offset(const Device *d, float o[2]) {
+    uint32_t f = d->frame + 1;
+    const Surf *r0 = d->rt[0];
+    if (r0 && r0->swap && d->ds && d->enh_done != f) taa_offset(d, f, o);
+    else o[0] = o[1] = 0.0f;
+}
+
 // ---------------- constants ----------------
 static void pos_fixup(Device *d, float *f) {
     State *S = &d->st;
     float w = (float)S->vp[2], h = (float)S->vp[3], zr = fbits(S->vp[5]) - fbits(S->vp[4]);
-    f[0] = w > 0 ? (63.0f / 64.0f) / w : 0.0f;
-    f[1] = h > 0 ? -(63.0f / 64.0f) / h : 0.0f;
+    // with the sub-pixel offset of temporal anti-aliasing (taa_jit, in pixels with y down)
+    f[0] = w > 0 ? ((63.0f / 64.0f) + 2.0f * d->taa_jit[0]) / w : 0.0f;
+    f[1] = h > 0 ? -((63.0f / 64.0f) + 2.0f * d->taa_jit[1]) / h : 0.0f;
     f[2] = fbits(S->rs[RS_DEPTHBIAS]) / (zr != 0.0f ? zr : 1.0f);
     f[3] = fbits(S->rs[RS_POINTSIZE]);
 }
@@ -1999,6 +2032,26 @@ static void mat_mul(const float *a, const float *b, float *o) {   // row-vector 
     for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++)
         t[i * 4 + j] = a[i * 4] * b[j] + a[i * 4 + 1] * b[4 + j] + a[i * 4 + 2] * b[8 + j] + a[i * 4 + 3] * b[12 + j];
     memcpy(o, t, sizeof t);
+}
+// the inverse of a 4x4 matrix (Gauss-Jordan elimination with partial pivoting, in double precision); 0 when the matrix
+// is singular
+static int mat_inv(const float *m, float *o) {
+    double a[4][8];
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) { a[i][j] = m[i * 4 + j]; a[i][4 + j] = i == j ? 1.0 : 0.0; }
+    for (int c = 0; c < 4; c++) {
+        int p = c;
+        for (int r = c + 1; r < 4; r++) if (fabs(a[r][c]) > fabs(a[p][c])) p = r;
+        if (!(fabs(a[p][c]) > 1e-12)) return 0;
+        if (p != c) for (int j = 0; j < 8; j++) { double t = a[c][j]; a[c][j] = a[p][j]; a[p][j] = t; }
+        double iv = 1.0 / a[c][c];
+        for (int j = 0; j < 8; j++) a[c][j] *= iv;
+        for (int r = 0; r < 4; r++) if (r != c && a[r][c] != 0.0) { double k = a[r][c]; for (int j = 0; j < 8; j++) a[r][j] -= k * a[c][j]; }
+    }
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) {
+        o[i * 4 + j] = (float)a[i][4 + j];
+        if (!isfinite(o[i * 4 + j])) return 0;
+    }
+    return 1;
 }
 // the normal matrix: inverse transpose of the upper 3x3
 static void normal_mat(const float *m, float *o) {
@@ -2274,6 +2327,10 @@ static int prepare(Device *d, int points, const UpStream *up, uint32_t *instance
     }
     if (x1 <= x0 || y1 <= y0) return 0;   // nothing inside the scissor rectangle
     [e setScissorRect:(MTLScissorRect){(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0)}];
+    // the sub-pixel offset of temporal anti-aliasing changes the half-pixel offset of the vertex constants
+    float jt[2];
+    taa_draw_offset(d, jt);
+    if (jt[0] != d->taa_jit[0] || jt[1] != d->taa_jit[1]) { d->taa_jit[0] = jt[0]; d->taa_jit[1] = jt[1]; d->vsc_dirty = d->ffc_dirty = 1; }
     // constants
     __unsafe_unretained id<MTLBuffer> cb; uint32_t co;
     if (ff) {
@@ -2350,6 +2407,8 @@ void d3d9_enh_light_pass(uint32_t w, uint32_t h, uint32_t fmt, uint32_t creg) {
 }
 // d3d9_enh_camera_vs: the camera comes from the vertex shader constants creg .. creg + 3
 static struct { int on; uint32_t creg; } enh_camvs;
+static uint32_t enh_bb_w, enh_bb_h;   // the back buffer of the last device reset (d3d9_enh_back_buffer)
+void d3d9_enh_back_buffer(uint32_t *w, uint32_t *h) { *w = enh_bb_w; *h = enh_bb_h; }
 void d3d9_enh_camera_vs(uint32_t creg) {
     if (creg > 256 - 4) rt_fatal("[d3d9] d3d9_enh_camera_vs: bad constant register c%u", creg);
     enh_camvs.on = 1; enh_camvs.creg = creg;
@@ -2507,7 +2566,7 @@ static void enh_note_draw(Device *d) {
     if (!d->ds && enh_is_light_target(r0) && S->vs && d->enh_light_frame != f) {
         if (enh_light_of((const float (*)[4])S->vsf[enh_lp.creg], d->enh_sc.light)) d->enh_light_frame = f;
     }
-    if (rt_enh->ao <= 0 && rt_enh->contact <= 0 && rt_enh->bloom <= 0 && rt_enh->tonemap != 1 && rt_enh->hdr != 1) return;
+    if (rt_enh->ao <= 0 && rt_enh->contact <= 0 && rt_enh->bloom <= 0 && rt_enh->tonemap != 1 && rt_enh->hdr != 1 && rt_enh->aa != 1) return;
     if (d->enh_done == f) return;
     if (rt_enh->contact > 0 && r0->swap && S->vs && S->vs->lv) enh_light_note(d, f, S);
     if (r0->swap && d->ds && S->rs[RS_ZENABLE] && S->rs[RS_ZWRITEENABLE] && !S->rs[RS_ALPHABLENDENABLE]) {
@@ -2576,12 +2635,13 @@ static void enh_apply(Device *d) {
         memcpy(d->enh_sc.light, enh_ld.dir, sizeof enh_ld.dir); d->enh_sc.light[3] = 0.0f;
         d->enh_sc.have_light = 1;
     } else if (!enh_lvs.on) d->enh_sc.have_light = d->enh_light_frame == f;
-    int ao = rt_enh->ao, contact = rt_enh->contact;
-    if (enh_camvs.on && (ao > 0 || contact > 0)) {
+    int ao = rt_enh->ao, contact = rt_enh->contact, taa = rt_enh->aa == 1, have_cam = !enh_camvs.on;
+    if (enh_camvs.on && (ao > 0 || contact > 0 || taa)) {
         // the camera with the most draws (the level geometry, whose world transform is the identity)
         uint32_t best = 0, n = d->enh_cam_frame == f ? d->enh_ncam : 0;
         for (uint32_t i = 1; i < n; i++) if (d->enh_cam[i].n > d->enh_cam[best].n) best = i;
         if (n) {
+            have_cam = 1;
             memcpy(d->enh_sc.view, d->enh_cam[best].view, 64); memcpy(d->enh_sc.proj, d->enh_cam[best].proj, 64);
             if (rt_verbose && !d->enh_cam_logged) {
                 const float *P = d->enh_sc.proj;
@@ -2599,6 +2659,20 @@ static void enh_apply(Device *d) {
         memcpy(d->enh_sc.light, d->enh_lv, sizeof d->enh_lv);
     }
     d3d9_enh_scene(d->mtl, d->cmd, d->enh_color, d->enh_depth, &d->enh_sc, ao, contact);
+    if (taa) {
+        // the motion of the camera from the last frame: inverse(this view-projection) x the last view-projection
+        float o[2], vp[16], iv[16], rp[16];
+        taa_offset(d, f, o);
+        int cont = d->taa_frame != 0 && d->taa_frame == f - 1;
+        mat_mul(d->enh_sc.view, d->enh_sc.proj, vp);
+        int motion = have_cam && cont && d->taa_vp_ok && mat_inv(vp, iv);
+        if (motion) mat_mul(iv, d->taa_vp, rp);
+        if (d3d9_enh_taa(d->mtl, d->cmd, d->enh_color, d->enh_depth, motion ? rp : NULL, o[0], o[1], !cont)) {
+            d->taa_frame = f;
+            d->taa_vp_ok = have_cam;
+            memcpy(d->taa_vp, vp, sizeof vp);
+        }
+    }
     d3d9_enh_bloom(d->mtl, d->cmd, d->enh_color, rt_enh->bloom);
     id<MTLTexture> c = d->enh_color;
     if ((rt_enh->tonemap == 1 || rt_enh->hdr == 1) && c.pixelFormat == MTLPixelFormatRGBA16Float && c.sampleCount == 1) {
@@ -2827,6 +2901,52 @@ static uint32_t get_rt_data(Device *d, Surf *s, Surf *t) {
     return D3D_OK;
 }
 
+// ---- frame pacing ----
+// A full-screen swap chain with the presentation interval D3DPRESENT_INTERVAL_DEFAULT or ONE and a refresh rate
+// (FullScreen_RefreshRateInHz) presents at that rate, as the display mode of Direct3D 9 does. The game asks for 60 Hz.
+// The game's scripts depend on this rate: above 60 frames per second their timing fails (the 60 FPS limit of the GOG
+// release fixes these errors; "DCoTE Unofficial Patch" v1.7 notes). On a screen of a higher rate (ProMotion, 120 Hz)
+// the layer alone would present at the rate of the screen.
+//   Each drawable shows for at least one period (presentDrawable:afterMinimumDuration:).
+//   Present returns at the next point of a fixed grid of periods. Thus the frames of the game start at even
+//   intervals, and the game's clocks advance by one period per frame. A frame that ends more than one period late
+//   starts a new grid (a slow frame, a pause in the background).
+//   The grid follows the screen: the layer frees a drawable when the screen shows the next one, once per period.
+//   When nextDrawable waits for that (more than 0.5 ms), the grid point of this frame moves to the time of the free
+//   drawable + a quarter period (the time for the rest of Present), if that is later. Thus the grid comes after the
+//   time at which the screen frees a drawable.
+// A windowed swap chain (refresh rate 0) and D3DPRESENT_INTERVAL_IMMEDIATE have no pacing.
+static uint64_t pace_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+static void pace_setup(Swap *sw) {
+    uint32_t rate = sw->pp[8] == 0 && sw->pp[13] != 0x80000000u ? sw->pp[12] : 0;
+    if (rate != sw->pace_rate) {
+        if (rate) rt_log("[d3d9] frame pacing: %u frames per second (the refresh rate of the presentation parameters)", rate);
+        else if (sw->pace_rate) rt_log("[d3d9] frame pacing: off");
+    }
+    sw->pace_rate = rate;
+    sw->pace_due = 0;
+}
+static void pace_drawable(Swap *sw, uint64_t t_ask, uint64_t t_got) {
+    if (!sw->pace_rate || t_got - t_ask <= 500000ull) return;
+    uint64_t due = t_got + 250000000ull / sw->pace_rate;
+    if (due > sw->pace_due) sw->pace_due = due;   // later only: a drawable that is free early does not raise the rate
+}
+static void pace_wait(Swap *sw) {
+    if (!sw->pace_rate) return;
+    uint64_t period = 1000000000ull / sw->pace_rate, now = pace_now();
+    if (!sw->pace_due || now > sw->pace_due + period) { sw->pace_due = now + period; return; }
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom && mach_timebase_info(&tb) != KERN_SUCCESS) rt_fatal("[d3d9] mach_timebase_info failed");
+    if (now < sw->pace_due) {
+        // CLOCK_UPTIME_RAW and mach_absolute_time are the same clock
+        uint64_t ticks = mach_absolute_time() + (sw->pace_due - now) * tb.denom / tb.numer;
+        kern_return_t kr;
+        while ((kr = mach_wait_until(ticks)) == KERN_ABORTED) { }
+        if (kr != KERN_SUCCESS) rt_fatal("[d3d9] frame pacing: mach_wait_until failed (%d)", kr);
+    }
+    sw->pace_due += period;
+}
+
 // ---- swap chains ----
 static void swap_destroy(Obj *o) {
     Swap *sw = (Swap *)o;
@@ -2927,7 +3047,9 @@ static uint32_t swap_present(Device *d, Swap *sw, uint32_t srp, uint32_t drp, ui
     int32_t sr[4];
     if (!read_rect(srp, bb->w, bb->h, sr)) return D3DERR_INVALIDCALL;
     id<MTLTexture> img = bt->ms > 1 ? bt->resolve : bt->mtl;
+    uint64_t t_ask = pace_now();
     id<CAMetalDrawable> dr = [layer nextDrawable];
+    if (!override) pace_drawable(sw, t_ask, pace_now());
     if (!dr) {
         rt_log("[d3d9] Present: the window gave no drawable; the frame is not shown");
         commit(d);
@@ -3022,7 +3144,8 @@ static uint32_t swap_present(Device *d, Swap *sw, uint32_t srp, uint32_t drp, ui
         util_quad(d, e, 'K', 1, dt.pixelFormat, d->cursor, d->samp_pt, cs, (uint32_t)d->cur_w, (uint32_t)d->cur_h, cd, DW, DH, nil, 0, NULL);
     }
     [e endEncoding];
-    [d->cmd presentDrawable:dr];
+    if (!override && sw->pace_rate) [d->cmd presentDrawable:dr afterMinimumDuration:1.0 / (double)sw->pace_rate];
+    else [d->cmd presentDrawable:dr];
     if (!override) {
         int want = rt_enh && rt_enh->hdr == 1;
         if (want != sw->edr) { rt_cocoa_layer_edr((__bridge void *)layer, want, 0); sw->edr = want; }
@@ -3049,6 +3172,7 @@ static uint32_t swap_present(Device *d, Swap *sw, uint32_t srp, uint32_t drp, ui
     }
     uint64_t old = d->frame_serial[d->frame % 3];
     if (old) wait_serial(d, old);
+    if (!override) pace_wait(sw);
     return D3D_OK;
 }
 // validate presentation parameters (defaults are written back, as Direct3D 9 does)
@@ -3090,6 +3214,7 @@ static void layer_setup(Swap *sw) {
     uint32_t hwnd = sw->hwnd, w = sw->pp[0], h = sw->pp[1];
     int windowed = sw->pp[8] != 0;
     dispatch_async(dispatch_get_main_queue(), ^{ l.displaySyncEnabled = sync; });
+    pace_setup(sw);
     // full screen: the client area becomes the display mode (the window is sized to the back buffer) and the window
     // goes to macOS full screen; windowed: the window leaves macOS full screen
     if (!windowed) rt_cocoa_set_size(hwnd, (int)w, (int)h);
@@ -3420,6 +3545,7 @@ static uint32_t dev_reset(Device *d, const uint32_t *pp, uint32_t focus) {
     mark_dirty(d);
     d->in_scene = 0;
     memcpy(d->pp, pp, sizeof d->pp);
+    enh_bb_w = pp[0]; enh_bb_h = pp[1];
     return D3D_OK;
 }
 METHOD(d3d_CreateDevice) {
