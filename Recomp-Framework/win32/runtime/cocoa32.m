@@ -259,25 +259,13 @@ void rt_cocoa_release_pointer(void) {
     if (__atomic_exchange_n(&pointer_held, 0, __ATOMIC_RELAXED)) CGAssociateMouseAndMouseCursorPosition(true);
 }
 
-// The content size in points of a window for a client area of w x h pixels. A client area larger than the screen in
-// points is in the pixels of the screen (the size of rt_cocoa_screen_pixels, for example the Retina resolution of the
-// Enhancements): its points are its pixels / the backing scale factor of the screen. Main thread only.
-static NSSize content_points(int w, int h) {
-    NSScreen *scr = NSScreen.mainScreen;
-    NSSize sp = scr.frame.size;
-    CGFloat bs = scr.backingScaleFactor;
-    if (bs > 1.0 && ((CGFloat)w > sp.width || (CGFloat)h > sp.height)) return NSMakeSize((CGFloat)w / bs, (CGFloat)h / bs);
-    return NSMakeSize(w, h);
-}
-
 // called from the game thread; returns the window's CAMetalLayer (retained)
 void *rt_cocoa_create_window(uint32_t hwnd, const char *title, int w, int h) {
     __block CAMetalLayer *layer = nil;
     NSString *t = [NSString stringWithUTF8String:title ? title : ""] ?: @"";
     dispatch_sync(dispatch_get_main_queue(), ^{
         if (!windows) windows = [NSMutableDictionary new];
-        NSSize cs = content_points(w, h);
-        NSRect r = NSMakeRect(0, 0, cs.width, cs.height);
+        NSRect r = NSMakeRect(0, 0, w, h);
         NSWindow *win = [[NSWindow alloc] initWithContentRect:r styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                                               NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
                                                       backing:NSBackingStoreBuffered defer:NO];
@@ -319,7 +307,7 @@ void rt_cocoa_set_size(uint32_t hwnd, int w, int h) {
         NSWindow *win = windows[@(hwnd)];
         if (!win) return;
         // in macOS full screen the window keeps the screen's size; the image is scaled into it
-        if (!(win.styleMask & NSWindowStyleMaskFullScreen)) [win setContentSize:content_points(w, h)];
+        if (!(win.styleMask & NSWindowStyleMaskFullScreen)) [win setContentSize:NSMakeSize(w, h)];
         ((CAMetalLayer *)win.contentView.layer).drawableSize = CGSizeMake(w, h);
     });
 }
@@ -391,15 +379,6 @@ void rt_cocoa_screen_size(int *w, int *h) {
     if ([NSThread isMainThread]) s = NSScreen.mainScreen.frame.size;
     else dispatch_sync(dispatch_get_main_queue(), ^{ s = NSScreen.mainScreen.frame.size; });
     *w = (int)s.width; *h = (int)s.height;
-}
-
-// the size of the main screen in pixels (its size in points x its backing scale factor; 2 on a Retina display)
-void rt_cocoa_screen_pixels(int *w, int *h) {
-    __block NSSize s;
-    __block CGFloat bs;
-    void (^get)(void) = ^{ s = NSScreen.mainScreen.frame.size; bs = NSScreen.mainScreen.backingScaleFactor; };
-    if ([NSThread isMainThread]) get(); else dispatch_sync(dispatch_get_main_queue(), get);
-    *w = (int)lround(s.width * bs); *h = (int)lround(s.height * bs);
 }
 
 // ---- app ----

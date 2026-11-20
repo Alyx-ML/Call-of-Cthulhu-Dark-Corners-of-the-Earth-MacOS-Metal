@@ -735,3 +735,9 @@ The HDR Calibration menu now has the two settings of the Capcom RE Engine (Resid
 - `make gen` and `make app` built the app with no new warnings.
 - The headless runs ended without errors. The registry and Enhancements.cfg of the test folder were restored after the runs.
 - The runner with time stamps (a copy of the headless runner) did not stop the game process at the end of the first run. The process was stopped with `pkill`. The next runs stopped it the same way.
+
+### Retina resolution removed
+
+- The user decided that the game must not render at the Retina resolution. The setting **Retina Resolution (restart)** and its code are removed: `coc_enh_resolution` and the patch 0x40b533 (`enhance.c`, `patches.txt`), the field `retina` (`rt_enh.h`), the display mode of the screen in pixels (`d3d9_metal.m`, `mode_list`), and `rt_cocoa_screen_pixels` and `content_points` (`cocoa32.m`).
+- The game again uses its own resolution (the screen in points, 1800 × 1125 on the test Mac). The Enhancements menu has 11 settings.
+- Verified: `make gen` and `make app` built the app (only the two known `key_frame` warnings of `wmvcore.c`). A headless run of 30 seconds had no error: the device was 1800 × 1125, and the log showed "menu ENHANCEDOPTIONS registered (11 settings)".

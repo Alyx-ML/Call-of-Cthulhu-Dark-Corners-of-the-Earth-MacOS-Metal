@@ -19,8 +19,6 @@
 412101 { C.eax = R_eax; C.ecx = R_ecx; C.esp = R_esp; C.esi = R_esi; C.edi = R_edi; extern void coc_enh_add_video(CPU *, uint32_t); coc_enh_add_video(c, R_esi); } R_ecx = (uint32_t)(R_esi);
 # 0x4352c0 (mov eax, [esp+4]): the player camera's field of view (CoCPlayerFovManager, in degrees); enhance.c scales it by Field of View
 4352c0 { extern uint32_t coc_enh_player_fov(uint32_t); R_eax = coc_enh_player_fov(rds32((uint32_t)(R_esp + 0x4u))); }
-# 0x40b533 (lea eax, [esp+0xc]): the settings object (esi) has its resolution (+8, +0xc) from the registry; enhance.c gives the Retina resolution
-40b533 { extern void coc_enh_resolution(uint32_t); coc_enh_resolution(R_esi); } R_eax = (uint32_t)(R_esp + 0xcu);
 # 0x4347e9 (push ecx): the aspect ratio of a camera's perspective projection (the game: 1.3256); enhance.c gives the back buffer's
 4347e9 { extern uint32_t coc_enh_aspect(uint32_t); PUSHL(coc_enh_aspect(R_ecx)); }
 # 0x55d88e, 0x55e01d, 0x55f08d, 0x55f35d (mov edx, [eax]): Black And White, Blurred Vision, Vertigo Blur and Screen Distort

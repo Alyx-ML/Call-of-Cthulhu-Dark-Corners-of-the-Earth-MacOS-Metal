@@ -35,7 +35,6 @@
 void *rt_window_layer(uint32_t hwnd);
 void rt_window_size(uint32_t hwnd, int *w, int *h);
 void rt_cocoa_screen_size(int *w, int *h);
-void rt_cocoa_screen_pixels(int *w, int *h);
 void rt_cocoa_set_size(uint32_t hwnd, int w, int h);
 void rt_cocoa_full_screen(uint32_t hwnd, int on);
 void rt_cocoa_layer_edr(void *layer, int on, int refresh_only);
@@ -3265,8 +3264,7 @@ static uint32_t ms_counts(id<MTLDevice> dev, uint32_t *out) {
     for (int i = 0; i < 4; i++) if ([dev supportsTextureSampleCount:cand[i]]) out[n++] = cand[i];
     return n;
 }
-// display modes: common sizes that fit the screen, and the screen itself (X8R8G8B8, 60 Hz); with the Retina resolution
-// (rt_enh.h retina) also the screen in pixels
+// display modes: common sizes that fit the screen, and the screen itself (X8R8G8B8, 60 Hz)
 #define MAX_MODES 32
 static uint32_t mode_list(uint32_t (*m)[2]) {
     static const uint16_t std[][2] = {{640, 480}, {800, 600}, {1024, 768}, {1152, 864}, {1280, 720}, {1280, 768}, {1280, 800},
@@ -3282,11 +3280,6 @@ static uint32_t mode_list(uint32_t (*m)[2]) {
         m[n][0] = std[i][0]; m[n][1] = std[i][1]; n++;
     }
     if (!native && sw > 0 && sh > 0) { m[n][0] = (uint32_t)sw; m[n][1] = (uint32_t)sh; n++; }
-    if (rt_enh && rt_enh->retina) {
-        int pw = 0, ph = 0;
-        rt_cocoa_screen_pixels(&pw, &ph);
-        if ((pw > sw || ph > sh) && n < MAX_MODES) { m[n][0] = (uint32_t)pw; m[n][1] = (uint32_t)ph; n++; }
-    }
     return n;
 }
 static void fill_caps(uint32_t p, uint32_t type) {
