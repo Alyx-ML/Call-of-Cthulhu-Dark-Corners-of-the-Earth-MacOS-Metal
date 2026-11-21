@@ -927,3 +927,35 @@ Verification:
 - `make app` built the app (only the two known `key_frame` warnings of `wmvcore.c`).
 - Headless run of 60 s with `film_grain=1` and `MTL_DEBUG_LAYER=1`: 3000 frames, no Metal validation error. The log shows "film grain off: frame 932, a draw with the grain texture (64x64, format 50) at stage 1 has stages 0 to 0 only" and "menu ENHANCEDOPTIONS registered (14 settings)".
 - Not verified: the image on the screen (screenshots are not permitted), and the GT7 curve on the screen. The effect of the toe is calculated, not measured.
+
+## 2026-11-21: Better global illumination (RTGI)
+
+Request (user): make the global illumination better.
+
+Changes (all in `Recomp-Framework/win32/runtime/d3d9_enhance.m`):
+
+- Hit refinement: three bisection steps between the hit step and the step before it find the surface.
+- Front-side test: a hit surface gives light only from its front side. Before, a ray that passed behind an object got the color of the front of that object (light leaked through objects).
+- Color pyramid: the new kernels `gi_color0` and `gi_colordown` make the linear back buffer at half size and four smaller levels, only from the pixels with a surface. A hit gets the color of the level whose pixel is near the screen distance between two steps, not the color of one texel.
+- Normals: `gi_main` writes the normal of each pixel to the new texture `gin`. `gi_denoise` multiplies the weight of each neighbor by the cosine between the normals to the power 8, so the light does not mix across corners.
+- Four denoise passes (the distances 1, 2, 4 and 8), not three. High uses 5 rays, not 4.
+- The strengths of low, medium and high are 0.75, 1.5 and 2.25 (1.5 x the strengths before). The front-side test decreased the mean light by approximately one third, and the new strengths keep the amount of light.
+
+Measurements (temporary statistics of the denoised result at half size, frames 1500, 2400 and 3300 of the town save, High; the statistics code is removed):
+
+| Version | GPU time of the frame (ms) | Mean light (linear) | Mean difference between neighbors on flat surfaces | The same, % of the mean |
+|---|---|---|---|---|
+| Before | 11.0, 12.0, 7.8 | 0.00155, 0.00151, 0.00108 | 0.000055, 0.000050, 0.000047 | 3.6, 3.3, 4.4 |
+| 4 rays, 3 passes | 8.1, 9.9, 7.8 | 0.00094, 0.00110, 0.00082 | 0.000040, 0.000042, 0.000047 | 4.2, 3.8, 5.7 |
+| 8 rays, 4 passes | 16.9, 16.9, 10.0 | 0.00094, 0.00109, 0.00087 | 0.000026, 0.000028, 0.000037 | 2.8, 2.5, 4.2 |
+| 5 rays, 4 passes (selected) | 9.8, 9.0, 8.3 | 0.00094, 0.00109, 0.00082 | 0.000030, 0.000030, 0.000037 | 3.2, 2.8, 4.6 |
+
+The mean light of the measurements is before the strength. A flat surface is three pixels on one plane along x. The GPU time changes much from run to run. 8 rays was too slow (16.9 ms of the 16.7 ms of a frame at 60 frames per second).
+
+Verification:
+
+- The shader source compiled offline with `xcrun metal` with no warning. `make app` built the app (only the two known `key_frame` warnings of `wmvcore.c`).
+- Headless run of 90 s, High, with all other enhancements on, `MTL_DEBUG_LAYER=1` and `MTL_SHADER_VALIDATION=1`: 3600 frames, no Metal validation error.
+- Headless run of 60 s, Low, with `MTL_DEBUG_LAYER=1`: 3600 frames, no Metal validation error.
+- Frame time, High, all other enhancements on: 10.00 s for each 600 frames (60 frames per second, the frame pacing limit).
+- Not verified: the image on the screen (screenshots are not permitted).

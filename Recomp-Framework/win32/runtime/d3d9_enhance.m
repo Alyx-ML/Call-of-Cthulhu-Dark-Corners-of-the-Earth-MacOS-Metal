@@ -88,16 +88,24 @@
 // used). The pass runs at half the size of the back buffer. For each pixel, gi_main makes the view position and the
 // normal from the depth buffer and sends GI_RAYS rays in a cosine-weighted hemisphere around the normal. Each ray
 // takes GI_STEPS steps out to GI_RADIUS, with more steps near the pixel. A step whose position is behind the depth
-// buffer by less than the thickness (GI_THICK + 2% of the view distance) is a hit: the ray gets the linear color of
-// the back buffer at that pixel. A ray that leaves the screen, or that only passes behind thicker surfaces, gets no
-// light. The result is the mean of the rays (the irradiance / pi of a cosine-weighted estimate). The noise is fixed
-// for each pixel (the Hilbert index, as in XeGTAO), so the image does not flicker. gi_denoise then filters three
-// times (an a-trous 3 x 3 filter at the distances 1, 2 and 4) with a depth weight. The composite (enh_fs) up-samples
+// buffer by less than the thickness (GI_THICK + 2% of the view distance) is a hit. Three bisection steps between the
+// hit step and the step before it find the surface. The hit surface gives light only from its front side: the
+// light is 0 when the normal of the hit surface faces away from the ray, with a smooth step from 0 to 0.2 of the
+// cosine. The light of the hit comes from a color pyramid (gi_color0, gi_colordown): the linear back buffer at half
+// size and GI_MIPS - 1 smaller levels, made only from the pixels with a surface (not the sky). The level is the one whose pixel is near the screen distance between two
+// steps, so a far hit gets the mean color of an area and not the color of one texel. This decreases the noise. A
+// ray that leaves the screen, or that only passes behind thicker surfaces, gets no light. The result is the mean of
+// the rays (the irradiance / pi of a cosine-weighted estimate). The noise is fixed for each pixel (the Hilbert
+// index, as in XeGTAO), so the image does not flicker. gi_denoise then filters GI_PASSES (4) times (an a-trous 3 x 3
+// filter at the distances 1, 2, 4 and 8) with a depth weight and a normal weight (the cosine between the normals to the power
+// 8), so the light does not mix across corners. The composite (enh_fs) up-samples
 // the result with depth weights and adds strength x albedo x result to the linear color. The game has no albedo
 // buffer, so the albedo comes from the pixel's color: its chroma (the color / its luminance, at most 3) x 0.4, at most
 // 0.9. Thus the bounce light keeps the color of the surface that it lights. The light can come only from surfaces on
-// the screen. The levels low, medium and high use 2, 3 and 4 rays, 12, 16 and 20 steps and the strength 0.5, 1.0 and
-// 1.5 (UNCONFIRMED tuning). The radius is 3 m and the thickness 0.3 m (UNCONFIRMED tuning).
+// the screen. The levels low, medium and high use 2, 3 and 5 rays, 12, 16 and 20 steps and the strength 0.75, 1.5
+// and 2.25 (UNCONFIRMED tuning). The front-side test removes light that leaked through objects: it decreased the mean
+// light of the result by approximately one third (measured in the town), so the strengths are 1.5 x the strengths
+// before the test. The radius is 3 m and the thickness 0.3 m (UNCONFIRMED tuning).
 //
 // Settings: XeGTAO falloff range 0.615, sample distribution power 2, depth mip offset 3.30, denoise beta 1.2. The
 // levels low, medium and high use 1 x 2, 2 x 2 and 3 x 3 slices x steps, an effect radius of 0.8, 1.2 and 1.6 m
@@ -122,6 +130,9 @@
 #define CONTACT_STRENGTH 0.6f
 #define GI_RADIUS (3.0f * UNIT_SCALE)   // the length of a global illumination ray (UNCONFIRMED tuning)
 #define GI_THICK (0.3f * UNIT_SCALE)    // the thickness of a surface of the depth buffer, plus 2% of its distance
+#define GI_MIPS 5u                      // the levels of the global illumination color pyramid (half size and smaller)
+#define GI_PASSES 4                     // a-trous denoise passes, at the distances 1, 2, 4 and 8
+#define GI_OUT ((GI_PASSES & 1) ? E.gi1 : E.gi0)   // the texture of the last denoise pass
 
 static const char enh_src[] =
     "#include <metal_stdlib>\n"
@@ -398,7 +409,7 @@ static const char enh_src[] =
     "static float3 to_lin(float3 c) { c = max(c, 0.0); return select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045); }\n"
     "static float3 to_srgb(float3 l) { l = max(l, 0.0); return select(1.055 * pow(l, 1.0 / 2.4) - 0.055, l * 12.92, l <= 0.0031308); }\n"
     // screen-space global illumination (see the comment at the top of the file)
-    "struct GIC { float mulx, muly, addx, addy, da, db, px, py, radius, thick, sw, sh; uint rays, steps, pad0, pad1; };\n"
+    "struct GIC { float mulx, muly, addx, addy, da, db, px, py, radius, thick, sw, sh; uint rays, steps, lods, pad1; };\n"
     "static float gi_z(depth2d<float, access::read> dt, int2 q, constant GIC &c) {\n"
     "  float d = dt.read(uint2(q));\n"
     "  if (d >= 1.0) return SKY;\n"
@@ -408,18 +419,11 @@ static const char enh_src[] =
     "static float3 gi_pos(float2 sp, float z, constant GIC &c) { return float3((float2(c.mulx, c.muly) * sp + float2(c.addx, c.addy)) * z, z); }\n"
     // the screen position (0 .. 1) of a view position: the inverse of gi_pos
     "static float2 gi_proj(float3 v, constant GIC &c) { return (v.xy / v.z - float2(c.addx, c.addy)) / float2(c.mulx, c.muly); }\n"
-    // out: rgb the mean light of the rays (linear), a the view distance of the pixel (SKY: no surface)
-    "kernel void gi_main(depth2d<float, access::read> dt [[texture(0)]], texture2d<float, access::read> col [[texture(1)]],\n"
-    "  texture2d<float, access::write> out [[texture(2)]], texture2d<ushort, access::read> hl [[texture(3)]],\n"
-    "  constant GIC &c [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {\n"
-    "  if (p.x >= out.get_width() || p.y >= out.get_height()) return;\n"
+    // the unit view normal at the full-size pixel q (view position P), toward the camera, from the neighbor with the
+    // smaller depth step on each axis; 0 when the normal has no length
+    "static float3 gi_nrm(depth2d<float, access::read> dt, int2 q, float3 P, constant GIC &c) {\n"
     "  int2 mx = int2(int(c.sw) - 1, int(c.sh) - 1);\n"
-    "  int2 q = min(int2(p) * 2, mx);\n"
-    "  float z = gi_z(dt, q, c);\n"
-    "  if (z >= SKY * 0.5) { out.write(float4(0.0, 0.0, 0.0, SKY), p); return; }\n"
     "  float2 px = float2(c.px, c.py), sp = (float2(q) + 0.5) * px;\n"
-    "  float3 P = gi_pos(sp, z, c);\n"
-    // the normal from the neighbor with the smaller depth step on each axis, toward the camera
     "  float3 pl = gi_pos(sp - float2(px.x, 0.0), gi_z(dt, clamp(q - int2(1, 0), int2(0), mx), c), c);\n"
     "  float3 pr = gi_pos(sp + float2(px.x, 0.0), gi_z(dt, clamp(q + int2(1, 0), int2(0), mx), c), c);\n"
     "  float3 pt = gi_pos(sp - float2(0.0, px.y), gi_z(dt, clamp(q - int2(0, 1), int2(0), mx), c), c);\n"
@@ -428,9 +432,49 @@ static const char enh_src[] =
     "  float3 dy = abs(pb.z - P.z) < abs(P.z - pt.z) ? pb - P : P - pt;\n"
     "  float3 N = cross(dx, dy);\n"
     "  float nn = dot(N, N);\n"
-    "  if (!(nn > 1e-24)) { out.write(float4(0.0, 0.0, 0.0, z), p); return; }\n"
+    "  if (!(nn > 1e-24)) return float3(0.0);\n"
     "  N *= rsqrt(nn);\n"
-    "  if (dot(N, P) > 0.0) N = -N;\n"
+    "  return dot(N, P) > 0.0 ? -N : N;\n"
+    "}\n"
+    // level 0 of the color pyramid at half size, from 2 x 2 back buffer pixels: rgb the sum of the linear colors of
+    // the pixels with a surface / 4, a the part of the pixels with a surface (the sky does not darken the mean)
+    "kernel void gi_color0(texture2d<float, access::read> col [[texture(0)]], texture2d<float, access::write> o [[texture(1)]],\n"
+    "  depth2d<float, access::read> dt [[texture(2)]], uint2 p [[thread_position_in_grid]]) {\n"
+    "  if (p.x >= o.get_width() || p.y >= o.get_height()) return;\n"
+    "  int2 mx = int2(int(col.get_width()) - 1, int(col.get_height()) - 1), q = int2(p) * 2;\n"
+    "  float4 s = float4(0.0);\n"
+    "  for (int i = 0; i < 4; i++) {\n"
+    "    uint2 qq = uint2(min(q + int2(i & 1, i >> 1), mx));\n"
+    "    if (dt.read(qq) < 1.0) s += float4(to_lin(col.read(qq).rgb), 1.0);\n"
+    "  }\n"
+    "  o.write(s * 0.25, p);\n"
+    "}\n"
+    // the next level of the color pyramid: the mean of 2 x 2 pixels of the level before it
+    "kernel void gi_colordown(texture2d<float, access::read> a [[texture(0)]], texture2d<float, access::write> o [[texture(1)]],\n"
+    "  uint2 p [[thread_position_in_grid]]) {\n"
+    "  if (p.x >= o.get_width() || p.y >= o.get_height()) return;\n"
+    "  int2 mx = int2(int(a.get_width()) - 1, int(a.get_height()) - 1), q = int2(p) * 2;\n"
+    "  float4 s = a.read(uint2(min(q, mx))) + a.read(uint2(min(q + int2(1, 0), mx)))\n"
+    "           + a.read(uint2(min(q + int2(0, 1), mx))) + a.read(uint2(min(q + int2(1, 1), mx)));\n"
+    "  o.write(s * 0.25, p);\n"
+    "}\n"
+    // out: rgb the mean light of the rays (linear), a the view distance of the pixel (SKY: no surface);
+    // nout: xyz the view normal of the pixel (0: none)
+    "kernel void gi_main(depth2d<float, access::read> dt [[texture(0)]], texture2d<float> gc [[texture(1)]],\n"
+    "  texture2d<float, access::write> out [[texture(2)]], texture2d<ushort, access::read> hl [[texture(3)]],\n"
+    "  texture2d<float, access::write> nout [[texture(4)]],\n"
+    "  constant GIC &c [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {\n"
+    "  if (p.x >= out.get_width() || p.y >= out.get_height()) return;\n"
+    "  constexpr sampler ls(coord::normalized, address::clamp_to_edge, filter::linear, mip_filter::linear);\n"
+    "  int2 mx = int2(int(c.sw) - 1, int(c.sh) - 1);\n"
+    "  int2 q = min(int2(p) * 2, mx);\n"
+    "  float z = gi_z(dt, q, c);\n"
+    "  if (z >= SKY * 0.5) { out.write(float4(0.0, 0.0, 0.0, SKY), p); nout.write(float4(0.0), p); return; }\n"
+    "  float2 px = float2(c.px, c.py), sp = (float2(q) + 0.5) * px;\n"
+    "  float3 P = gi_pos(sp, z, c);\n"
+    "  float3 N = gi_nrm(dt, q, P, c);\n"
+    "  nout.write(float4(N, 0.0), p);\n"
+    "  if (dot(N, N) < 0.5) { out.write(float4(0.0, 0.0, 0.0, z), p); return; }\n"
     "  float3 T = normalize(abs(N.y) < 0.99 ? cross(N, float3(0.0, 1.0, 0.0)) : cross(N, float3(1.0, 0.0, 0.0)));\n"
     "  float3 B = cross(N, T);\n"
     "  uint hi = hl.read(uint2(q) % 64u).r;\n"
@@ -443,6 +487,7 @@ static const char enh_src[] =
     "    float rr = sqrt(u1), ph = 2.0 * M_PI_F * u2;\n"
     "    float3 d = T * (rr * cos(ph)) + B * (rr * sin(ph)) + N * sqrt(max(0.0, 1.0 - u1));\n"
     "    float jit = fract(n0 + n1 + float(r) * 0.5698402909980533);\n"
+    "    float fp = 0.0;\n"   // the ray parameter of the last step in front of the depth buffer
     "    for (uint s = 0; s < c.steps; s++) {\n"
     "      float f = (float(s) + jit) / float(c.steps);\n"
     "      float3 Q = O + d * (c.radius * f * f + z * 0.01);\n"
@@ -451,22 +496,48 @@ static const char enh_src[] =
     "      if (any(qs < 0.0) || any(qs >= 1.0)) break;\n"
     "      int2 qi = min(int2(qs * ss), mx);\n"
     "      float zs = gi_z(dt, qi, c), dz = Q.z - zs;\n"
-    "      if (dz > 0.0 && dz < c.thick + zs * 0.02) { acc += to_lin(col.read(uint2(qi)).rgb); break; }\n"
+    "      if (dz > 0.0 && dz < c.thick + zs * 0.02) {\n"
+    // three bisection steps between the last step in front of the surface and this step
+    "        float lo = fp, hi = f;\n"
+    "        for (uint b = 0; b < 3u; b++) {\n"
+    "          float fm = 0.5 * (lo + hi);\n"
+    "          float3 Qm = O + d * (c.radius * fm * fm + z * 0.01);\n"
+    "          int2 qm = clamp(int2(gi_proj(Qm, c) * ss), int2(0), mx);\n"
+    "          if (Qm.z - gi_z(dt, qm, c) > 0.0) hi = fm; else lo = fm;\n"
+    "        }\n"
+    "        Q = O + d * (c.radius * hi * hi + z * 0.01);\n"
+    "        qs = clamp(gi_proj(Q, c), float2(0.0), float2(1.0));\n"
+    "        qi = min(int2(qs * ss), mx);\n"
+    // the hit surface gives light only from its front side: no light when it faces away from the pixel
+    "        float3 Nh = gi_nrm(dt, qi, gi_pos((float2(qi) + 0.5) * px, gi_z(dt, qi, c), c), c);\n"
+    "        float wf = dot(Nh, Nh) < 0.5 ? 1.0 : smoothstep(0.0, 0.2, -dot(Nh, d));\n"
+    // the color of the hit from the pyramid level whose pixel is near the distance between two steps
+    "        float lod = clamp(log2(max(length((qs - sp) * ss) * 0.5 / float(c.steps), 1.0)), 0.0, float(c.lods));\n"
+    "        float4 cs = gc.sample(ls, qs, level(lod));\n"
+    "        if (cs.a > 1e-3) acc += cs.rgb / cs.a * wf;\n"
+    "        break;\n"
+    "      }\n"
+    "      fp = f;\n"
     "    }\n"
     "  }\n"
     "  out.write(float4(acc / float(c.rays), z), p);\n"
     "}\n"
-    // a-trous 3 x 3 filter at the distance st (half-size pixels) with a depth weight
+    // a-trous 3 x 3 filter at the distance st (half-size pixels) with a depth weight and a normal weight
     "kernel void gi_denoise(texture2d<float, access::read> a [[texture(0)]], texture2d<float, access::write> o [[texture(1)]],\n"
+    "  texture2d<float, access::read> nt [[texture(2)]],\n"
     "  constant int &st [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {\n"
     "  if (p.x >= o.get_width() || p.y >= o.get_height()) return;\n"
     "  int2 mx = int2(int(a.get_width()) - 1, int(a.get_height()) - 1);\n"
     "  float4 cc = a.read(p);\n"
     "  if (cc.a >= SKY * 0.5) { o.write(cc, p); return; }\n"
+    "  float3 n0 = nt.read(p).xyz;\n"
+    "  bool hn = dot(n0, n0) > 0.5;\n"
     "  float3 s = float3(0.0); float ws = 0.0;\n"
     "  for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {\n"
-    "    float4 v = a.read(uint2(clamp(int2(p) + int2(x, y) * st, int2(0), mx)));\n"
+    "    uint2 qn = uint2(clamp(int2(p) + int2(x, y) * st, int2(0), mx));\n"
+    "    float4 v = a.read(qn);\n"
     "    float w = (x == 0 ? 2.0 : 1.0) * (y == 0 ? 2.0 : 1.0) * saturate(1.0 - abs(v.a - cc.a) / (cc.a * 0.03));\n"
+    "    if (hn && (x != 0 || y != 0)) w *= pow(saturate(dot(n0, nt.read(qn).xyz)), 8.0);\n"
     "    s += v.rgb * w; ws += w;\n"
     "  }\n"
     "  o.write(float4(s / ws, cc.a), p);\n"
@@ -612,7 +683,7 @@ typedef struct { float sx, sy, px, py, mulx, muly, addx, addy, mpx, mpy, da, db,
 typedef struct { float light[4]; int32_t offset[2]; float far_z, near_z, thickness, bilinear, contrast, pad, da, db, fade_start, fade_end; } SSSP;
 typedef struct { float beta; uint32_t ao, contact; float strength; float light[4]; float mulx, muly, addx, addy, da, db, px, py;
                  uint32_t gi; float gik, pad0, pad1; } CC;
-typedef struct { float mulx, muly, addx, addy, da, db, px, py, radius, thick, sw, sh; uint32_t rays, steps, pad0, pad1; } GIC;
+typedef struct { float mulx, muly, addx, addy, da, db, px, py, radius, thick, sw, sh; uint32_t rays, steps, lods, pad1; } GIC;
 typedef struct { int32_t count[3]; int32_t offset[2]; } SssDispatch;
 
 typedef struct { float px[2]; float k, inv; } BP;
@@ -624,15 +695,15 @@ static const float ao_radius[4] = {0.0f, 0.8f, 1.2f, 1.6f}, ao_power[4] = {0.0f,
 #define BLOOM_LEVELS 6
 static const float bloom_intensity[4] = {0.0f, 0.04f, 0.08f, 0.15f};   // k of the composite
 // the global illumination levels: rays per pixel, steps per ray, strength (UNCONFIRMED tuning)
-static const uint32_t gi_rays[4] = {0, 2, 3, 4}, gi_steps[4] = {0, 12, 16, 20};
-static const float gi_strength[4] = {0.0f, 0.5f, 1.0f, 1.5f};
+static const uint32_t gi_rays[4] = {0, 2, 3, 5}, gi_steps[4] = {0, 12, 16, 20};
+static const float gi_strength[4] = {0.0f, 0.75f, 1.5f, 2.25f};
 
 static struct {
     id<MTLDevice> dev;
     id<MTLLibrary> lib;
-    id<MTLComputePipelineState> prefilter, main_pso[4], denoise, sss, gi_main, gi_denoise;
+    id<MTLComputePipelineState> prefilter, main_pso[4], denoise, sss, gi_main, gi_denoise, gi_color0, gi_colordown;
     id<MTLRenderPipelineState> apply; MTLPixelFormat apply_fmt;
-    id<MTLTexture> hilbert, depths, mip[AO_MIPS], ao0, ao1, edges, shadow, gi0, gi1;
+    id<MTLTexture> hilbert, depths, mip[AO_MIPS], ao0, ao1, edges, shadow, gi0, gi1, gin, gc, gcm[GI_MIPS];
     id<MTLRenderPipelineState> bloom_pre, bloom_down, bloom_up, bloom_comp; MTLPixelFormat bloom_comp_fmt;
     id<MTLTexture> bloom_lv[BLOOM_LEVELS];
     id<MTLComputePipelineState> taa_motion;
@@ -693,6 +764,8 @@ static void setup(id<MTLDevice> dev) {
     E.taa_motion = kernel_of(@"taa_motion", nil);
     E.gi_main = kernel_of(@"gi_main", nil);
     E.gi_denoise = kernel_of(@"gi_denoise", nil);
+    E.gi_color0 = kernel_of(@"gi_color0", nil);
+    E.gi_colordown = kernel_of(@"gi_colordown", nil);
 }
 static id<MTLTexture> tex_of(id<MTLTexture> __strong *slot, NSUInteger w, NSUInteger h, MTLPixelFormat fmt, NSUInteger mips) {
     id<MTLTexture> t = *slot;
@@ -808,23 +881,47 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
             NSUInteger hw = (w + 1) / 2, hh = (h + 1) / 2;
             tex_of(&E.gi0, hw, hh, MTLPixelFormatRGBA16Float, 1);
             tex_of(&E.gi1, hw, hh, MTLPixelFormatRGBA16Float, 1);
+            tex_of(&E.gin, hw, hh, MTLPixelFormatRGBA16Float, 1);
+            if (!E.gc || E.gc.width != hw || E.gc.height != hh) {
+                tex_of(&E.gc, hw, hh, MTLPixelFormatRGBA16Float, GI_MIPS);
+                for (NSUInteger i = 0; i < GI_MIPS; i++) {
+                    E.gcm[i] = [E.gc newTextureViewWithPixelFormat:MTLPixelFormatRGBA16Float textureType:MTLTextureType2D
+                                                            levels:NSMakeRange(i, 1) slices:NSMakeRange(0, 1)];
+                    if (!E.gcm[i]) rt_fatal("[d3d9] Metal did not create a global illumination color level view");
+                }
+            }
             GIC g = {k.mulx, k.muly, k.addx, k.addy, da, db, k.px, k.py, GI_RADIUS, GI_THICK, (float)w, (float)h,
-                     gi_rays[gi], gi_steps[gi], 0, 0};
+                     gi_rays[gi], gi_steps[gi], GI_MIPS - 1, 0};
             if (!E.logged_gi) {
-                rt_log("[d3d9] screen-space global illumination %lux%lu (computed at %lux%lu): %u rays x %u steps, strength %.2f",
-                       (unsigned long)w, (unsigned long)h, (unsigned long)hw, (unsigned long)hh, gi_rays[gi], gi_steps[gi], gi_strength[gi]);
+                rt_log("[d3d9] screen-space global illumination %lux%lu (computed at %lux%lu): %u rays x %u steps, strength %.2f, "
+                       "color pyramid of %u levels, 3 bisection steps for each hit, %d normal-weighted denoise passes",
+                       (unsigned long)w, (unsigned long)h, (unsigned long)hw, (unsigned long)hh, gi_rays[gi], gi_steps[gi], gi_strength[gi], GI_MIPS, GI_PASSES);
                 E.logged_gi = 1;
+            }
+            // the color pyramid: the linear back buffer at half size, then each level from the level before it
+            [ce setComputePipelineState:E.gi_color0];
+            [ce setTexture:color atIndex:0];
+            [ce setTexture:E.gcm[0] atIndex:1];
+            [ce setTexture:depth atIndex:2];
+            [ce dispatchThreads:MTLSizeMake(hw, hh, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+            [ce setComputePipelineState:E.gi_colordown];
+            for (NSUInteger i = 1; i < GI_MIPS; i++) {
+                [ce setTexture:E.gcm[i - 1] atIndex:0];
+                [ce setTexture:E.gcm[i] atIndex:1];
+                [ce dispatchThreads:MTLSizeMake(E.gcm[i].width, E.gcm[i].height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
             }
             [ce setComputePipelineState:E.gi_main];
             [ce setBytes:&g length:sizeof g atIndex:0];
             [ce setTexture:depth atIndex:0];
-            [ce setTexture:color atIndex:1];
+            [ce setTexture:E.gc atIndex:1];
             [ce setTexture:E.gi0 atIndex:2];
             [ce setTexture:E.hilbert atIndex:3];
+            [ce setTexture:E.gin atIndex:4];
             [ce dispatchThreads:MTLSizeMake(hw, hh, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-            // three a-trous passes (distances 1, 2, 4): gi0 -> gi1 -> gi0 -> gi1
+            // GI_PASSES a-trous passes (distances 1, 2, 4, ...): gi0 -> gi1 -> gi0 -> ...
             [ce setComputePipelineState:E.gi_denoise];
-            for (int i = 0; i < 3; i++) {
+            [ce setTexture:E.gin atIndex:2];
+            for (int i = 0; i < GI_PASSES; i++) {
                 int32_t st = 1 << i;
                 [ce setBytes:&st length:sizeof st atIndex:0];
                 [ce setTexture:(i & 1) ? E.gi1 : E.gi0 atIndex:0];
@@ -907,12 +1004,12 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
         [re setRenderPipelineState:apply_pso(color.pixelFormat)];
         // every texture argument is bound; the feature flags in k select the ones the shader reads. `any` is a texture
         // of an effect of this frame (the arguments of the effects that are off get it)
-        id<MTLTexture> any = ao ? E.ao1 : contact ? E.shadow : E.gi1;
+        id<MTLTexture> any = ao ? E.ao1 : contact ? E.shadow : GI_OUT;
         [re setFragmentTexture:ao ? E.ao1 : any atIndex:0];
         [re setFragmentTexture:ao ? E.edges : any atIndex:1];
         [re setFragmentTexture:contact ? E.shadow : any atIndex:2];
         [re setFragmentTexture:depth atIndex:3];
-        [re setFragmentTexture:gi ? E.gi1 : any atIndex:4];
+        [re setFragmentTexture:gi ? GI_OUT : any atIndex:4];
         [re setFragmentBytes:&k length:sizeof k atIndex:0];
         [re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [re endEncoding];
