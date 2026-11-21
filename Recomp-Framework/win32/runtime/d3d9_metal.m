@@ -2211,10 +2211,32 @@ static void ff_vs_key(Device *d, FFVSKey *k, int points) {
     k->points = (uint8_t)points;
     k->point_scale = points && S->rs[RS_POINTSCALEENABLE];
 }
+// d3d9_enh_grain: the stage of the game's film grain, and whether this draw has it
+static struct { int on, logged; uint32_t w, h, fmt, stage, op; } enh_grain;
+void d3d9_enh_grain(uint32_t w, uint32_t h, uint32_t fmt, uint32_t stage, uint32_t op) {
+    if (!w || !h || stage < 1 || stage > 7 || op < 2 || op > 26)
+        rt_fatal("[d3d9] d3d9_enh_grain: bad grain texture %ux%u, stage %u or operation %u", w, h, stage, op);
+    enh_grain.w = w; enh_grain.h = h; enh_grain.fmt = fmt; enh_grain.stage = stage; enh_grain.op = op; enh_grain.on = 1;
+}
+static Tex *bound_tex(Device *d, int s);
+static int enh_grain_off(Device *d, int i) {
+    if (!enh_grain.on || !rt_enh || rt_enh->grain != 1 || (uint32_t)i != enh_grain.stage || d->st.tss[i][TSS_COLOROP] != enh_grain.op) return 0;
+    Tex *t = bound_tex(d, i);
+    if (!t || t->w != enh_grain.w || t->h != enh_grain.h || t->fmt != enh_grain.fmt) return 0;
+    if (!enh_grain.logged) {
+        rt_log("[d3d9] film grain off: frame %u, a draw with the grain texture (%ux%u, format %u) at stage %u has stages 0 to %u only",
+               d->frame + 1, t->w, t->h, t->fmt, (uint32_t)i, (uint32_t)i - 1);
+        enh_grain.logged = 1;
+    }
+    return 1;
+}
 static void ff_ps_key(Device *d, FFPSKey *k) {
     State *S = &d->st;
     for (int i = 0; i < 8; i++) {
         const uint32_t *t = S->tss[i];
+        // the film grain off (rt_enh.h): this stage and the stages after it are disabled (D3DTOP_DISABLE), so the draw
+        // gives the result of the stages before it
+        if (enh_grain_off(d, i)) { k->st[i].cop = 1; k->st[i].aop = 1; break; }
         k->st[i].cop = (uint8_t)t[TSS_COLOROP]; k->st[i].aop = (uint8_t)t[TSS_ALPHAOP];
         k->st[i].ca[0] = (uint8_t)t[TSS_COLORARG0]; k->st[i].ca[1] = (uint8_t)t[TSS_COLORARG1]; k->st[i].ca[2] = (uint8_t)t[TSS_COLORARG2];
         k->st[i].aa[0] = (uint8_t)t[TSS_ALPHAARG0]; k->st[i].aa[1] = (uint8_t)t[TSS_ALPHAARG1]; k->st[i].aa[2] = (uint8_t)t[TSS_ALPHAARG2];
@@ -2611,7 +2633,7 @@ static void enh_note_draw(Device *d) {
     if (!d->ds && enh_is_light_target(r0) && S->vs && d->enh_light_frame != f) {
         if (enh_light_of((const float (*)[4])S->vsf[enh_lp.creg], d->enh_sc.light)) d->enh_light_frame = f;
     }
-    if (rt_enh->ao <= 0 && rt_enh->contact <= 0 && rt_enh->bloom <= 0 && rt_enh->tonemap != 1 && rt_enh->hdr != 1 && rt_enh->aa != 1) return;
+    if (rt_enh->ao <= 0 && rt_enh->contact <= 0 && rt_enh->gi <= 0 && rt_enh->bloom <= 0 && rt_enh->tonemap != 1 && rt_enh->hdr != 1 && rt_enh->aa != 1) return;
     if (d->enh_done == f) return;
     if (rt_enh->contact > 0 && r0->swap && S->vs && S->vs->lv) enh_light_note(d, f, S);
     if (r0->swap && d->ds && S->rs[RS_ZENABLE] && S->rs[RS_ZWRITEENABLE] && !S->rs[RS_ALPHABLENDENABLE]) {
@@ -2680,8 +2702,8 @@ static void enh_apply(Device *d) {
         memcpy(d->enh_sc.light, enh_ld.dir, sizeof enh_ld.dir); d->enh_sc.light[3] = 0.0f;
         d->enh_sc.have_light = 1;
     } else if (!enh_lvs.on) d->enh_sc.have_light = d->enh_light_frame == f;
-    int ao = rt_enh->ao, contact = rt_enh->contact, taa = rt_enh->aa == 1, have_cam = !enh_camvs.on;
-    if (enh_camvs.on && (ao > 0 || contact > 0 || taa)) {
+    int ao = rt_enh->ao, contact = rt_enh->contact, gi = rt_enh->gi, taa = rt_enh->aa == 1, have_cam = !enh_camvs.on;
+    if (enh_camvs.on && (ao > 0 || contact > 0 || gi > 0 || taa)) {
         // the camera with the most draws (the level geometry, whose world transform is the identity)
         uint32_t best = 0, n = d->enh_cam_frame == f ? d->enh_ncam : 0;
         for (uint32_t i = 1; i < n; i++) if (d->enh_cam[i].n > d->enh_cam[best].n) best = i;
@@ -2696,14 +2718,14 @@ static void enh_apply(Device *d) {
             }
         } else {
             // no draw of this frame had a perspective camera (a menu, a loading screen): no scene passes
-            ao = contact = 0;
+            ao = contact = gi = 0;
         }
     }
     if (enh_lvs.on) {
         d->enh_sc.have_light = contact > 0 && enh_light_pick(d, f, d->enh_sc.view);
         memcpy(d->enh_sc.light, d->enh_lv, sizeof d->enh_lv);
     }
-    d3d9_enh_scene(d->mtl, d->cmd, d->enh_color, d->enh_depth, &d->enh_sc, ao, contact);
+    d3d9_enh_scene(d->mtl, d->cmd, d->enh_color, d->enh_depth, &d->enh_sc, ao, contact, gi);
     if (taa) {
         // the motion of the camera from the last frame: inverse(this view-projection) x the last view-projection
         float o[2], vp[16], iv[16], rp[16];
@@ -3124,9 +3146,10 @@ static void gamma_reset(Swap *sw) { for (int i = 0; i < 256; i++) for (int c = 0
 //   CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 //   DEALINGS IN THE SOFTWARE.
 //
-// The curve parameters are those of the reference (alpha 0.25, mid point 0.538, linear section 0.444, blend ratio 0.6,
-// chroma fade 0.98 .. 1.16), except the toe strength: 1.0, not 1.280 (present_tm_consts). The units are those of the
-// reference: frame-buffer units, 1.0 = 100 nits.
+// The curve parameters are those of the reference (alpha 0.25, mid point 0.538, linear section 0.444, toe strength
+// 1.280, blend ratio 0.6, chroma fade 0.98 .. 1.16), in the units of the reference: frame-buffer units, 1.0 = 100 nits.
+// The toe darkens the colors below the mid point (53.8 nits), as in the reference. Calculated: the game's gray sRGB 0.1
+// keeps 43% of its light in SDR, and 72% in HDR with paper white 2.13 x SDR white (SDR white 600 nits, peak 1600 nits).
 //   SDR output (initializeAsSDR): the target is 2.5 (the SDR paper white of 250 nits of the reference); the game's
 //   white is at that paper white (expo 2.5), and the output is divided by 2.5 (oscale 0.4). Thus the colors between
 //   the mid point and the linear section (linear 0.215 .. 0.444) do not change.
@@ -3150,10 +3173,7 @@ static void present_tm_consts(PresentTM *k, uint32_t mode, float paper, float pe
     k->rel = peak > paper ? peak / paper : 1.0f;
     k->w = (float)w; k->h = (float)h;
     k->gt = gt; k->expo = expo; k->oscale = oscale;
-    // toe 1.0, not the 1.280 of the reference: the game's image is already tone mapped and has its own toe, and a second
-    // toe darkened its shadows (sRGB 0.1: 0.56 x in HDR, 0.43 x in SDR). With 1.0 the curve is linear below the linear
-    // section, so the shadows and the midtones stay those of the game; the shoulder above the linear section stays.
-    const float alpha = 0.25f, mid = 0.538f, lin = 0.444f, toe = 1.0f;
+    const float alpha = 0.25f, mid = 0.538f, lin = 0.444f, toe = 1.280f;
     float kk = (lin - 1.0f) / (alpha - 1.0f);
     k->kA = gt * lin + gt * kk;
     k->kB = -gt * kk * expf(lin / kk);

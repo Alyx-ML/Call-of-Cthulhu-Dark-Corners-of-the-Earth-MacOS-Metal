@@ -877,3 +877,53 @@ Correction (`d3d9_metal.m`, `ps_consts_header` and the pixel shader entry point;
 - `make app` built the app (only the two known `key_frame` warnings of `wmvcore.c`).
 - Headless run of 90 s from a copy of the user's town save, with `MTL_DEBUG_LAYER=1`: no Metal validation error, no translation error, 4200 frames. The dumped Metal source of all 29 pixel shaders has the clamp.
 - Not verified: the image on the screen. Screenshots are not permitted, and the value of v0 under the character was not measured.
+
+## 2026-11-21: Global illumination (RTGI)
+
+Request (user): add RTGI to the game as a setting in the menus. The user selected screen-space ray tracing (as the RTGI shader of ReShade), not hardware ray tracing.
+
+Changes:
+
+- `Recomp-Framework/win32/runtime/rt_enh.h`: the new field `gi` of `RtEnh` (0 off, 1 to 3 low, medium, high). `d3d9_enh_scene` has the new argument `gi`.
+- `Recomp-Framework/win32/runtime/d3d9_enhance.m`: the new kernels `gi_main` and `gi_denoise`, and the global illumination in the composite `enh_fs`. The method is in the comment at the top of the file. `to_lin` and `to_srgb` moved above the composite, so that the composite can use them. The bloom uses them as before.
+- `Recomp-Framework/win32/runtime/d3d9_metal.m`: the scene passes run when `gi` is on, and a frame with no scene camera gets no global illumination.
+- `CoC-Recomp/enhance.c`: the setting **Global Illumination (RTGI)** (Off, Low, Medium, High) in Options > Enhancements, after Raw Mouse Input. The key `global_illumination` in `Enhancements.cfg` (default 0). The menu has 13 settings.
+- `CoC-Recomp/launcher.m`: the same setting in the Graphics panel of the launcher window.
+
+The pass needs only the projection of the scene camera, not the camera motion from frame to frame. Thus the errors of the camera motion that the anti-aliasing investigation found do not affect it.
+
+Limits:
+
+- The light comes only from surfaces on the screen. A surface behind the camera, off the screen or behind another surface gives no light.
+- The game has no albedo buffer. The albedo comes from the chroma of the pixel color (UNCONFIRMED approximation).
+- The ray length (3 m), the thickness (0.3 m) and the strengths (0.5, 1.0, 1.5) are UNCONFIRMED tuning.
+
+Verification:
+
+- `make app` built the app (only the two known `key_frame` warnings of `wmvcore.c`).
+- Headless run from a copy of the user's town save, High, with all other enhancements on, `MTL_DEBUG_LAYER=1` and `MTL_SHADER_VALIDATION=1`: 1800 frames, no Metal validation error. The log shows "screen-space global illumination 1800x1125 (computed at 900x563): 4 rays x 20 steps, strength 1.50" and "menu ENHANCEDOPTIONS registered (13 settings)".
+- Headless run with Low alone (ambient occlusion and contact shadows off), `MTL_DEBUG_LAYER=1`: 2400 frames, no Metal validation error.
+- Frame time (time stamps of the log, 600 frames for each report, 1800 × 1125, all other enhancements on): High 10.3 to 10.8 s (56 to 58 frames per second); off 10.0 s (60 frames per second, the frame pacing limit).
+- Not verified: the image on the screen (screenshots and pixel readback are not permitted for this task), the launcher window on the screen, and the menu on the screen.
+
+## 2026-11-21: GT7 tone mapping with the reference toe, and Film Grain
+
+Request (user): GT7 tone mapping did not seem to work, and the user wants proper GT7 tone mapping. Also, the user wants a way to remove the film grain of the game.
+
+Cause of the GT7 problem: the curve had a toe strength of 1.0, not the 1.280 of the reference. With toe 1.0, the curve has no effect below the linear section (lin 0.444 x the peak). In the town at night, the maximum scene value before the game's post-processing was 0.271 (no pixel above 1.0). Thus the curve did not change the image.
+
+Changes:
+
+- `Recomp-Framework/win32/runtime/d3d9_metal.m`: the GT7 toe strength is 1.280, as in the reference. The comment gives the calculated effect: the gray sRGB 0.1 of the game keeps 43% of its light in SDR, and 72% in HDR with the settings of the user (paper white 2.13 x SDR white, SDR white 600 nits, peak 1600 nits).
+- `Recomp-Framework/win32/runtime/d3d9_metal.m`: the new function `d3d9_enh_grain` sets the grain texture of the game (size, format, stage and color operation). When `grain` is 1, the fixed-function pixel key of a draw with that texture at that stage and that color operation stops at that stage. The draw then copies the image without the noise.
+- `Recomp-Framework/win32/runtime/rt_enh.h`: the new field `grain` of `RtEnh` (0 the game's film grain, 1 off), and the declaration of `d3d9_enh_grain`.
+- `CoC-Recomp/enhance.c`: `coc_enh_init` calls `d3d9_enh_grain(64, 64, D3DFMT_L8, 1, D3DTOP_BLENDFACTORALPHA)`. The setting **Film Grain** (Game, Off) in Options > Enhancements, after Sanity Effects. The key `film_grain` in `Enhancements.cfg` (default 0). The menu has 14 settings.
+- `CoC-Recomp/launcher.m`: the same setting in the Game panel of the launcher window.
+
+The grain pass (measured from the draws of the game): two full-screen draws into an 1800 x 1125 render target. Stage 0 is the image. Stage 1 is a 64 x 64 `D3DFMT_L8` noise texture with `D3DTOP_BLENDFACTORALPHA` (texture factor alpha 0x0a and 0x30).
+
+Verification:
+
+- `make app` built the app (only the two known `key_frame` warnings of `wmvcore.c`).
+- Headless run of 60 s with `film_grain=1` and `MTL_DEBUG_LAYER=1`: 3000 frames, no Metal validation error. The log shows "film grain off: frame 932, a draw with the grain texture (64x64, format 50) at stage 1 has stages 0 to 0 only" and "menu ENHANCEDOPTIONS registered (14 settings)".
+- Not verified: the image on the screen (screenshots are not permitted), and the GT7 curve on the screen. The effect of the toe is calculated, not measured.

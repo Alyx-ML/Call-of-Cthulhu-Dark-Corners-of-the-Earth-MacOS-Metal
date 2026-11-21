@@ -95,9 +95,11 @@ The game has a menu **Options > Enhancements**. The menu also shows in the pause
 |---|---|
 | Field of View | Game, 110%, 120%, 130%, 140% |
 | Sanity Effects | Game, 75%, 50%, 25%, Off |
+| Film Grain | Game, Off |
 | Anti-Aliasing (MetalFX) | Off, On |
 | Headphone Audio (HRTF) | Off, On |
 | Raw Mouse Input | Off, On |
+| Global Illumination (RTGI) | Off, Low, Medium, High |
 | Ambient Occlusion | Off, Low, Medium, High |
 | GT7 Tone Mapping | Off, On |
 | HDR Output | Off, On |
@@ -115,10 +117,12 @@ The game made its menus, text and pointer for 4:3 screens. On a wider screen, th
 HDR Output needs a display with HDR (EDR) support. HDR Output and GT7 Tone Mapping change the 3D scene. The UI, the text and the menus stay at paper white.
 
 - **Highlights:** the game clamps its final image to white. The app keeps the colors of the scene that are brighter than white (lamps, fire, bloom) from before the game's post-processing. With HDR Output, these highlights go above the white of the game, up to the peak. With GT7 Tone Mapping in SDR, they keep their detail.
-- **GT7 Tone Mapping** is the tone mapping of Gran Turismo 7 (Polyphony Digital, MIT license), with the parameters of the reference except the toe. The image of the game already has its own toe, so the curve does not darken the shadows again. The shadows and the midtones stay as the game made them, and the curve compresses only the highlights. In SDR, the white of the game is at 250 nits of the reference. With HDR Output, the white of the game is at paper white and the highlights go up to the peak.
+- **GT7 Tone Mapping** is the tone mapping of Gran Turismo 7 (Polyphony Digital, MIT license), with the parameters of the reference. The toe of the curve makes the shadows darker, as in the reference, and the curve compresses the highlights. In SDR, the white of the game is at 250 nits of the reference. With HDR Output, the white of the game is at paper white and the highlights go up to the peak.
+- **Global Illumination (RTGI)** adds light that bounces from lit surfaces onto the surfaces near them. The light keeps the color of the surface that it lights. The app traces rays in screen space, against the depth and the colors of the 3D scene. Thus the bounce light can come only from surfaces that are on the screen. Low, Medium and High use more rays and more light. On the test Mac (1800 × 1125, all other enhancements on), High decreased the frame rate from 60 to approximately 57 frames per second.
 - **Bloom** has no threshold: it mixes a wide blur of the scene into the scene (Low 4%, Medium 8%, High 15%). Bright areas spread light into their surroundings.
 - **Field of View** multiplies the field of view of the player camera (the game: 55 degrees vertical). Cut scenes keep their field of view. All cameras use the aspect ratio of the window, so that the 3D image is not too wide.
 - **Sanity Effects** sets the strength of the visual sanity effects of the game: Black And White, Blurred Vision, Vertigo Blur, Screen Distort and Camera Motion Blur. Off removes them. The sounds and the sanity value of the game do not change.
+- **Film Grain** set to Off removes the noise that the game puts on the image.
 - **Anti-Aliasing (MetalFX)** smooths the edges of the 3D scene with the MetalFX temporal scaler of macOS at the full resolution of the window. With anti-aliasing, the textures of the 3D scene use sharper mipmap levels (a texture LOD bias of -1, as the MetalFX guide of Apple recommends).
 - **Raw Mouse Input** gives the game the movement of the mouse without the pointer acceleration of macOS. The same mouse movement then always turns the view by the same angle. The mouse sensitivity can feel different. If necessary, change the mouse sensitivity of the game.
 - **Headphone Audio (HRTF)** plays the 3D sounds of the game through the spatial audio of macOS for headphones (the head-related transfer function of the AUSpatialMixer, with your personalized spatial audio profile when macOS has one). Use it with headphones. Without it, 3D sounds use left-right panning.

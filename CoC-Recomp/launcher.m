@@ -39,6 +39,8 @@ typedef struct setting_text {
 
 static const setting_text graphics_rows[] = {
     { offsetof(RtEnh, aa), "Anti-Aliasing (MetalFX)", "Smooths the edges of the 3D scene.", { "Off", "On" } },
+    { offsetof(RtEnh, gi), "Global Illumination (RTGI)", "Light that bounces from lit surfaces into the shadows.",
+      { "Off", "Low", "Medium", "High" } },
     { offsetof(RtEnh, ao), "Ambient Occlusion", "Darker corners and contact areas.", { "Off", "Low", "Medium", "High" } },
     { offsetof(RtEnh, contact), "Contact Shadows", "Small shadows where a character blocks the light.", { "Off", "On" } },
     { offsetof(RtEnh, shadows), "Sharp Character Shadows", "Sharper shadows. Uses more graphics memory.", { "Off", "On" } },
@@ -56,6 +58,7 @@ static const setting_text game_rows[] = {
     { offsetof(RtEnh, fov), "Field of View", "A wider view. Cut scenes keep theirs.", { "Game", "110%", "120%", "130%", "140%" } },
     { offsetof(RtEnh, sanity), "Sanity Effects", "The strength of the visual effects of fear.",
       { "Game", "75%", "50%", "25%", "Off" } },
+    { offsetof(RtEnh, grain), "Film Grain", "The noise that the game puts on the image.", { "Game", "Off" } },
     { offsetof(RtEnh, sub_scale), "Subtitle Size", "The size of the subtitle text.", { "Game", "1.25x", "1.5x", "1.75x", "2x" } },
     { offsetof(RtEnh, skip_intro), "Skip Intro Videos", "The game starts at the main menu.", { "Off", "On" } },
 };

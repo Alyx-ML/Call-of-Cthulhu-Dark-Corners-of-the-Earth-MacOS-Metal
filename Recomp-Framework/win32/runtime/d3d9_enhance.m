@@ -1,10 +1,11 @@
-// Direct3D 9 on Metal: scene enhancements of rt_enh.h (ambient occlusion, contact shadows, temporal anti-aliasing and
-// bloom).
+// Direct3D 9 on Metal: scene enhancements of rt_enh.h (global illumination, ambient occlusion, contact shadows, temporal
+// anti-aliasing and bloom).
 //
 // d3d9_metal.m calls d3d9_enh_scene, d3d9_enh_taa and then d3d9_enh_bloom once per frame, after the game's 3D scene
 // and before its post-processing (see enh_apply there). The ambient occlusion and contact shadow passes read the
 // scene depth buffer and multiply the back buffer in place; the anti-aliasing pass replaces the back buffer with the
-// output of MetalFX; the bloom pass adds to the back buffer in place.
+// output of MetalFX; the bloom pass adds to the back buffer in place. The global illumination pass reads the scene depth
+// buffer and the back buffer and adds to the back buffer in place (before the ambient occlusion).
 //
 // Ambient occlusion: a Metal port of XeGTAO (ground-truth ambient occlusion, Jimenez et al. 2016, in the XeGTAO
 // form of Intel):
@@ -82,6 +83,22 @@
 // door) gets the motion of the static world behind it at that pixel; MetalFX then finds that the history color does not
 // agree and uses less history for those pixels. The kernel also copies the depth to R32Float for MetalFX.
 //
+// Global illumination: screen-space ray tracing of one bounce of the scene's light, written for this renderer (the
+// method of screen-space ray-traced global illumination, as in the RTGI shader of ReShade; no code of that shader is
+// used). The pass runs at half the size of the back buffer. For each pixel, gi_main makes the view position and the
+// normal from the depth buffer and sends GI_RAYS rays in a cosine-weighted hemisphere around the normal. Each ray
+// takes GI_STEPS steps out to GI_RADIUS, with more steps near the pixel. A step whose position is behind the depth
+// buffer by less than the thickness (GI_THICK + 2% of the view distance) is a hit: the ray gets the linear color of
+// the back buffer at that pixel. A ray that leaves the screen, or that only passes behind thicker surfaces, gets no
+// light. The result is the mean of the rays (the irradiance / pi of a cosine-weighted estimate). The noise is fixed
+// for each pixel (the Hilbert index, as in XeGTAO), so the image does not flicker. gi_denoise then filters three
+// times (an a-trous 3 x 3 filter at the distances 1, 2 and 4) with a depth weight. The composite (enh_fs) up-samples
+// the result with depth weights and adds strength x albedo x result to the linear color. The game has no albedo
+// buffer, so the albedo comes from the pixel's color: its chroma (the color / its luminance, at most 3) x 0.4, at most
+// 0.9. Thus the bounce light keeps the color of the surface that it lights. The light can come only from surfaces on
+// the screen. The levels low, medium and high use 2, 3 and 4 rays, 12, 16 and 20 steps and the strength 0.5, 1.0 and
+// 1.5 (UNCONFIRMED tuning). The radius is 3 m and the thickness 0.3 m (UNCONFIRMED tuning).
+//
 // Settings: XeGTAO falloff range 0.615, sample distribution power 2, depth mip offset 3.30, denoise beta 1.2. The
 // levels low, medium and high use 1 x 2, 2 x 2 and 3 x 3 slices x steps, an effect radius of 0.8, 1.2 and 1.6 m
 // and a final value power of 2.4, 3.0 and 3.6. With the XeGTAO defaults (0.5 m, power 2.2) the mean visibility of
@@ -103,6 +120,8 @@
 #define SSS_MAX_DISPATCH 8
 #define UNIT_SCALE 100.0f          // world units per meter (UNCONFIRMED: one unit = 1 cm)
 #define CONTACT_STRENGTH 0.6f
+#define GI_RADIUS (3.0f * UNIT_SCALE)   // the length of a global illumination ray (UNCONFIRMED tuning)
+#define GI_THICK (0.3f * UNIT_SCALE)    // the thickness of a surface of the depth buffer, plus 2% of its distance
 
 static const char enh_src[] =
     "#include <metal_stdlib>\n"
@@ -376,8 +395,98 @@ static const char enh_src[] =
     "  r = mix(r, 1.0, saturate((vz - p.fade_start) / (p.fade_end - p.fade_start)));\n"
     "  if (inside) out.write(float4(r), uint2(w));\n"
     "}\n"
-    // the composite: the last denoise pass of XeGTAO with the GTAO multi-bounce approximation (the scene color is
-    // the albedo), and the contact shadow; the scene pixel is read in place (framebuffer fetch)
+    "static float3 to_lin(float3 c) { c = max(c, 0.0); return select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045); }\n"
+    "static float3 to_srgb(float3 l) { l = max(l, 0.0); return select(1.055 * pow(l, 1.0 / 2.4) - 0.055, l * 12.92, l <= 0.0031308); }\n"
+    // screen-space global illumination (see the comment at the top of the file)
+    "struct GIC { float mulx, muly, addx, addy, da, db, px, py, radius, thick, sw, sh; uint rays, steps, pad0, pad1; };\n"
+    "static float gi_z(depth2d<float, access::read> dt, int2 q, constant GIC &c) {\n"
+    "  float d = dt.read(uint2(q));\n"
+    "  if (d >= 1.0) return SKY;\n"
+    "  float den = d - c.da;\n"
+    "  return abs(den) < 1e-12 ? SKY : clamp(c.db / den, 1e-4, SKY);\n"
+    "}\n"
+    "static float3 gi_pos(float2 sp, float z, constant GIC &c) { return float3((float2(c.mulx, c.muly) * sp + float2(c.addx, c.addy)) * z, z); }\n"
+    // the screen position (0 .. 1) of a view position: the inverse of gi_pos
+    "static float2 gi_proj(float3 v, constant GIC &c) { return (v.xy / v.z - float2(c.addx, c.addy)) / float2(c.mulx, c.muly); }\n"
+    // out: rgb the mean light of the rays (linear), a the view distance of the pixel (SKY: no surface)
+    "kernel void gi_main(depth2d<float, access::read> dt [[texture(0)]], texture2d<float, access::read> col [[texture(1)]],\n"
+    "  texture2d<float, access::write> out [[texture(2)]], texture2d<ushort, access::read> hl [[texture(3)]],\n"
+    "  constant GIC &c [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {\n"
+    "  if (p.x >= out.get_width() || p.y >= out.get_height()) return;\n"
+    "  int2 mx = int2(int(c.sw) - 1, int(c.sh) - 1);\n"
+    "  int2 q = min(int2(p) * 2, mx);\n"
+    "  float z = gi_z(dt, q, c);\n"
+    "  if (z >= SKY * 0.5) { out.write(float4(0.0, 0.0, 0.0, SKY), p); return; }\n"
+    "  float2 px = float2(c.px, c.py), sp = (float2(q) + 0.5) * px;\n"
+    "  float3 P = gi_pos(sp, z, c);\n"
+    // the normal from the neighbor with the smaller depth step on each axis, toward the camera
+    "  float3 pl = gi_pos(sp - float2(px.x, 0.0), gi_z(dt, clamp(q - int2(1, 0), int2(0), mx), c), c);\n"
+    "  float3 pr = gi_pos(sp + float2(px.x, 0.0), gi_z(dt, clamp(q + int2(1, 0), int2(0), mx), c), c);\n"
+    "  float3 pt = gi_pos(sp - float2(0.0, px.y), gi_z(dt, clamp(q - int2(0, 1), int2(0), mx), c), c);\n"
+    "  float3 pb = gi_pos(sp + float2(0.0, px.y), gi_z(dt, clamp(q + int2(0, 1), int2(0), mx), c), c);\n"
+    "  float3 dx = abs(pr.z - P.z) < abs(P.z - pl.z) ? pr - P : P - pl;\n"
+    "  float3 dy = abs(pb.z - P.z) < abs(P.z - pt.z) ? pb - P : P - pt;\n"
+    "  float3 N = cross(dx, dy);\n"
+    "  float nn = dot(N, N);\n"
+    "  if (!(nn > 1e-24)) { out.write(float4(0.0, 0.0, 0.0, z), p); return; }\n"
+    "  N *= rsqrt(nn);\n"
+    "  if (dot(N, P) > 0.0) N = -N;\n"
+    "  float3 T = normalize(abs(N.y) < 0.99 ? cross(N, float3(0.0, 1.0, 0.0)) : cross(N, float3(1.0, 0.0, 0.0)));\n"
+    "  float3 B = cross(N, T);\n"
+    "  uint hi = hl.read(uint2(q) % 64u).r;\n"
+    "  float n0 = fract(0.5 + float(hi) * 0.75487766624669276), n1 = fract(0.5 + float(hi) * 0.56984029099805326);\n"
+    "  float3 O = P + N * (z * 0.004);\n"
+    "  float2 ss = float2(c.sw, c.sh);\n"
+    "  float3 acc = float3(0.0);\n"
+    "  for (uint r = 0; r < c.rays; r++) {\n"
+    "    float u1 = fract(n0 + float(r) * 0.6180339887498948), u2 = fract(n1 + float(r) * 0.7548776662466927);\n"
+    "    float rr = sqrt(u1), ph = 2.0 * M_PI_F * u2;\n"
+    "    float3 d = T * (rr * cos(ph)) + B * (rr * sin(ph)) + N * sqrt(max(0.0, 1.0 - u1));\n"
+    "    float jit = fract(n0 + n1 + float(r) * 0.5698402909980533);\n"
+    "    for (uint s = 0; s < c.steps; s++) {\n"
+    "      float f = (float(s) + jit) / float(c.steps);\n"
+    "      float3 Q = O + d * (c.radius * f * f + z * 0.01);\n"
+    "      if (Q.z <= 1e-3) break;\n"
+    "      float2 qs = gi_proj(Q, c);\n"
+    "      if (any(qs < 0.0) || any(qs >= 1.0)) break;\n"
+    "      int2 qi = min(int2(qs * ss), mx);\n"
+    "      float zs = gi_z(dt, qi, c), dz = Q.z - zs;\n"
+    "      if (dz > 0.0 && dz < c.thick + zs * 0.02) { acc += to_lin(col.read(uint2(qi)).rgb); break; }\n"
+    "    }\n"
+    "  }\n"
+    "  out.write(float4(acc / float(c.rays), z), p);\n"
+    "}\n"
+    // a-trous 3 x 3 filter at the distance st (half-size pixels) with a depth weight
+    "kernel void gi_denoise(texture2d<float, access::read> a [[texture(0)]], texture2d<float, access::write> o [[texture(1)]],\n"
+    "  constant int &st [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {\n"
+    "  if (p.x >= o.get_width() || p.y >= o.get_height()) return;\n"
+    "  int2 mx = int2(int(a.get_width()) - 1, int(a.get_height()) - 1);\n"
+    "  float4 cc = a.read(p);\n"
+    "  if (cc.a >= SKY * 0.5) { o.write(cc, p); return; }\n"
+    "  float3 s = float3(0.0); float ws = 0.0;\n"
+    "  for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {\n"
+    "    float4 v = a.read(uint2(clamp(int2(p) + int2(x, y) * st, int2(0), mx)));\n"
+    "    float w = (x == 0 ? 2.0 : 1.0) * (y == 0 ? 2.0 : 1.0) * saturate(1.0 - abs(v.a - cc.a) / (cc.a * 0.03));\n"
+    "    s += v.rgb * w; ws += w;\n"
+    "  }\n"
+    "  o.write(float4(s / ws, cc.a), p);\n"
+    "}\n"
+    // the half-size result at the full-size pixel ip (view distance z): a 3 x 3 filter with spatial and depth weights
+    "static float3 gi_up(texture2d<float, access::read> g, int2 ip, float z) {\n"
+    "  int2 h = ip / 2, mx = int2(int(g.get_width()) - 1, int(g.get_height()) - 1);\n"
+    "  float3 s = float3(0.0); float ws = 0.0;\n"
+    "  for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {\n"
+    "    int2 qh = clamp(h + int2(x, y), int2(0), mx);\n"
+    "    float4 v = g.read(uint2(qh));\n"
+    "    float2 dd = float2(qh * 2) - float2(ip);\n"
+    "    float w = exp(-dot(dd, dd) / 4.5) * max(saturate(1.0 - abs(v.a - z) / (z * 0.03)), 1e-3);\n"
+    "    s += v.rgb * w; ws += w;\n"
+    "  }\n"
+    "  return s / ws;\n"
+    "}\n"
+    // the composite: the global illumination, the last denoise pass of XeGTAO with the GTAO multi-bounce
+    // approximation (the scene color is the albedo), and the contact shadow; the scene pixel is read in place
+    // (framebuffer fetch)
     "struct PV { float4 pos [[position]]; };\n"
     "vertex PV enh_vs(uint vid [[vertex_id]]) {\n"
     "  float2 q = float2(float((vid << 1) & 2u), float(vid & 2u));\n"
@@ -385,7 +494,8 @@ static const char enh_src[] =
     "}\n"
     // CC.light: the light in view space (a position, w = 1, or a direction, w = 0); mulx .. db: the view position of
     // a depth value (as vpos); px, py: the size of one pixel in screen coordinates (0 .. 1)
-    "struct CC { float beta; uint ao; uint contact; float strength; float4 light; float mulx, muly, addx, addy, da, db, px, py; };\n"
+    "struct CC { float beta; uint ao; uint contact; float strength; float4 light; float mulx, muly, addx, addy, da, db, px, py;\n"
+    "  uint gi; float gik, pad0, pad1; };\n"
     "static float3 cpos(depth2d<float, access::read> dt, int2 q, constant CC &k) {\n"
     "  q = clamp(q, int2(0), int2(int(dt.get_width()) - 1, int(dt.get_height()) - 1));\n"
     "  float z = k.db / (dt.read(uint2(q)) - k.da);\n"
@@ -410,12 +520,21 @@ static const char enh_src[] =
     "}\n"
     "fragment float4 enh_fs(PV in [[stage_in]], texture2d<float, access::read> a [[texture(0)]],\n"
     "  texture2d<float, access::read> e [[texture(1)]], texture2d<float, access::read> sh [[texture(2)]],\n"
-    "  depth2d<float, access::read> dt [[texture(3)]], constant CC &k [[buffer(0)]], float4 dst [[color(0)]]) {\n"
+    "  depth2d<float, access::read> dt [[texture(3)]], texture2d<float, access::read> gt [[texture(4)]],\n"
+    "  constant CC &k [[buffer(0)]], float4 dst [[color(0)]]) {\n"
     "  int2 ip = int2(in.pos.xy);\n"
+    "  float3 c0 = dst.rgb;\n"
+    "  if (k.gi != 0u) {\n"
+    "    float3 g = gi_up(gt, ip, cpos(dt, ip, k).z);\n"
+    "    float3 cl = to_lin(c0);\n"
+    "    float lum = dot(cl, float3(0.2126, 0.7152, 0.0722));\n"
+    "    float3 alb = min(0.4 * (lum > 1e-4 ? min(cl / lum, float3(3.0)) : float3(1.0)), float3(0.9));\n"
+    "    c0 = to_srgb(cl + k.gik * alb * g);\n"
+    "  }\n"
     "  float3 m = float3(1.0);\n"
     "  if (k.ao != 0u) {\n"
     "    float v = denoise(a, e, ip, k.beta);\n"
-    "    float3 al = saturate(dst.rgb);\n"
+    "    float3 al = saturate(c0);\n"
     "    float3 ka = 2.0404 * al - 0.3324, kb = -4.7951 * al + 0.6417, kc = 2.7552 * al + 0.6903;\n"
     "    m = max(float3(v), ((v * ka + kb) * v + kc) * v);\n"
     "  }\n"
@@ -423,7 +542,7 @@ static const char enh_src[] =
     "    float sv = sh.read(uint2(ip)).r;\n"
     "    if (sv < 1.0) m *= mix(1.0, sv, k.strength * contact_nl(dt, ip, k));\n"
     "  }\n"
-    "  return float4(dst.rgb * m, dst.a);\n"
+    "  return float4(c0 * m, dst.a);\n"
     "}\n"
     // dual Kawase bloom. BP.px: one texel of the source (bloom_pre), half a texel of the output (bloom_down,
     // bloom_up, bloom_comp)
@@ -435,8 +554,6 @@ static const char enh_src[] =
     "constexpr sampler bls(filter::linear, address::clamp_to_edge);\n"
     // BP.k: the bloom part of the composite; inv: 1 / the number of levels
     "struct BP { float2 px; float k, inv; };\n"
-    "static float3 to_lin(float3 c) { c = max(c, 0.0); return select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045); }\n"
-    "static float3 to_srgb(float3 l) { l = max(l, 0.0); return select(1.055 * pow(l, 1.0 / 2.4) - 0.055, l * 12.92, l <= 0.0031308); }\n"
     "static float karis(float3 c) { return 1.0 / (1.0 + max(max(c.r, c.g), c.b)); }\n"
     "static float3 lt(texture2d<float> t, float2 uv) { return to_lin(t.sample(bls, uv).rgb); }\n"
     "fragment float4 bloom_pre(BV in [[stage_in]], texture2d<float> t [[texture(0)]], constant BP &p [[buffer(0)]]) {\n"
@@ -493,7 +610,9 @@ static const char enh_src[] =
 
 typedef struct { float sx, sy, px, py, mulx, muly, addx, addy, mpx, mpy, da, db, radius, falloff, power, mipoff, beta, pad; } AOC;
 typedef struct { float light[4]; int32_t offset[2]; float far_z, near_z, thickness, bilinear, contrast, pad, da, db, fade_start, fade_end; } SSSP;
-typedef struct { float beta; uint32_t ao, contact; float strength; float light[4]; float mulx, muly, addx, addy, da, db, px, py; } CC;
+typedef struct { float beta; uint32_t ao, contact; float strength; float light[4]; float mulx, muly, addx, addy, da, db, px, py;
+                 uint32_t gi; float gik, pad0, pad1; } CC;
+typedef struct { float mulx, muly, addx, addy, da, db, px, py, radius, thick, sw, sh; uint32_t rays, steps, pad0, pad1; } GIC;
 typedef struct { int32_t count[3]; int32_t offset[2]; } SssDispatch;
 
 typedef struct { float px[2]; float k, inv; } BP;
@@ -504,20 +623,23 @@ static const uint32_t ao_slices[4] = {0, 1, 2, 3}, ao_steps[4] = {0, 2, 2, 3};
 static const float ao_radius[4] = {0.0f, 0.8f, 1.2f, 1.6f}, ao_power[4] = {0.0f, 2.4f, 3.0f, 3.6f};
 #define BLOOM_LEVELS 6
 static const float bloom_intensity[4] = {0.0f, 0.04f, 0.08f, 0.15f};   // k of the composite
+// the global illumination levels: rays per pixel, steps per ray, strength (UNCONFIRMED tuning)
+static const uint32_t gi_rays[4] = {0, 2, 3, 4}, gi_steps[4] = {0, 12, 16, 20};
+static const float gi_strength[4] = {0.0f, 0.5f, 1.0f, 1.5f};
 
 static struct {
     id<MTLDevice> dev;
     id<MTLLibrary> lib;
-    id<MTLComputePipelineState> prefilter, main_pso[4], denoise, sss;
+    id<MTLComputePipelineState> prefilter, main_pso[4], denoise, sss, gi_main, gi_denoise;
     id<MTLRenderPipelineState> apply; MTLPixelFormat apply_fmt;
-    id<MTLTexture> hilbert, depths, mip[AO_MIPS], ao0, ao1, edges, shadow;
+    id<MTLTexture> hilbert, depths, mip[AO_MIPS], ao0, ao1, edges, shadow, gi0, gi1;
     id<MTLRenderPipelineState> bloom_pre, bloom_down, bloom_up, bloom_comp; MTLPixelFormat bloom_comp_fmt;
     id<MTLTexture> bloom_lv[BLOOM_LEVELS];
     id<MTLComputePipelineState> taa_motion;
     id<MTLFXTemporalScaler> taa; NSUInteger taa_w, taa_h; MTLPixelFormat taa_fmt;
     id<MTLTexture> taa_mv, taa_dz, taa_out;
     int logged_taa, logged_taa_ms;
-    int logged_ao, logged_sss, logged_cam, logged_ms, logged_bloom, logged_bloom_ms;
+    int logged_gi, logged_ao, logged_sss, logged_cam, logged_ms, logged_bloom, logged_bloom_ms;
 } E;
 
 static id<MTLComputePipelineState> kernel_of(NSString *name, MTLFunctionConstantValues *cv) {
@@ -569,6 +691,8 @@ static void setup(id<MTLDevice> dev) {
     if (E.sss.maxTotalThreadsPerThreadgroup < SSS_WAVE) rt_fatal("[d3d9] the contact shadow kernel cannot run %d threads in a group", SSS_WAVE);
     E.hilbert = hilbert_texture();
     E.taa_motion = kernel_of(@"taa_motion", nil);
+    E.gi_main = kernel_of(@"gi_main", nil);
+    E.gi_denoise = kernel_of(@"gi_denoise", nil);
 }
 static id<MTLTexture> tex_of(id<MTLTexture> __strong *slot, NSUInteger w, NSUInteger h, MTLPixelFormat fmt, NSUInteger mips) {
     id<MTLTexture> t = *slot;
@@ -640,11 +764,13 @@ static int dispatch_list(const float lp[4], int w, int h, float light_out[4], Ss
 }
 
 int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTexture> depth,
-                   const EnhScene *s, int ao, int contact) {
+                   const EnhScene *s, int ao, int contact, int gi) {
     if (ao < 0) ao = 0;
     if (ao > 3) ao = 3;
+    if (gi < 0) gi = 0;
+    if (gi > 3) gi = 3;
     if (!s->have_light) contact = 0;
-    if (!ao && !contact) return 0;
+    if (!ao && !contact && !gi) return 0;
     NSUInteger w = depth.width, h = depth.height;
     if (color.sampleCount > 1 || depth.sampleCount > 1 || color.width != w || color.height != h || w < 16 || h < 16) {
         if (!E.logged_ms) rt_log("[d3d9] ambient occlusion / contact shadows: the scene is multisampled or its depth buffer (%lux%lu) "
@@ -668,13 +794,44 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
         id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
         if (!ce) rt_fatal("[d3d9] Metal did not create the enhancement compute encoder");
         CC k = {1.2f, (uint32_t)(ao != 0), (uint32_t)(contact != 0), CONTACT_STRENGTH, {0, 0, 0, 0},
-                2.0f / P[0], -2.0f / P[5], -1.0f / P[0], 1.0f / P[5], da, db, 1.0f / (float)w, 1.0f / (float)h};
+                2.0f / P[0], -2.0f / P[5], -1.0f / P[0], 1.0f / P[5], da, db, 1.0f / (float)w, 1.0f / (float)h,
+                (uint32_t)(gi != 0), gi_strength[gi], 0.0f, 0.0f};
         // the light in view space: light * view (row vectors)
         for (int cc = 0; cc < 3; cc++) {
             float a = 0; for (int j = 0; j < 4; j++) a += s->light[j] * s->view[j * 4 + cc];
             k.light[cc] = a;
         }
         k.light[3] = s->light[3];
+        if (gi) {
+            if (!(color.usage & MTLTextureUsageShaderRead))
+                rt_fatal("[d3d9] global illumination: the back buffer texture cannot be read by a shader (usage 0x%lx)", (unsigned long)color.usage);
+            NSUInteger hw = (w + 1) / 2, hh = (h + 1) / 2;
+            tex_of(&E.gi0, hw, hh, MTLPixelFormatRGBA16Float, 1);
+            tex_of(&E.gi1, hw, hh, MTLPixelFormatRGBA16Float, 1);
+            GIC g = {k.mulx, k.muly, k.addx, k.addy, da, db, k.px, k.py, GI_RADIUS, GI_THICK, (float)w, (float)h,
+                     gi_rays[gi], gi_steps[gi], 0, 0};
+            if (!E.logged_gi) {
+                rt_log("[d3d9] screen-space global illumination %lux%lu (computed at %lux%lu): %u rays x %u steps, strength %.2f",
+                       (unsigned long)w, (unsigned long)h, (unsigned long)hw, (unsigned long)hh, gi_rays[gi], gi_steps[gi], gi_strength[gi]);
+                E.logged_gi = 1;
+            }
+            [ce setComputePipelineState:E.gi_main];
+            [ce setBytes:&g length:sizeof g atIndex:0];
+            [ce setTexture:depth atIndex:0];
+            [ce setTexture:color atIndex:1];
+            [ce setTexture:E.gi0 atIndex:2];
+            [ce setTexture:E.hilbert atIndex:3];
+            [ce dispatchThreads:MTLSizeMake(hw, hh, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+            // three a-trous passes (distances 1, 2, 4): gi0 -> gi1 -> gi0 -> gi1
+            [ce setComputePipelineState:E.gi_denoise];
+            for (int i = 0; i < 3; i++) {
+                int32_t st = 1 << i;
+                [ce setBytes:&st length:sizeof st atIndex:0];
+                [ce setTexture:(i & 1) ? E.gi1 : E.gi0 atIndex:0];
+                [ce setTexture:(i & 1) ? E.gi0 : E.gi1 atIndex:1];
+                [ce dispatchThreads:MTLSizeMake(hw, hh, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+            }
+        }
         if (ao) {
             tex_of(&E.ao0, w, h, MTLPixelFormatR16Float, 1);
             tex_of(&E.ao1, w, h, MTLPixelFormatR16Float, 1);
@@ -748,12 +905,14 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
         id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
         if (!re) rt_fatal("[d3d9] Metal did not create the enhancement composite encoder");
         [re setRenderPipelineState:apply_pso(color.pixelFormat)];
-        // every texture argument is bound; the feature flags in k select the ones the shader reads
-        id<MTLTexture> t0 = ao ? E.ao1 : E.shadow, t1 = ao ? E.edges : E.shadow, t2 = contact ? E.shadow : E.ao1;
-        [re setFragmentTexture:t0 atIndex:0];
-        [re setFragmentTexture:t1 atIndex:1];
-        [re setFragmentTexture:t2 atIndex:2];
+        // every texture argument is bound; the feature flags in k select the ones the shader reads. `any` is a texture
+        // of an effect of this frame (the arguments of the effects that are off get it)
+        id<MTLTexture> any = ao ? E.ao1 : contact ? E.shadow : E.gi1;
+        [re setFragmentTexture:ao ? E.ao1 : any atIndex:0];
+        [re setFragmentTexture:ao ? E.edges : any atIndex:1];
+        [re setFragmentTexture:contact ? E.shadow : any atIndex:2];
         [re setFragmentTexture:depth atIndex:3];
+        [re setFragmentTexture:gi ? E.gi1 : any atIndex:4];
         [re setFragmentBytes:&k length:sizeof k atIndex:0];
         [re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [re endEncoding];

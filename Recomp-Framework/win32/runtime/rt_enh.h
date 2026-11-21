@@ -1,4 +1,5 @@
 // Enhancement settings that the runtime applies on top of the game (anisotropic filtering, ambient occlusion,
+// screen-space global illumination, the film grain of the game,
 // tone mapping, HDR output and its calibration, contact shadows, bloom, reduced banding, sharp shadows, temporal
 // anti-aliasing, headphone audio, raw mouse input, the interface in 4:3; and
 // settings that the game project applies: gamepad input, intro videos, subtitle size, field of view, sanity effects).
@@ -37,6 +38,9 @@ typedef struct RtEnh {
                        //    of macOS for headphones (fmodex.c)
     int32_t raw_mouse; // 0: the mouse movement of the pointer (with the pointer acceleration of macOS); 1: the
                        //    unaccelerated movement of the mouse (kCGEventUnacceleratedPointerMovementX and Y, cocoa32.m)
+    int32_t gi;        // 0: off; 1..3: screen-space ray-traced global illumination (one bounce of the light of the
+                       //    scene), low, medium, high
+    int32_t grain;     // 0: the game's film grain; 1: no film grain (d3d9_enh_grain)
 } RtEnh;
 
 // The HDR calibration has the two settings of the Capcom RE Engine (Resident Evil Village, Resident Evil 4), with the
@@ -91,6 +95,12 @@ void d3d9_enh_light_vs(const char *dir, const char *pos, const char *grad, uint3
 // call every draw keeps the full width. Call it before the game creates its vertex shaders.
 void d3d9_enh_ui_vs(const char *source, uint32_t creg);
 
+// The film grain of the game: a fixed-function draw whose texture at stage `stage` (1 to 7) has w x h pixels and
+// D3DFORMAT fmt, with the D3DTOPS COLOROP op there. With rt_enh->grain = 1, such a draw has that stage and the stages
+// after it disabled (D3DTOP_DISABLE), so it gives the result of the stages before it. Without this call the setting
+// has no effect.
+void d3d9_enh_grain(uint32_t w, uint32_t h, uint32_t fmt, uint32_t stage, uint32_t op);
+
 // The size in pixels of the back buffer of the device (its last Reset or creation); 0 x 0 before the device exists.
 void d3d9_enh_back_buffer(uint32_t *w, uint32_t *h);
 
@@ -116,10 +126,11 @@ typedef struct EnhScene {
     int have_light;
     float light[4];
 } EnhScene;
-// Ambient occlusion (quality ao 1..3, 0 = off) and contact shadows (contact != 0) of the scene: compute passes on
-// cb that read depth, then a render pass that multiplies color in place. Returns 1 when color was changed.
+// Global illumination (level gi 1..3, 0 = off), ambient occlusion (quality ao 1..3, 0 = off) and contact shadows
+// (contact != 0) of the scene: compute passes on cb that read depth (and color, for the global illumination), then a
+// render pass that changes color in place. Returns 1 when color was changed.
 int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTexture> depth,
-                   const EnhScene *s, int ao, int contact);
+                   const EnhScene *s, int ao, int contact, int gi);
 // Dual Kawase bloom (level 1..3, 0 = off) of the scene in color: render passes on cb that add the bloom to color in
 // place. Returns 1 when color was changed.
 int d3d9_enh_bloom(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> color, int level);
