@@ -959,3 +959,41 @@ Verification:
 - Headless run of 60 s, Low, with `MTL_DEBUG_LAYER=1`: 3600 frames, no Metal validation error.
 - Frame time, High, all other enhancements on: 10.00 s for each 600 frames (60 frames per second, the frame pacing limit).
 - Not verified: the image on the screen (screenshots are not permitted).
+
+## 2026-11-22: Temporal accumulation of global illumination and ambient occlusion
+
+Request (user): add temporal accumulation for the global illumination (RTGI) and the ambient occlusion. Measure first. Show a screenshot with the setting on and a screenshot before the change (the user permitted screenshots for this task).
+
+Changes:
+
+- `Recomp-Framework/win32/runtime/d3d9_enhance.m`: the new kernels `gi_accum` (half size, before `gi_denoise`) and `ao_accum` (full size, before the ambient occlusion denoise). For each pixel, `ta_reproj` finds the screen position and the view distance of the surface in the last frame. The history is read there with 4 bilinear taps. A tap is used only when its view distance is within 4% of the reprojected distance. For the global illumination, the cosine between the normals must also be 0.9 or more. The history keeps the mean of at most 16 frames (global illumination) and 8 frames (ambient occlusion). With the setting on, `gi_main` and `ao_main` add 288 x (frame % 64) to the Hilbert index of each pixel, so each frame gives different noise. `gi_main` writes the normal and the view distance to `gin`; `gi_denoise` reads the view distance from there. The two histories alternate between two textures. The history starts again when the camera of the last frame is not known, when the last frame did not have these passes, or when the textures are made again. With `RT_VERBOSE`, the log gives the pixels with no history and the mean motion once in 600 frames. The comment at the top of the file describes the method.
+- `Recomp-Framework/win32/runtime/rt_enh.h`: the new setting `temporal` in `RtEnh`; `EnhScene` has the camera of the last frame (`reproj`, `rot`, `have_reproj`) and the frame number; `d3d9_enh_scene` has the new argument `temporal`.
+- `Recomp-Framework/win32/runtime/d3d9_metal.m`: `enh_apply` keeps the view-projection and the view of the last frame with a scene camera. It gives `reproj` (inverse of this frame's view-projection x the last frame's view-projection) and `rot` (the rotation from this view space to the last view space) to `d3d9_enh_scene`.
+- `CoC-Recomp/enhance.c`: the setting **Temporal Accumulation** (Off, On; default On) in **Options > Enhancements**, after **Ambient Occlusion**, with the key `temporal_accumulation` in `Enhancements.cfg`.
+- `CoC-Recomp/launcher.m`: the setting **Temporal Accumulation** in the graphics settings of the launcher, after **Ambient Occlusion**.
+
+Measurements before the change (the town save, High, all other enhancements on): the global illumination noise on flat surfaces (the mean difference between neighbors, % of the mean light, frames 1200, 1350 and 1700) was 2.29, 2.76 and 2.23. After the change: 1.69, 2.24 and 1.42. This number measures fine noise. It does not measure the large soft patches of noise well. The temporary statistics code is removed.
+
+Camera alignment: a test with the colors of two frames showed a large error. The fog of the scene caused that error. A test with the depth buffer showed that the reprojection of the camera is correct.
+
+Pixels with no history (log of `RT_VERBOSE`): global illumination 0.1% to 1% and ambient occlusion 0.02% to 0.08% with a static camera; global illumination 11% to 13% and ambient occlusion 7% to 9% while the camera moves in the bus (mean motion 10 to 23 pixels per frame).
+
+Screenshots (frame 7300, a static view of a lit doorway in the town, High, MetalFX anti-aliasing on, film grain off, HDR off). The screenshots are in `temporal-accumulation-shots/` in the game folder. They are not in the repository. A temporary capture code in `d3d9_metal.m` saved the drawable. That code is removed:
+
+| Frame | Mean (0 to 255) | Fine detail of the lit wall, 3 x 3 (% of the mean) | Fine detail, 5 x 5 (% of the mean) |
+|---|---|---|---|
+| No global illumination, no ambient occlusion (reference) | 66.0 | 5.88 | 11.77 |
+| Temporal accumulation off | 55.6 | 7.18 | 13.72 |
+| Temporal accumulation on | 55.5 | 6.21 | 12.29 |
+
+Fine detail is the mean difference between a pixel and the mean of the 3 x 3 or 5 x 5 pixels around it. The reference has only the detail of the textures. Above the reference, the global illumination and the ambient occlusion add 1.30 (off) and 0.33 (on) points of noise (3 x 3), and 1.95 and 0.52 points (5 x 5): approximately 75% less with the setting on. In the whole frame, the two frames are almost the same: the median difference is 0.3 of 255, and 99% of the pixels differ by 5 or less.
+
+Flicker (9 frames, 7292 to 7300, static camera, film grain off): the mean change from frame to frame was 0.35 of 255 with the setting on and 0.38 and 0.41 with the setting off (two runs). The change from frame to frame comes mostly from the anti-aliasing jitter. A first measurement with 5 frames gave 0.67 (on) against 0.27 (off). That result did not repeat with 9 frames. A test with 32 and 16 frames of history gave 0.31 (on) against 0.38 (off). That difference is within the variation between runs, so the limits stay at 16 and 8 frames. Less history responds faster when the light changes.
+
+Verification:
+
+- The shader source compiled offline with `xcrun metal` with no warning. `make app` built the app (only the two known `key_frame` warnings of `wmvcore.c`).
+- Headless run, High, all other enhancements on, `MTL_DEBUG_LAYER=1` and `MTL_SHADER_VALIDATION=1`: 3000 frames, no Metal validation error.
+- Frame time, High, all other enhancements on, final build, two pairs of runs (setting on and off, film grain on and off): 10.00 s for each 600 frames after the loading, in all four runs (60 frames per second, the frame pacing limit). Two earlier runs with the setting on and the capture code had some intervals of 10.2 to 12.5 s for 600 frames. Four other runs with the setting on (one of them with 32 and 16 frames of history) did not. The cause of those two slower runs is not known.
+- The final app has no capture code (`strings` finds no `MEAS_SHOT`).
+- The launcher sets its window size from the fitting size of its views (Auto Layout, `content.fittingSize`), so the window gets taller by one row. Not verified at run time: the launcher window with the added row (the test runs are headless).

@@ -1,5 +1,5 @@
 // Enhancement settings that the runtime applies on top of the game (anisotropic filtering, ambient occlusion,
-// screen-space global illumination, the film grain of the game,
+// screen-space global illumination, temporal accumulation, the film grain of the game,
 // tone mapping, HDR output and its calibration, contact shadows, bloom, reduced banding, sharp shadows, temporal
 // anti-aliasing, headphone audio, raw mouse input, the interface in 4:3; and
 // settings that the game project applies: gamepad input, intro videos, subtitle size, field of view, sanity effects).
@@ -41,6 +41,7 @@ typedef struct RtEnh {
     int32_t gi;        // 0: off; 1..3: screen-space ray-traced global illumination (one bounce of the light of the
                        //    scene), low, medium, high
     int32_t grain;     // 0: the game's film grain; 1: no film grain (d3d9_enh_grain)
+    int32_t temporal;  // 0: off; 1: temporal accumulation of the global illumination and the ambient occlusion
 } RtEnh;
 
 // The HDR calibration has the two settings of the Capcom RE Engine (Resident Evil Village, Resident Evil 4), with the
@@ -121,16 +122,24 @@ void d3d9_enh_shadow_target(uint32_t w, uint32_t h, uint32_t fmt, uint32_t scale
 // d3d9_enhance.m, called by d3d9_metal.m.
 // The scene of one frame: the camera (Direct3D 9 row-vector matrices, clip = position * view * proj) and the light
 // of the contact shadows (homogeneous world position, w = 1, or the world direction to the light, w = 0).
+// reproj: inverse(this frame's view-projection) x the last frame's view-projection (row vectors); rot: the rotation
+// (3 x 3, row vectors) from this frame's view space to the last frame's view space; have_reproj: reproj and rot hold the
+// camera of the last frame (frame - 1); frame: the number of this frame.
 typedef struct EnhScene {
     float view[16], proj[16];
     int have_light;
     float light[4];
+    float reproj[16], rot[9];
+    int have_reproj;
+    uint32_t frame;
 } EnhScene;
 // Global illumination (level gi 1..3, 0 = off), ambient occlusion (quality ao 1..3, 0 = off) and contact shadows
 // (contact != 0) of the scene: compute passes on cb that read depth (and color, for the global illumination), then a
-// render pass that changes color in place. Returns 1 when color was changed.
+// render pass that changes color in place. temporal != 0: the global illumination and the ambient occlusion are
+// accumulated over the frames (the history of a pixel comes from its position in the last frame). Returns 1 when color
+// was changed.
 int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTexture> depth,
-                   const EnhScene *s, int ao, int contact, int gi);
+                   const EnhScene *s, int ao, int contact, int gi, int temporal);
 // Dual Kawase bloom (level 1..3, 0 = off) of the scene in color: render passes on cb that add the bloom to color in
 // place. Returns 1 when color was changed.
 int d3d9_enh_bloom(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> color, int level);

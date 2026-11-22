@@ -506,6 +506,8 @@ struct Device {
     int ui_logged;                 // the first draw in 4:3 is in the log
     uint32_t taa_frame;            // the last frame with anti-aliasing
     float taa_vp[16];              // the view-projection of the camera of the last anti-aliasing frame
+    uint32_t enh_pframe;           // the last frame with a scene camera and scene passes (0: none)
+    float enh_pvp[16], enh_pview[16];   // the view-projection and the view of the camera of that frame
     int taa_vp_ok;                 // taa_vp holds a camera
 };
 
@@ -2725,7 +2727,29 @@ static void enh_apply(Device *d) {
         d->enh_sc.have_light = contact > 0 && enh_light_pick(d, f, d->enh_sc.view);
         memcpy(d->enh_sc.light, d->enh_lv, sizeof d->enh_lv);
     }
-    d3d9_enh_scene(d->mtl, d->cmd, d->enh_color, d->enh_depth, &d->enh_sc, ao, contact, gi);
+    // temporal accumulation: the motion of the camera from the last frame (inverse(this view-projection) x the last
+    // view-projection) and the rotation of its view space
+    float svp[16];
+    mat_mul(d->enh_sc.view, d->enh_sc.proj, svp);
+    d->enh_sc.frame = f;
+    d->enh_sc.have_reproj = 0;
+    if (have_cam && d->enh_pframe != 0 && d->enh_pframe == f - 1) {
+        float iv[16];
+        if (mat_inv(svp, iv)) {
+            mat_mul(iv, d->enh_pvp, d->enh_sc.reproj);
+            // rows of the view are the world axes in view space: R = transpose(this view 3x3) x last view 3x3
+            for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) {
+                float a = 0.0f; for (int k = 0; k < 3; k++) a += d->enh_sc.view[k * 4 + i] * d->enh_pview[k * 4 + j];
+                d->enh_sc.rot[i * 3 + j] = a;
+            }
+            d->enh_sc.have_reproj = 1;
+        }
+    }
+    d3d9_enh_scene(d->mtl, d->cmd, d->enh_color, d->enh_depth, &d->enh_sc, ao, contact, gi, rt_enh->temporal == 1);
+    if (have_cam && (ao > 0 || gi > 0)) {
+        d->enh_pframe = f;
+        memcpy(d->enh_pvp, svp, sizeof svp); memcpy(d->enh_pview, d->enh_sc.view, sizeof d->enh_pview);
+    } else d->enh_pframe = 0;
     if (taa) {
         // the motion of the camera from the last frame: inverse(this view-projection) x the last view-projection
         float o[2], vp[16], iv[16], rp[16];

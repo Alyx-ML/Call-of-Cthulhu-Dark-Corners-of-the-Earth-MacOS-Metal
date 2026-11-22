@@ -1,5 +1,5 @@
-// Direct3D 9 on Metal: scene enhancements of rt_enh.h (global illumination, ambient occlusion, contact shadows, temporal
-// anti-aliasing and bloom).
+// Direct3D 9 on Metal: scene enhancements of rt_enh.h (global illumination, ambient occlusion, their temporal
+// accumulation, contact shadows, temporal anti-aliasing and bloom).
 //
 // d3d9_metal.m calls d3d9_enh_scene, d3d9_enh_taa and then d3d9_enh_bloom once per frame, after the game's 3D scene
 // and before its post-processing (see enh_apply there). The ambient occlusion and contact shadow passes read the
@@ -95,8 +95,11 @@
 // size and GI_MIPS - 1 smaller levels, made only from the pixels with a surface (not the sky). The level is the one whose pixel is near the screen distance between two
 // steps, so a far hit gets the mean color of an area and not the color of one texel. This decreases the noise. A
 // ray that leaves the screen, or that only passes behind thicker surfaces, gets no light. The result is the mean of
-// the rays (the irradiance / pi of a cosine-weighted estimate). The noise is fixed for each pixel (the Hilbert
-// index, as in XeGTAO), so the image does not flicker. gi_denoise then filters GI_PASSES (4) times (an a-trous 3 x 3
+// the rays (the irradiance / pi of a cosine-weighted estimate). The noise of a pixel comes from its Hilbert index, as
+// in XeGTAO. Without temporal accumulation the noise is fixed for each pixel, so the image does not flicker; with
+// temporal accumulation the noise changes in each frame (see the temporal accumulation paragraph after this one).
+// gi_main also writes the normal and the view distance of each pixel for the denoise passes and the history. gi_denoise
+// then filters GI_PASSES (4) times (an a-trous 3 x 3
 // filter at the distances 1, 2, 4 and 8) with a depth weight and a normal weight (the cosine between the normals to the power
 // 8), so the light does not mix across corners. The composite (enh_fs) up-samples
 // the result with depth weights and adds strength x albedo x result to the linear color. The game has no albedo
@@ -106,6 +109,23 @@
 // and 2.25 (UNCONFIRMED tuning). The front-side test removes light that leaked through objects: it decreased the mean
 // light of the result by approximately one third (measured in the town), so the strengths are 1.5 x the strengths
 // before the test. The radius is 3 m and the thickness 0.3 m (UNCONFIRMED tuning).
+//
+// Temporal accumulation (rt_enh->temporal): the global illumination and the ambient occlusion of a pixel are the mean
+// of the results of the last frames at the same surface. Each frame adds 288 x (frame % 64) to the Hilbert index of
+// each pixel, as XeGTAO does for its temporal mode, so each frame gives different noise. d3d9_metal.m gives the camera
+// of this frame and of the last frame (EnhScene reproj and rot). For each pixel, ta_reproj finds the screen position
+// and the view distance of the surface in the last frame. The history is read there with the 4 bilinear taps. A tap
+// is used only when its view distance is within 4% of the reprojected distance and, for the global illumination, when
+// the cosine between its normal and the normal (turned into the last view space) is 0.9 or more. Thus a surface that
+// was hidden in the last frame (disocclusion) starts again with no history. gi_accum (half size, before gi_denoise)
+// and ao_accum (full size, before the ambient occlusion denoise) keep the mean of at most GI_FRAMES (16) and
+// AO_FRAMES (8) frames: the new result has the weight 1 / k, where k is the number of frames in the history plus 1.
+// The two histories alternate between two textures (by the parity of the frame). The history starts again when the
+// camera of the last frame is not known, when the last frame did not have these passes, or when the textures are
+// made again. The motion of objects that move by themselves is not known (as for the anti-aliasing); the depth and
+// normal tests remove most of their history. Measured on a static view (the town, frame 7300, high levels, film
+// grain off): the fine noise of the lit wall above the noise of a frame without global illumination and ambient
+// occlusion decreased by approximately 75%, and the frame-to-frame change did not increase.
 //
 // Settings: XeGTAO falloff range 0.615, sample distribution power 2, depth mip offset 3.30, denoise beta 1.2. The
 // levels low, medium and high use 1 x 2, 2 x 2 and 3 x 3 slices x steps, an effect radius of 0.8, 1.2 and 1.6 m
@@ -131,6 +151,8 @@
 #define GI_RADIUS (3.0f * UNIT_SCALE)   // the length of a global illumination ray (UNCONFIRMED tuning)
 #define GI_THICK (0.3f * UNIT_SCALE)    // the thickness of a surface of the depth buffer, plus 2% of its distance
 #define GI_MIPS 5u                      // the levels of the global illumination color pyramid (half size and smaller)
+#define GI_FRAMES 16u                   // the most frames in the global illumination history
+#define AO_FRAMES 8u                    // the most frames in the ambient occlusion history
 #define GI_PASSES 4                     // a-trous denoise passes, at the distances 1, 2, 4 and 8
 #define GI_OUT ((GI_PASSES & 1) ? E.gi1 : E.gi0)   // the texture of the last denoise pass
 
@@ -142,7 +164,7 @@ static const char enh_src[] =
     "  float mulx, muly, addx, addy;\n"
     "  float mpx, mpy, da, db;\n"
     "  float radius, falloff, power, mipoff;\n"
-    "  float beta, pad;\n"
+    "  float beta, frame;\n"
     "};\n"
     "constant uint SLICES [[function_constant(0)]];\n"
     "constant uint STEPS [[function_constant(1)]];\n"
@@ -246,7 +268,7 @@ static const char enh_src[] =
     "  float mins = 1.3 / sr;\n"
     "  float fr = c.falloff * c.radius, ff = c.radius * (1.0 - c.falloff);\n"
     "  float fm = -1.0 / fr, fa = ff / fr + 1.0;\n"
-    "  uint hi = hl.read(p % 64).r;\n"
+    "  uint hi = hl.read(p % 64).r + 288u * (uint(c.frame) % 64u);\n"
     "  float nslice = fract(0.5 + float(hi) * 0.75487766624669276);\n"
     "  float nsample = fract(0.5 + float(hi) * 0.56984029099805326);\n"
     "  half3 Vh = half3(V), Nh = half3(N);\n"
@@ -409,7 +431,7 @@ static const char enh_src[] =
     "static float3 to_lin(float3 c) { c = max(c, 0.0); return select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045); }\n"
     "static float3 to_srgb(float3 l) { l = max(l, 0.0); return select(1.055 * pow(l, 1.0 / 2.4) - 0.055, l * 12.92, l <= 0.0031308); }\n"
     // screen-space global illumination (see the comment at the top of the file)
-    "struct GIC { float mulx, muly, addx, addy, da, db, px, py, radius, thick, sw, sh; uint rays, steps, lods, pad1; };\n"
+    "struct GIC { float mulx, muly, addx, addy, da, db, px, py, radius, thick, sw, sh; uint rays, steps, lods, frame; };\n"
     "static float gi_z(depth2d<float, access::read> dt, int2 q, constant GIC &c) {\n"
     "  float d = dt.read(uint2(q));\n"
     "  if (d >= 1.0) return SKY;\n"
@@ -459,7 +481,7 @@ static const char enh_src[] =
     "  o.write(s * 0.25, p);\n"
     "}\n"
     // out: rgb the mean light of the rays (linear), a the view distance of the pixel (SKY: no surface);
-    // nout: xyz the view normal of the pixel (0: none)
+    // nout: xyz the view normal of the pixel (0: none), w the view distance
     "kernel void gi_main(depth2d<float, access::read> dt [[texture(0)]], texture2d<float> gc [[texture(1)]],\n"
     "  texture2d<float, access::write> out [[texture(2)]], texture2d<ushort, access::read> hl [[texture(3)]],\n"
     "  texture2d<float, access::write> nout [[texture(4)]],\n"
@@ -469,15 +491,15 @@ static const char enh_src[] =
     "  int2 mx = int2(int(c.sw) - 1, int(c.sh) - 1);\n"
     "  int2 q = min(int2(p) * 2, mx);\n"
     "  float z = gi_z(dt, q, c);\n"
-    "  if (z >= SKY * 0.5) { out.write(float4(0.0, 0.0, 0.0, SKY), p); nout.write(float4(0.0), p); return; }\n"
+    "  if (z >= SKY * 0.5) { out.write(float4(0.0, 0.0, 0.0, SKY), p); nout.write(float4(0.0, 0.0, 0.0, SKY), p); return; }\n"
     "  float2 px = float2(c.px, c.py), sp = (float2(q) + 0.5) * px;\n"
     "  float3 P = gi_pos(sp, z, c);\n"
     "  float3 N = gi_nrm(dt, q, P, c);\n"
-    "  nout.write(float4(N, 0.0), p);\n"
+    "  nout.write(float4(N, z), p);\n"
     "  if (dot(N, N) < 0.5) { out.write(float4(0.0, 0.0, 0.0, z), p); return; }\n"
     "  float3 T = normalize(abs(N.y) < 0.99 ? cross(N, float3(0.0, 1.0, 0.0)) : cross(N, float3(1.0, 0.0, 0.0)));\n"
     "  float3 B = cross(N, T);\n"
-    "  uint hi = hl.read(uint2(q) % 64u).r;\n"
+    "  uint hi = hl.read(uint2(q) % 64u).r + 288u * (c.frame % 64u);\n"
     "  float n0 = fract(0.5 + float(hi) * 0.75487766624669276), n1 = fract(0.5 + float(hi) * 0.56984029099805326);\n"
     "  float3 O = P + N * (z * 0.004);\n"
     "  float2 ss = float2(c.sw, c.sh);\n"
@@ -522,25 +544,112 @@ static const char enh_src[] =
     "  }\n"
     "  out.write(float4(acc / float(c.rays), z), p);\n"
     "}\n"
-    // a-trous 3 x 3 filter at the distance st (half-size pixels) with a depth weight and a normal weight
+    // a-trous 3 x 3 filter at the distance st (half-size pixels) with a depth weight and a normal weight (the depth and
+    // the normal come from nt); out: rgb the light, a the view distance
     "kernel void gi_denoise(texture2d<float, access::read> a [[texture(0)]], texture2d<float, access::write> o [[texture(1)]],\n"
     "  texture2d<float, access::read> nt [[texture(2)]],\n"
     "  constant int &st [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {\n"
     "  if (p.x >= o.get_width() || p.y >= o.get_height()) return;\n"
     "  int2 mx = int2(int(a.get_width()) - 1, int(a.get_height()) - 1);\n"
-    "  float4 cc = a.read(p);\n"
-    "  if (cc.a >= SKY * 0.5) { o.write(cc, p); return; }\n"
-    "  float3 n0 = nt.read(p).xyz;\n"
+    "  float4 nc = nt.read(p);\n"
+    "  if (nc.w >= SKY * 0.5) { o.write(float4(0.0, 0.0, 0.0, SKY), p); return; }\n"
+    "  float3 n0 = nc.xyz;\n"
     "  bool hn = dot(n0, n0) > 0.5;\n"
     "  float3 s = float3(0.0); float ws = 0.0;\n"
     "  for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {\n"
     "    uint2 qn = uint2(clamp(int2(p) + int2(x, y) * st, int2(0), mx));\n"
-    "    float4 v = a.read(qn);\n"
-    "    float w = (x == 0 ? 2.0 : 1.0) * (y == 0 ? 2.0 : 1.0) * saturate(1.0 - abs(v.a - cc.a) / (cc.a * 0.03));\n"
-    "    if (hn && (x != 0 || y != 0)) w *= pow(saturate(dot(n0, nt.read(qn).xyz)), 8.0);\n"
+    "    float4 v = a.read(qn), nv = nt.read(qn);\n"
+    "    float w = (x == 0 ? 2.0 : 1.0) * (y == 0 ? 2.0 : 1.0) * saturate(1.0 - abs(nv.w - nc.w) / (nc.w * 0.03));\n"
+    "    if (hn && (x != 0 || y != 0)) w *= pow(saturate(dot(n0, nv.xyz)), 8.0);\n"
     "    s += v.rgb * w; ws += w;\n"
     "  }\n"
-    "  o.write(float4(s / ws, cc.a), p);\n"
+    "  o.write(float4(s / ws, nc.w), p);\n"
+    "}\n"
+    // temporal accumulation (see the comment at the top of the file). TA.r: the rows of inverse(this frame's
+    // view-projection) x the last frame's view-projection (row vectors); rot: the rows of the rotation from this frame's
+    // view space to the last frame's view space; valid = 0: no history (it starts again); stats != 0: count the pixels
+    "struct TA { float4 r[4]; float4 rot[3]; float sw, sh, da, db; uint valid, stats, maxn, pad; };\n"
+    // the screen position (0 .. 1) and the view distance in the last frame of the surface at the screen position sp and
+    // the view distance z of this frame; false when the surface is behind the last camera
+    "static bool ta_reproj(float2 sp, float z, constant TA &t, thread float2 &ps, thread float &pz) {\n"
+    "  float d = t.da + t.db / z;\n"
+    "  float4 q = (sp.x * 2.0 - 1.0) * t.r[0] + (1.0 - sp.y * 2.0) * t.r[1] + d * t.r[2] + t.r[3];\n"
+    "  if (!(q.w > 1e-6)) return false;\n"
+    "  float2 n = q.xy / q.w;\n"
+    "  ps = float2(n.x * 0.5 + 0.5, 0.5 - n.y * 0.5);\n"
+    "  pz = q.w * z;\n"   // q is the last clip position / this view distance
+    "  return true;\n"
+    "}\n"
+    // cnt: 0 the pixels with a surface, 1 the pixels with no history, 2 the sum of the motion (1/4 pixels)
+    "static void ta_count(device atomic_uint *cnt, uint base, bool hist, float mv) {\n"
+    "  atomic_fetch_add_explicit(&cnt[base], 1u, memory_order_relaxed);\n"
+    "  if (!hist) atomic_fetch_add_explicit(&cnt[base + 1u], 1u, memory_order_relaxed);\n"
+    "  atomic_fetch_add_explicit(&cnt[base + 2u], uint(min(mv, 1000.0) * 4.0), memory_order_relaxed);\n"
+    "}\n"
+    // the global illumination at half size: cur the light of this frame (rgb), nc the normal and the view distance of
+    // this frame, hp the history of the last frame (rgb the light, a the frames in it), np the normal and the view
+    // distance of the last frame; ho the new history
+    "kernel void gi_accum(texture2d<float, access::read> cur [[texture(0)]], texture2d<float, access::read> nc [[texture(1)]],\n"
+    "  texture2d<float, access::read> hp [[texture(2)]], texture2d<float, access::read> np [[texture(3)]],\n"
+    "  texture2d<float, access::write> ho [[texture(4)]], constant TA &t [[buffer(0)]], device atomic_uint *cnt [[buffer(1)]],\n"
+    "  uint2 p [[thread_position_in_grid]]) {\n"
+    "  if (p.x >= ho.get_width() || p.y >= ho.get_height()) return;\n"
+    "  float3 c = cur.read(p).rgb;\n"
+    "  float4 n = nc.read(p);\n"
+    "  if (n.w >= SKY * 0.5 || dot(n.xyz, n.xyz) < 0.5) { ho.write(float4(c, 1.0), p); return; }\n"
+    "  float nh = 0.0, mv = 0.0;\n"
+    "  float3 hs = float3(0.0);\n"
+    "  float2 ss = float2(t.sw, t.sh), sp = (float2(min(int2(p) * 2, int2(ss) - 1)) + 0.5) / ss, ps;\n"
+    "  float pz;\n"
+    "  if (t.valid != 0u && ta_reproj(sp, n.w, t, ps, pz)) {\n"
+    "    mv = length((ps - sp) * ss);\n"
+    "    float3 pn = n.x * t.rot[0].xyz + n.y * t.rot[1].xyz + n.z * t.rot[2].xyz;\n"
+    "    float2 hq = (ps * ss - 0.5) * 0.5, b = floor(hq), fr = hq - b;\n"   // in the pixels of the half-size history
+    "    int2 hm = int2(int(hp.get_width()) - 1, int(hp.get_height()) - 1);\n"
+    "    float4 acc = float4(0.0); float ws = 0.0;\n"
+    "    for (int i = 0; i < 4; i++) {\n"
+    "      int2 o = int2(i & 1, i >> 1), qq = int2(b) + o;\n"
+    "      if (any(qq < 0) || any(qq > hm)) continue;\n"
+    "      float4 pv = np.read(uint2(qq));\n"
+    "      if (!(abs(pv.w - pz) < 0.04 * pz) || dot(pv.xyz, pn) < 0.9) continue;\n"
+    "      float w = (o.x != 0 ? fr.x : 1.0 - fr.x) * (o.y != 0 ? fr.y : 1.0 - fr.y);\n"
+    "      acc += hp.read(uint2(qq)) * w; ws += w;\n"
+    "    }\n"
+    "    if (ws > 0.05) { acc /= ws; nh = acc.a; hs = acc.rgb; }\n"
+    "  }\n"
+    "  float k = min(nh, float(t.maxn) - 1.0) + 1.0;\n"
+    "  ho.write(float4(nh > 0.0 ? mix(hs, c, 1.0 / k) : c, nh > 0.0 ? k : 1.0), p);\n"
+    "  if (t.stats != 0u) ta_count(cnt, 0u, nh > 0.0, mv);\n"
+    "}\n"
+    // the ambient occlusion at full size: cur the visibility of this frame, zt the view distance of this frame (depth mip
+    // 0), hp the history of the last frame (r the visibility, g the frames in it, b the view distance); ho the new history
+    "kernel void ao_accum(texture2d<float, access::read> cur [[texture(0)]], texture2d<float, access::read> zt [[texture(1)]],\n"
+    "  texture2d<float, access::read> hp [[texture(2)]], texture2d<float, access::write> ho [[texture(3)]],\n"
+    "  constant TA &t [[buffer(0)]], device atomic_uint *cnt [[buffer(1)]], uint2 p [[thread_position_in_grid]]) {\n"
+    "  if (p.x >= ho.get_width() || p.y >= ho.get_height()) return;\n"
+    "  float a = cur.read(p).r, z = zt.read(p).r;\n"
+    "  if (z >= SKY * 0.5) { ho.write(float4(a, 1.0, SKY, 0.0), p); return; }\n"
+    "  float nh = 0.0, hs = 0.0, mv = 0.0;\n"
+    "  float2 ss = float2(t.sw, t.sh), sp = (float2(p) + 0.5) / ss, ps;\n"
+    "  float pz;\n"
+    "  if (t.valid != 0u && ta_reproj(sp, z, t, ps, pz)) {\n"
+    "    mv = length((ps - sp) * ss);\n"
+    "    float2 hq = ps * ss - 0.5, b = floor(hq), fr = hq - b;\n"
+    "    int2 hm = int2(int(hp.get_width()) - 1, int(hp.get_height()) - 1);\n"
+    "    float2 acc = float2(0.0); float ws = 0.0;\n"
+    "    for (int i = 0; i < 4; i++) {\n"
+    "      int2 o = int2(i & 1, i >> 1), qq = int2(b) + o;\n"
+    "      if (any(qq < 0) || any(qq > hm)) continue;\n"
+    "      float4 h = hp.read(uint2(qq));\n"
+    "      if (!(abs(h.b - pz) < 0.04 * pz)) continue;\n"
+    "      float w = (o.x != 0 ? fr.x : 1.0 - fr.x) * (o.y != 0 ? fr.y : 1.0 - fr.y);\n"
+    "      acc += h.rg * w; ws += w;\n"
+    "    }\n"
+    "    if (ws > 0.05) { acc /= ws; hs = acc.x; nh = acc.y; }\n"
+    "  }\n"
+    "  float k = min(nh, float(t.maxn) - 1.0) + 1.0;\n"
+    "  ho.write(float4(nh > 0.0 ? mix(hs, a, 1.0 / k) : a, nh > 0.0 ? k : 1.0, z, 0.0), p);\n"
+    "  if (t.stats != 0u) ta_count(cnt, 3u, nh > 0.0, mv);\n"
     "}\n"
     // the half-size result at the full-size pixel ip (view distance z): a 3 x 3 filter with spatial and depth weights
     "static float3 gi_up(texture2d<float, access::read> g, int2 ip, float z) {\n"
@@ -679,11 +788,12 @@ static const char enh_src[] =
     "  return float4(to_srgb(mix(to_lin(dst.rgb), up8(t, in.uv, p.px) * p.inv, p.k)), dst.a);\n"
     "}\n";
 
-typedef struct { float sx, sy, px, py, mulx, muly, addx, addy, mpx, mpy, da, db, radius, falloff, power, mipoff, beta, pad; } AOC;
+typedef struct { float sx, sy, px, py, mulx, muly, addx, addy, mpx, mpy, da, db, radius, falloff, power, mipoff, beta, frame; } AOC;
 typedef struct { float light[4]; int32_t offset[2]; float far_z, near_z, thickness, bilinear, contrast, pad, da, db, fade_start, fade_end; } SSSP;
 typedef struct { float beta; uint32_t ao, contact; float strength; float light[4]; float mulx, muly, addx, addy, da, db, px, py;
                  uint32_t gi; float gik, pad0, pad1; } CC;
-typedef struct { float mulx, muly, addx, addy, da, db, px, py, radius, thick, sw, sh; uint32_t rays, steps, lods, pad1; } GIC;
+typedef struct { float mulx, muly, addx, addy, da, db, px, py, radius, thick, sw, sh; uint32_t rays, steps, lods, frame; } GIC;
+typedef struct { float r[4][4]; float rot[3][4]; float sw, sh, da, db; uint32_t valid, stats, maxn, pad; } TA;
 typedef struct { int32_t count[3]; int32_t offset[2]; } SssDispatch;
 
 typedef struct { float px[2]; float k, inv; } BP;
@@ -701,9 +811,11 @@ static const float gi_strength[4] = {0.0f, 0.75f, 1.5f, 2.25f};
 static struct {
     id<MTLDevice> dev;
     id<MTLLibrary> lib;
-    id<MTLComputePipelineState> prefilter, main_pso[4], denoise, sss, gi_main, gi_denoise, gi_color0, gi_colordown;
+    id<MTLComputePipelineState> prefilter, main_pso[4], denoise, sss, gi_main, gi_denoise, gi_color0, gi_colordown, gi_accum, ao_accum;
     id<MTLRenderPipelineState> apply; MTLPixelFormat apply_fmt;
-    id<MTLTexture> hilbert, depths, mip[AO_MIPS], ao0, ao1, edges, shadow, gi0, gi1, gin, gc, gcm[GI_MIPS];
+    id<MTLTexture> hilbert, depths, mip[AO_MIPS], ao0, ao1, edges, shadow, gi0, gi1, gin[2], gc, gcm[GI_MIPS], gh[2], aoh[2];
+    id<MTLBuffer> nostats;          // the counter buffer of the frames without statistics
+    uint32_t gi_hist, ao_hist;      // the frame of the last history of the global illumination / ambient occlusion (0: none)
     id<MTLRenderPipelineState> bloom_pre, bloom_down, bloom_up, bloom_comp; MTLPixelFormat bloom_comp_fmt;
     id<MTLTexture> bloom_lv[BLOOM_LEVELS];
     id<MTLComputePipelineState> taa_motion;
@@ -766,6 +878,11 @@ static void setup(id<MTLDevice> dev) {
     E.gi_denoise = kernel_of(@"gi_denoise", nil);
     E.gi_color0 = kernel_of(@"gi_color0", nil);
     E.gi_colordown = kernel_of(@"gi_colordown", nil);
+    E.gi_accum = kernel_of(@"gi_accum", nil);
+    E.ao_accum = kernel_of(@"ao_accum", nil);
+    static const uint32_t zero[8];
+    E.nostats = [dev newBufferWithBytes:zero length:sizeof zero options:MTLResourceStorageModeShared];
+    if (!E.nostats) rt_fatal("[d3d9] out of memory for the temporal accumulation counters");
 }
 static id<MTLTexture> tex_of(id<MTLTexture> __strong *slot, NSUInteger w, NSUInteger h, MTLPixelFormat fmt, NSUInteger mips) {
     id<MTLTexture> t = *slot;
@@ -837,7 +954,7 @@ static int dispatch_list(const float lp[4], int w, int h, float light_out[4], Ss
 }
 
 int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTexture> depth,
-                   const EnhScene *s, int ao, int contact, int gi) {
+                   const EnhScene *s, int ao, int contact, int gi, int temporal) {
     if (ao < 0) ao = 0;
     if (ao > 3) ao = 3;
     if (gi < 0) gi = 0;
@@ -875,13 +992,33 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
             k.light[cc] = a;
         }
         k.light[3] = s->light[3];
+        // temporal accumulation: the reprojection of this frame, and the counters of the statistics (rt_verbose, every 600
+        // frames)
+        TA t; memset(&t, 0, sizeof t);
+        memcpy(t.r, s->reproj, sizeof t.r);
+        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) t.rot[i][j] = s->rot[i * 3 + j];
+        t.sw = (float)w; t.sh = (float)h; t.da = da; t.db = db;
+        int stats = temporal && s->have_reproj && rt_verbose && s->frame % 600 == 0 && (gi || ao);
+        id<MTLBuffer> cnt = E.nostats;
+        if (stats) {
+            static const uint32_t zero[8];
+            cnt = [dev newBufferWithBytes:zero length:sizeof zero options:MTLResourceStorageModeShared];
+            if (!cnt) rt_fatal("[d3d9] out of memory for the temporal accumulation counters");
+            t.stats = 1;
+        }
         if (gi) {
             if (!(color.usage & MTLTextureUsageShaderRead))
                 rt_fatal("[d3d9] global illumination: the back buffer texture cannot be read by a shader (usage 0x%lx)", (unsigned long)color.usage);
             NSUInteger hw = (w + 1) / 2, hh = (h + 1) / 2;
             tex_of(&E.gi0, hw, hh, MTLPixelFormatRGBA16Float, 1);
             tex_of(&E.gi1, hw, hh, MTLPixelFormatRGBA16Float, 1);
-            tex_of(&E.gin, hw, hh, MTLPixelFormatRGBA16Float, 1);
+            // the textures of the history are made again when the size changes; the history then starts again
+            int fresh = !E.gh[0] || E.gh[0].width != hw || E.gh[0].height != hh;
+            for (int i = 0; i < 2; i++) {
+                tex_of(&E.gin[i], hw, hh, MTLPixelFormatRGBA16Float, 1);
+                tex_of(&E.gh[i], hw, hh, MTLPixelFormatRGBA16Float, 1);
+            }
+            uint32_t cur = s->frame & 1u;
             if (!E.gc || E.gc.width != hw || E.gc.height != hh) {
                 tex_of(&E.gc, hw, hh, MTLPixelFormatRGBA16Float, GI_MIPS);
                 for (NSUInteger i = 0; i < GI_MIPS; i++) {
@@ -891,7 +1028,7 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
                 }
             }
             GIC g = {k.mulx, k.muly, k.addx, k.addy, da, db, k.px, k.py, GI_RADIUS, GI_THICK, (float)w, (float)h,
-                     gi_rays[gi], gi_steps[gi], GI_MIPS - 1, 0};
+                     gi_rays[gi], gi_steps[gi], GI_MIPS - 1, temporal ? s->frame : 0};
             if (!E.logged_gi) {
                 rt_log("[d3d9] screen-space global illumination %lux%lu (computed at %lux%lu): %u rays x %u steps, strength %.2f, "
                        "color pyramid of %u levels, 3 bisection steps for each hit, %d normal-weighted denoise passes",
@@ -916,15 +1053,30 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
             [ce setTexture:E.gc atIndex:1];
             [ce setTexture:E.gi0 atIndex:2];
             [ce setTexture:E.hilbert atIndex:3];
-            [ce setTexture:E.gin atIndex:4];
+            [ce setTexture:E.gin[cur] atIndex:4];
             [ce dispatchThreads:MTLSizeMake(hw, hh, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-            // GI_PASSES a-trous passes (distances 1, 2, 4, ...): gi0 -> gi1 -> gi0 -> ...
+            if (temporal) {
+                // gi0 and the history of the last frame -> gh[cur]
+                t.valid = (uint32_t)(s->have_reproj && !fresh && E.gi_hist != 0 && E.gi_hist + 1 == s->frame);
+                t.maxn = GI_FRAMES;
+                [ce setComputePipelineState:E.gi_accum];
+                [ce setBytes:&t length:sizeof t atIndex:0];
+                [ce setBuffer:cnt offset:0 atIndex:1];
+                [ce setTexture:E.gi0 atIndex:0];
+                [ce setTexture:E.gin[cur] atIndex:1];
+                [ce setTexture:E.gh[cur ^ 1u] atIndex:2];
+                [ce setTexture:E.gin[cur ^ 1u] atIndex:3];
+                [ce setTexture:E.gh[cur] atIndex:4];
+                [ce dispatchThreads:MTLSizeMake(hw, hh, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+                E.gi_hist = s->frame;
+            } else E.gi_hist = 0;
+            // GI_PASSES a-trous passes (distances 1, 2, 4, ...): gh[cur] (or gi0) -> gi1 -> gi0 -> ...
             [ce setComputePipelineState:E.gi_denoise];
-            [ce setTexture:E.gin atIndex:2];
+            [ce setTexture:E.gin[cur] atIndex:2];
             for (int i = 0; i < GI_PASSES; i++) {
                 int32_t st = 1 << i;
                 [ce setBytes:&st length:sizeof st atIndex:0];
-                [ce setTexture:(i & 1) ? E.gi1 : E.gi0 atIndex:0];
+                [ce setTexture:i == 0 ? (temporal ? E.gh[cur] : E.gi0) : (i & 1) ? E.gi1 : E.gi0 atIndex:0];
                 [ce setTexture:(i & 1) ? E.gi0 : E.gi1 atIndex:1];
                 [ce dispatchThreads:MTLSizeMake(hw, hh, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
             }
@@ -947,6 +1099,7 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
             c.mpx = c.mulx * c.px; c.mpy = c.muly * c.py;
             c.da = da; c.db = db;
             c.radius = ao_radius[ao] * UNIT_SCALE * 1.457f; c.falloff = 0.615f; c.power = ao_power[ao]; c.mipoff = 3.30f; c.beta = 1.2f;
+            c.frame = temporal ? (float)(s->frame % 64u) : 0.0f;
             if (!E.logged_ao) { rt_log("[d3d9] XeGTAO ambient occlusion %lux%lu: %u slices x %u steps", (unsigned long)w, (unsigned long)h, ao_slices[ao], ao_steps[ao]); E.logged_ao = 1; }
             [ce setBytes:&c length:sizeof c atIndex:0];
             [ce setTexture:depth atIndex:0];
@@ -959,10 +1112,29 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
             [ce setTexture:E.hilbert atIndex:3];
             [ce setComputePipelineState:E.main_pso[ao]];
             [ce dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+            id<MTLTexture> aoin = E.ao0;
+            if (temporal) {
+                // ao0 and the history of the last frame -> aoh[cur]
+                int fresh = !E.aoh[0] || E.aoh[0].width != w || E.aoh[0].height != h;
+                for (int i = 0; i < 2; i++) tex_of(&E.aoh[i], w, h, MTLPixelFormatRGBA16Float, 1);
+                uint32_t cur = s->frame & 1u;
+                t.valid = (uint32_t)(s->have_reproj && !fresh && E.ao_hist != 0 && E.ao_hist + 1 == s->frame);
+                t.maxn = AO_FRAMES;
+                [ce setComputePipelineState:E.ao_accum];
+                [ce setBytes:&t length:sizeof t atIndex:0];
+                [ce setBuffer:cnt offset:0 atIndex:1];
+                [ce setTexture:E.ao0 atIndex:0];
+                [ce setTexture:E.mip[0] atIndex:1];
+                [ce setTexture:E.aoh[cur ^ 1u] atIndex:2];
+                [ce setTexture:E.aoh[cur] atIndex:3];
+                [ce dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+                E.ao_hist = s->frame;
+                aoin = E.aoh[cur];
+            } else E.ao_hist = 0;
             // the first denoise pass (less weight on the center); the second is the composite
             float beta = c.beta / 5.0f;
             [ce setBytes:&beta length:sizeof beta atIndex:0];
-            [ce setTexture:E.ao0 atIndex:0];
+            [ce setTexture:aoin atIndex:0];
             [ce setTexture:E.edges atIndex:1];
             [ce setTexture:E.ao1 atIndex:2];
             [ce setComputePipelineState:E.denoise];
@@ -995,6 +1167,20 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
             }
         }
         [ce endEncoding];
+        if (!gi) E.gi_hist = 0;
+        if (!ao) E.ao_hist = 0;
+        if (stats) {
+            uint32_t fn = s->frame;
+            int sg = gi, sa = ao;
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+                (void)b;
+                const uint32_t *v = (const uint32_t *)cnt.contents;
+                rt_log("[d3d9] temporal accumulation: frame %u, global illumination %s: no history at %.2f%% of %u pixels, mean motion "
+                       "%.2f pixels; ambient occlusion %s: no history at %.2f%% of %u pixels, mean motion %.2f pixels", fn,
+                       sg ? "on" : "off", v[0] ? 100.0 * v[1] / v[0] : 0.0, v[0], v[0] ? 0.25 * v[2] / v[0] : 0.0,
+                       sa ? "on" : "off", v[3] ? 100.0 * v[4] / v[3] : 0.0, v[3], v[3] ? 0.25 * v[5] / v[3] : 0.0);
+            }];
+        }
         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
         rp.colorAttachments[0].texture = color;
         rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
