@@ -42,7 +42,6 @@ static const setting_text graphics_rows[] = {
     { offsetof(RtEnh, gi), "Global Illumination (RTGI)", "Light that bounces from lit surfaces into the shadows.",
       { "Off", "Low", "Medium", "High" } },
     { offsetof(RtEnh, ao), "Ambient Occlusion", "Darker corners and contact areas.", { "Off", "Low", "Medium", "High" } },
-    { offsetof(RtEnh, temporal), "Temporal Accumulation", "Less noise in global illumination and ambient occlusion.", { "Off", "On" } },
     { offsetof(RtEnh, contact), "Contact Shadows", "Small shadows where a character blocks the light.", { "Off", "On" } },
     { offsetof(RtEnh, shadows), "Sharp Character Shadows", "Sharper shadows. Uses more graphics memory.", { "Off", "On" } },
     { offsetof(RtEnh, bloom), "Bloom", "A soft glow that spreads from bright areas.", { "Off", "Low", "Medium", "High" } },

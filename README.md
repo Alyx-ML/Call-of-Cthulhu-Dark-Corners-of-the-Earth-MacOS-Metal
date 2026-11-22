@@ -101,7 +101,6 @@ The game has a menu **Options > Enhancements**. The menu also shows in the pause
 | Raw Mouse Input | Off, On |
 | Global Illumination (RTGI) | Off, Low, Medium, High |
 | Ambient Occlusion | Off, Low, Medium, High |
-| Temporal Accumulation | Off, On |
 | GT7 Tone Mapping | Off, On |
 | HDR Output | Off, On |
 | Contact Shadows | Off, On |
@@ -111,7 +110,7 @@ The game has a menu **Options > Enhancements**. The menu also shows in the pause
 
 **Options > Video** has the setting **Subtitle Size** (Game, 1.25x, 1.5x, 1.75x, 2x).
 
-These items are always on: 16x anisotropic texture filtering, reduced color banding, 10-bit color output and game controller support (SDL3).
+These items are always on: 16x anisotropic texture filtering, reduced color banding, 10-bit color output, game controller support (SDL3) and temporal accumulation of Global Illumination and Ambient Occlusion.
 
 The game made its menus, text and pointer for 4:3 screens. On a wider screen, the app draws them in the centered 4:3 area, so that they keep their shape. Backgrounds and fades that fill the screen, and the bands behind the subtitles, keep the full width.
 
@@ -120,7 +119,7 @@ HDR Output needs a display with HDR (EDR) support. HDR Output and GT7 Tone Mappi
 - **Highlights:** the game clamps its final image to white. The app keeps the colors of the scene that are brighter than white (lamps, fire, bloom) from before the game's post-processing. With HDR Output, these highlights go above the white of the game, up to the peak. With GT7 Tone Mapping in SDR, they keep their detail.
 - **GT7 Tone Mapping** is the tone mapping of Gran Turismo 7 (Polyphony Digital, MIT license), with the parameters of the reference. The toe of the curve makes the shadows darker, as in the reference, and the curve compresses the highlights. In SDR, the white of the game is at 250 nits of the reference. With HDR Output, the white of the game is at paper white and the highlights go up to the peak.
 - **Global Illumination (RTGI)** adds light that bounces from lit surfaces onto the surfaces near them. The light keeps the color of the surface that it lights. The app traces rays in screen space, against the depth and the colors of the 3D scene. Thus the bounce light can come only from surfaces that are on the screen. A surface gives bounce light only from its front side, so the light does not leak through objects. Low, Medium and High use more rays and more light. On the test Mac (1800 × 1125, all other enhancements on), the game stayed at 60 frames per second with High.
-- **Temporal Accumulation** (default On) decreases the noise of Global Illumination and Ambient Occlusion. Each frame calculates the light with different noise. The app keeps the mean of the last frames for each surface: at most 16 frames for Global Illumination and 8 frames for Ambient Occlusion. It uses the camera of each frame to find the same surface in the last frame. A surface that was not visible in the last frame starts with no history. On a static view in the town, the fine noise that Global Illumination and Ambient Occlusion add to a lit wall decreased by approximately 75%. The game stayed at 60 frames per second.
+- **Temporal accumulation** (always on, no setting) decreases the noise of Global Illumination and Ambient Occlusion. Each frame calculates the light with different noise. The app keeps the mean of the last frames for each surface: at most 16 frames for Global Illumination and 8 frames for Ambient Occlusion. It uses the camera of each frame to find the same surface in the last frame. A surface that was not visible in the last frame starts with no history. On a static view in the town, the fine noise that Global Illumination and Ambient Occlusion add to a lit wall decreased by approximately 75%. The game stayed at 60 frames per second.
 - **Bloom** has no threshold: it mixes a wide blur of the scene into the scene (Low 4%, Medium 8%, High 15%). Bright areas spread light into their surroundings.
 - **Field of View** multiplies the field of view of the player camera (the game: 55 degrees vertical). Cut scenes keep their field of view. All cameras use the aspect ratio of the window, so that the 3D image is not too wide.
 - **Sanity Effects** sets the strength of the visual sanity effects of the game: Black And White, Blurred Vision, Vertigo Blur, Screen Distort and Camera Motion Blur. Off removes them. The sounds and the sanity value of the game do not change.

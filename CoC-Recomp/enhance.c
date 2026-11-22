@@ -18,7 +18,7 @@
 // Anisotropic filtering is always 16x and is not in the menu (the file can set another value).
 // Reduced banding and the gamepad are always on and are not in the menu or the file.
 // Defaults: headphone audio, anti-aliasing, global illumination, ambient occlusion, tone mapping, HDR, contact shadows, bloom, sharp character
-// shadows and skip intro videos off; temporal accumulation on; subtitles at the game's size; the game's field of view, sanity effects and film grain; Max Brightness
+// shadows and skip intro videos off; subtitles at the game's size; the game's field of view, sanity effects and film grain; Max Brightness
 // (HDR) 0 (1000 nits) and Brightness (HDR) 0 (300 nits).
 #include "rt32.h"
 #include "enhance.h"
@@ -67,7 +67,7 @@ extern void (*rt_dinput_poll_hook)(void);   // dinput8.c
 #define TXT_BASE 0xE000u
 enum { T_TITLE, T_GAME, T_2X, T_AO, T_OFF, T_LOW, T_MEDIUM, T_HIGH, T_ON,
        T_TONEMAP, T_HDR, T_CONTACT, T_SKIP, T_BLOOM, T_SHADOWS, T_SUBS, T_125, T_150, T_175,
-       T_CALIB, T_PEAK, T_PAPER, T_FOV, T_110, T_120, T_130, T_140, T_SANITY, T_S75, T_S50, T_S25, T_AA, T_HRTF, T_RAWMOUSE, T_GI, T_GRAIN, T_TEMPORAL,
+       T_CALIB, T_PEAK, T_PAPER, T_FOV, T_110, T_120, T_130, T_140, T_SANITY, T_S75, T_S50, T_S25, T_AA, T_HRTF, T_RAWMOUSE, T_GI, T_GRAIN,
        T_NITS0, T_NITS_END = T_NITS0 + RT_ENH_HDR_PEAKS - 1,     // the values of RT_ENH_HDR_PEAK_NITS
        T_BRI0, T_BRI_END = T_BRI0 + RT_ENH_HDR_PAPERS - 1,       // the values of RT_ENH_HDR_PAPER_NITS
        T_COUNT };
@@ -81,7 +81,7 @@ static const char *const txt[T_COUNT] = {
     [T_FOV] = "Field of View", [T_110] = "110%", [T_120] = "120%", [T_130] = "130%", [T_140] = "140%",
     [T_SANITY] = "Sanity Effects", [T_S75] = "75%", [T_S50] = "50%", [T_S25] = "25%",
     [T_AA] = "Anti-Aliasing (MetalFX)", [T_HRTF] = "Headphone Audio (HRTF)", [T_RAWMOUSE] = "Raw Mouse Input",
-    [T_GI] = "Global Illumination (RTGI)", [T_GRAIN] = "Film Grain", [T_TEMPORAL] = "Temporal Accumulation",
+    [T_GI] = "Global Illumination (RTGI)", [T_GRAIN] = "Film Grain",
     // the steps -10 .. +10 of the two settings of the RE Engine, with their values in nits (rt_enh.h)
     [T_NITS0] =
     "-10 (300 nits)", "-9 (400 nits)", "-8 (500 nits)", "-7 (600 nits)", "-6 (700 nits)", "-5 (750 nits)",
@@ -130,13 +130,12 @@ const CocEnhKey coc_enh_keys[] = {
     {"raw_mouse_input", offsetof(RtEnh, raw_mouse), 1, 0},
     {"global_illumination", offsetof(RtEnh, gi), 3, 0},
     {"film_grain", offsetof(RtEnh, grain), 1, 0},   // 0: the game's film grain; 1: off
-    {"temporal_accumulation", offsetof(RtEnh, temporal), 1, 1},   // of the global illumination and the ambient occlusion
 };
-enum { K_ANISO, K_AO, K_TONEMAP, K_HDR, K_CONTACT, K_SKIP, K_BLOOM, K_SHADOWS, K_SUBS, K_PEAK, K_PAPER, K_FOV, K_SANITY, K_AA, K_HRTF, K_RAWMOUSE, K_GI, K_GRAIN, K_TEMPORAL };
-// keys of earlier versions: settings that are now always on (gamepad, reduced_banding) and the HDR calibration of
-// other steps (hdr_peak: 400 .. 4000 nits; hdr_paper_white: a percentage of the SDR white of macOS). The loader skips
-// them, and the next save leaves them out.
-static const char *const retired_keys[] = {"gamepad", "reduced_banding", "hdr_peak", "hdr_paper_white"};
+enum { K_ANISO, K_AO, K_TONEMAP, K_HDR, K_CONTACT, K_SKIP, K_BLOOM, K_SHADOWS, K_SUBS, K_PEAK, K_PAPER, K_FOV, K_SANITY, K_AA, K_HRTF, K_RAWMOUSE, K_GI, K_GRAIN };
+// keys of earlier versions: settings that are now always on (gamepad, reduced_banding, temporal_accumulation) and the
+// HDR calibration of other steps (hdr_peak: 400 .. 4000 nits; hdr_paper_white: a percentage of the SDR white of macOS).
+// The loader skips them, and the next save leaves them out.
+static const char *const retired_keys[] = {"gamepad", "reduced_banding", "hdr_peak", "hdr_paper_white", "temporal_accumulation"};
 #define NKEYS (sizeof coc_enh_keys / sizeof coc_enh_keys[0])
 static const CocEnhKey *const keys = coc_enh_keys;
 const size_t coc_enh_nkeys = NKEYS;
@@ -170,10 +169,10 @@ static void cfg_save(void) {
     if (!coc_enh_write(rt_enh, problem, sizeof problem)) { rt_log("[enh] %s The settings are not saved.", problem); return; }
     saved = *rt_enh;
     if (rt_verbose) rt_log("[enh] settings saved: aniso %d, ao %d, tonemap %d, hdr %d, contact %d, skip_intro %d, "
-                           "bloom %d, shadows %d, subtitle size %d, hdr max brightness %d, hdr brightness %d, field of view %d, sanity effects %d, anti-aliasing %d, headphone audio %d, raw mouse input %d, global illumination %d, film grain %d, temporal accumulation %d",
+                           "bloom %d, shadows %d, subtitle size %d, hdr max brightness %d, hdr brightness %d, field of view %d, sanity effects %d, anti-aliasing %d, headphone audio %d, raw mouse input %d, global illumination %d, film grain %d",
                            rt_enh->aniso,
                            rt_enh->ao, rt_enh->tonemap, rt_enh->hdr, rt_enh->contact, rt_enh->skip_intro, rt_enh->bloom,
-                           rt_enh->shadows, rt_enh->sub_scale, rt_enh->hdr_peak, rt_enh->hdr_paper, rt_enh->fov, rt_enh->sanity, rt_enh->aa, rt_enh->hrtf, rt_enh->raw_mouse, rt_enh->gi, rt_enh->grain, rt_enh->temporal);
+                           rt_enh->shadows, rt_enh->sub_scale, rt_enh->hdr_peak, rt_enh->hdr_paper, rt_enh->fov, rt_enh->sanity, rt_enh->aa, rt_enh->hrtf, rt_enh->raw_mouse, rt_enh->gi, rt_enh->grain);
 }
 int coc_enh_read(RtEnh *e, char *problem, size_t n) {
     memset(e, 0, sizeof *e);
@@ -284,13 +283,13 @@ void coc_enh_init(void) {
     rt_dinput_poll_hook = input_frame;
     static const char *const lvl[] = {"off", "low", "medium", "high"}, *const sub[] = {"game", "1.25x", "1.5x", "1.75x", "2x"};
     rt_log("[enh] settings: anisotropic filtering %s, ambient occlusion %s, GT7 tone mapping %s, HDR %s (max brightness %s, "
-           "brightness %s), contact shadows %s, bloom %s, sharp character shadows %s, subtitle size %s, skip intro videos %s, field of view %s, sanity effects %s, anti-aliasing %s, headphone audio %s, raw mouse input %s, global illumination %s, film grain %s, temporal accumulation %s",
+           "brightness %s), contact shadows %s, bloom %s, sharp character shadows %s, subtitle size %s, skip intro videos %s, field of view %s, sanity effects %s, anti-aliasing %s, headphone audio %s, raw mouse input %s, global illumination %s, film grain %s",
            (const char *[]){"game", "2x", "4x", "8x", "16x"}[rt_enh->aniso], lvl[rt_enh->ao], rt_enh->tonemap ? "on" : "off",
            rt_enh->hdr ? "on" : "off", txt[T_NITS0 + rt_enh->hdr_peak], txt[T_BRI0 + rt_enh->hdr_paper],
            rt_enh->contact ? "on" : "off", lvl[rt_enh->bloom], rt_enh->shadows ? "on" : "off", sub[rt_enh->sub_scale],
            rt_enh->skip_intro ? "on" : "off", (const char *[]){"game", "110%", "120%", "130%", "140%"}[rt_enh->fov],
            (const char *[]){"game", "75%", "50%", "25%", "off"}[rt_enh->sanity], rt_enh->aa ? "MetalFX" : "off", rt_enh->hrtf ? "HRTF" : "off",
-           rt_enh->raw_mouse ? "on" : "off", lvl[rt_enh->gi], rt_enh->grain ? "off" : "game", rt_enh->temporal ? "on" : "off");
+           rt_enh->raw_mouse ? "on" : "off", lvl[rt_enh->gi], rt_enh->grain ? "off" : "game");
 }
 
 // ---- the field of view and the aspect ratio ----
@@ -414,7 +413,7 @@ void coc_enh_add_link(CPU *c, uint32_t menu) {
     CALL(G_CTL_LINK, ctl, 1, calib_name_guest(), 0);
 }
 
-#define ENH_SETTINGS 15                  // the settings in the Enhancements menu (coc_enh_build_menu)
+#define ENH_SETTINGS 14                  // the settings in the Enhancements menu (coc_enh_build_menu)
 static void add_enum(CPU *c, uint32_t menu, int label, const int *values, int nvalues, size_t key) {
     uint32_t ctl = CALL(G_MENU_ADD, menu, S_TEXTOPTIONENUM);
     if (!ctl) rt_fatal("[enh] the menu system did not add an Enhancements control");
@@ -514,7 +513,6 @@ void coc_enh_build_menu(CPU *c) {
     add_enum(c, menu, T_RAWMOUSE, (const int[]){T_OFF, T_ON}, 2, K_RAWMOUSE);
     add_enum(c, menu, T_GI, (const int[]){T_OFF, T_LOW, T_MEDIUM, T_HIGH}, 4, K_GI);
     add_enum(c, menu, T_AO, (const int[]){T_OFF, T_LOW, T_MEDIUM, T_HIGH}, 4, K_AO);
-    add_enum(c, menu, T_TEMPORAL, (const int[]){T_OFF, T_ON}, 2, K_TEMPORAL);
     add_enum(c, menu, T_TONEMAP, (const int[]){T_OFF, T_ON}, 2, K_TONEMAP);
     add_enum(c, menu, T_HDR, (const int[]){T_OFF, T_ON}, 2, K_HDR);
     add_enum(c, menu, T_CONTACT, (const int[]){T_OFF, T_ON}, 2, K_CONTACT);

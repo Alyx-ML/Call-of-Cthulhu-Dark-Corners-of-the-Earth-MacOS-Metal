@@ -96,8 +96,7 @@
 // steps, so a far hit gets the mean color of an area and not the color of one texel. This decreases the noise. A
 // ray that leaves the screen, or that only passes behind thicker surfaces, gets no light. The result is the mean of
 // the rays (the irradiance / pi of a cosine-weighted estimate). The noise of a pixel comes from its Hilbert index, as
-// in XeGTAO. Without temporal accumulation the noise is fixed for each pixel, so the image does not flicker; with
-// temporal accumulation the noise changes in each frame (see the temporal accumulation paragraph after this one).
+// in XeGTAO, and changes in each frame (see the temporal accumulation paragraph after this one).
 // gi_main also writes the normal and the view distance of each pixel for the denoise passes and the history. gi_denoise
 // then filters GI_PASSES (4) times (an a-trous 3 x 3
 // filter at the distances 1, 2, 4 and 8) with a depth weight and a normal weight (the cosine between the normals to the power
@@ -110,7 +109,7 @@
 // light of the result by approximately one third (measured in the town), so the strengths are 1.5 x the strengths
 // before the test. The radius is 3 m and the thickness 0.3 m (UNCONFIRMED tuning).
 //
-// Temporal accumulation (rt_enh->temporal): the global illumination and the ambient occlusion of a pixel are the mean
+// Temporal accumulation (always on): the global illumination and the ambient occlusion of a pixel are the mean
 // of the results of the last frames at the same surface. Each frame adds 288 x (frame % 64) to the Hilbert index of
 // each pixel, as XeGTAO does for its temporal mode, so each frame gives different noise. d3d9_metal.m gives the camera
 // of this frame and of the last frame (EnhScene reproj and rot). For each pixel, ta_reproj finds the screen position
@@ -124,8 +123,9 @@
 // camera of the last frame is not known, when the last frame did not have these passes, or when the textures are
 // made again. The motion of objects that move by themselves is not known (as for the anti-aliasing); the depth and
 // normal tests remove most of their history. Measured on a static view (the town, frame 7300, high levels, film
-// grain off): the fine noise of the lit wall above the noise of a frame without global illumination and ambient
-// occlusion decreased by approximately 75%, and the frame-to-frame change did not increase.
+// grain off), against fixed noise with no accumulation: the fine noise of the lit wall above the noise of a frame
+// without global illumination and ambient occlusion decreased by approximately 75%, and the frame-to-frame change did
+// not increase.
 //
 // Settings: XeGTAO falloff range 0.615, sample distribution power 2, depth mip offset 3.30, denoise beta 1.2. The
 // levels low, medium and high use 1 x 2, 2 x 2 and 3 x 3 slices x steps, an effect radius of 0.8, 1.2 and 1.6 m
@@ -954,7 +954,7 @@ static int dispatch_list(const float lp[4], int w, int h, float light_out[4], Ss
 }
 
 int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTexture> depth,
-                   const EnhScene *s, int ao, int contact, int gi, int temporal) {
+                   const EnhScene *s, int ao, int contact, int gi) {
     if (ao < 0) ao = 0;
     if (ao > 3) ao = 3;
     if (gi < 0) gi = 0;
@@ -998,7 +998,7 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
         memcpy(t.r, s->reproj, sizeof t.r);
         for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) t.rot[i][j] = s->rot[i * 3 + j];
         t.sw = (float)w; t.sh = (float)h; t.da = da; t.db = db;
-        int stats = temporal && s->have_reproj && rt_verbose && s->frame % 600 == 0 && (gi || ao);
+        int stats = s->have_reproj && rt_verbose && s->frame % 600 == 0 && (gi || ao);
         id<MTLBuffer> cnt = E.nostats;
         if (stats) {
             static const uint32_t zero[8];
@@ -1028,7 +1028,7 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
                 }
             }
             GIC g = {k.mulx, k.muly, k.addx, k.addy, da, db, k.px, k.py, GI_RADIUS, GI_THICK, (float)w, (float)h,
-                     gi_rays[gi], gi_steps[gi], GI_MIPS - 1, temporal ? s->frame : 0};
+                     gi_rays[gi], gi_steps[gi], GI_MIPS - 1, s->frame};
             if (!E.logged_gi) {
                 rt_log("[d3d9] screen-space global illumination %lux%lu (computed at %lux%lu): %u rays x %u steps, strength %.2f, "
                        "color pyramid of %u levels, 3 bisection steps for each hit, %d normal-weighted denoise passes",
@@ -1055,28 +1055,26 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
             [ce setTexture:E.hilbert atIndex:3];
             [ce setTexture:E.gin[cur] atIndex:4];
             [ce dispatchThreads:MTLSizeMake(hw, hh, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-            if (temporal) {
-                // gi0 and the history of the last frame -> gh[cur]
-                t.valid = (uint32_t)(s->have_reproj && !fresh && E.gi_hist != 0 && E.gi_hist + 1 == s->frame);
-                t.maxn = GI_FRAMES;
-                [ce setComputePipelineState:E.gi_accum];
-                [ce setBytes:&t length:sizeof t atIndex:0];
-                [ce setBuffer:cnt offset:0 atIndex:1];
-                [ce setTexture:E.gi0 atIndex:0];
-                [ce setTexture:E.gin[cur] atIndex:1];
-                [ce setTexture:E.gh[cur ^ 1u] atIndex:2];
-                [ce setTexture:E.gin[cur ^ 1u] atIndex:3];
-                [ce setTexture:E.gh[cur] atIndex:4];
-                [ce dispatchThreads:MTLSizeMake(hw, hh, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-                E.gi_hist = s->frame;
-            } else E.gi_hist = 0;
-            // GI_PASSES a-trous passes (distances 1, 2, 4, ...): gh[cur] (or gi0) -> gi1 -> gi0 -> ...
+            // gi0 and the history of the last frame -> gh[cur]
+            t.valid = (uint32_t)(s->have_reproj && !fresh && E.gi_hist != 0 && E.gi_hist + 1 == s->frame);
+            t.maxn = GI_FRAMES;
+            [ce setComputePipelineState:E.gi_accum];
+            [ce setBytes:&t length:sizeof t atIndex:0];
+            [ce setBuffer:cnt offset:0 atIndex:1];
+            [ce setTexture:E.gi0 atIndex:0];
+            [ce setTexture:E.gin[cur] atIndex:1];
+            [ce setTexture:E.gh[cur ^ 1u] atIndex:2];
+            [ce setTexture:E.gin[cur ^ 1u] atIndex:3];
+            [ce setTexture:E.gh[cur] atIndex:4];
+            [ce dispatchThreads:MTLSizeMake(hw, hh, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+            E.gi_hist = s->frame;
+            // GI_PASSES a-trous passes (distances 1, 2, 4, ...): gh[cur] -> gi1 -> gi0 -> ...
             [ce setComputePipelineState:E.gi_denoise];
             [ce setTexture:E.gin[cur] atIndex:2];
             for (int i = 0; i < GI_PASSES; i++) {
                 int32_t st = 1 << i;
                 [ce setBytes:&st length:sizeof st atIndex:0];
-                [ce setTexture:i == 0 ? (temporal ? E.gh[cur] : E.gi0) : (i & 1) ? E.gi1 : E.gi0 atIndex:0];
+                [ce setTexture:i == 0 ? E.gh[cur] : (i & 1) ? E.gi1 : E.gi0 atIndex:0];
                 [ce setTexture:(i & 1) ? E.gi0 : E.gi1 atIndex:1];
                 [ce dispatchThreads:MTLSizeMake(hw, hh, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
             }
@@ -1099,7 +1097,7 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
             c.mpx = c.mulx * c.px; c.mpy = c.muly * c.py;
             c.da = da; c.db = db;
             c.radius = ao_radius[ao] * UNIT_SCALE * 1.457f; c.falloff = 0.615f; c.power = ao_power[ao]; c.mipoff = 3.30f; c.beta = 1.2f;
-            c.frame = temporal ? (float)(s->frame % 64u) : 0.0f;
+            c.frame = (float)(s->frame % 64u);
             if (!E.logged_ao) { rt_log("[d3d9] XeGTAO ambient occlusion %lux%lu: %u slices x %u steps", (unsigned long)w, (unsigned long)h, ao_slices[ao], ao_steps[ao]); E.logged_ao = 1; }
             [ce setBytes:&c length:sizeof c atIndex:0];
             [ce setTexture:depth atIndex:0];
@@ -1112,25 +1110,22 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
             [ce setTexture:E.hilbert atIndex:3];
             [ce setComputePipelineState:E.main_pso[ao]];
             [ce dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-            id<MTLTexture> aoin = E.ao0;
-            if (temporal) {
-                // ao0 and the history of the last frame -> aoh[cur]
-                int fresh = !E.aoh[0] || E.aoh[0].width != w || E.aoh[0].height != h;
-                for (int i = 0; i < 2; i++) tex_of(&E.aoh[i], w, h, MTLPixelFormatRGBA16Float, 1);
-                uint32_t cur = s->frame & 1u;
-                t.valid = (uint32_t)(s->have_reproj && !fresh && E.ao_hist != 0 && E.ao_hist + 1 == s->frame);
-                t.maxn = AO_FRAMES;
-                [ce setComputePipelineState:E.ao_accum];
-                [ce setBytes:&t length:sizeof t atIndex:0];
-                [ce setBuffer:cnt offset:0 atIndex:1];
-                [ce setTexture:E.ao0 atIndex:0];
-                [ce setTexture:E.mip[0] atIndex:1];
-                [ce setTexture:E.aoh[cur ^ 1u] atIndex:2];
-                [ce setTexture:E.aoh[cur] atIndex:3];
-                [ce dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-                E.ao_hist = s->frame;
-                aoin = E.aoh[cur];
-            } else E.ao_hist = 0;
+            // ao0 and the history of the last frame -> aoh[cur]
+            int fresh = !E.aoh[0] || E.aoh[0].width != w || E.aoh[0].height != h;
+            for (int i = 0; i < 2; i++) tex_of(&E.aoh[i], w, h, MTLPixelFormatRGBA16Float, 1);
+            uint32_t cur = s->frame & 1u;
+            t.valid = (uint32_t)(s->have_reproj && !fresh && E.ao_hist != 0 && E.ao_hist + 1 == s->frame);
+            t.maxn = AO_FRAMES;
+            [ce setComputePipelineState:E.ao_accum];
+            [ce setBytes:&t length:sizeof t atIndex:0];
+            [ce setBuffer:cnt offset:0 atIndex:1];
+            [ce setTexture:E.ao0 atIndex:0];
+            [ce setTexture:E.mip[0] atIndex:1];
+            [ce setTexture:E.aoh[cur ^ 1u] atIndex:2];
+            [ce setTexture:E.aoh[cur] atIndex:3];
+            [ce dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+            E.ao_hist = s->frame;
+            id<MTLTexture> aoin = E.aoh[cur];
             // the first denoise pass (less weight on the center); the second is the composite
             float beta = c.beta / 5.0f;
             [ce setBytes:&beta length:sizeof beta atIndex:0];

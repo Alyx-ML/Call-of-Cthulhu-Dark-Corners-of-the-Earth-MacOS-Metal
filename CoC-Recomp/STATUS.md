@@ -997,3 +997,20 @@ Verification:
 - Frame time, High, all other enhancements on, final build, two pairs of runs (setting on and off, film grain on and off): 10.00 s for each 600 frames after the loading, in all four runs (60 frames per second, the frame pacing limit). Two earlier runs with the setting on and the capture code had some intervals of 10.2 to 12.5 s for 600 frames. Four other runs with the setting on (one of them with 32 and 16 frames of history) did not. The cause of those two slower runs is not known.
 - The final app has no capture code (`strings` finds no `MEAS_SHOT`).
 - The launcher sets its window size from the fitting size of its views (Auto Layout, `content.fittingSize`), so the window gets taller by one row. Not verified at run time: the launcher window with the added row (the test runs are headless).
+
+## 2026-11-22: Temporal accumulation always on
+
+Request (user): temporal accumulation must not be a setting in the menus. It must always be on.
+
+Changes:
+
+- `CoC-Recomp/enhance.c`: the setting **Temporal Accumulation** and its menu item are removed. The key `temporal_accumulation` (saved by v1.4.0) is a retired key: the loader skips it, and the next save leaves it out.
+- `CoC-Recomp/launcher.m`: the row **Temporal Accumulation** is removed.
+- `Recomp-Framework/win32/runtime/rt_enh.h`: the field `temporal` of `RtEnh` and the argument `temporal` of `d3d9_enh_scene` are removed.
+- `Recomp-Framework/win32/runtime/d3d9_enhance.m`: `gi_accum` and `ao_accum` always run, and the noise always changes in each frame. The code for fixed noise without accumulation is removed.
+- `Recomp-Framework/win32/runtime/d3d9_metal.m`: the call of `d3d9_enh_scene` has no `temporal` argument.
+
+Verification:
+
+- `make app` built the app (only the two known `key_frame` warnings of `wmvcore.c`).
+- Headless run of 75 s, High, with `MTL_DEBUG_LAYER=1` and `MTL_SHADER_VALIDATION=1`, and a settings file with the line `temporal_accumulation=1`: 2400 frames, no Metal validation error, no "not a valid setting" message. The `RT_VERBOSE` log shows the accumulation in each 600 frames.

@@ -2745,7 +2745,7 @@ static void enh_apply(Device *d) {
             d->enh_sc.have_reproj = 1;
         }
     }
-    d3d9_enh_scene(d->mtl, d->cmd, d->enh_color, d->enh_depth, &d->enh_sc, ao, contact, gi, rt_enh->temporal == 1);
+    d3d9_enh_scene(d->mtl, d->cmd, d->enh_color, d->enh_depth, &d->enh_sc, ao, contact, gi);
     if (have_cam && (ao > 0 || gi > 0)) {
         d->enh_pframe = f;
         memcpy(d->enh_pvp, svp, sizeof svp); memcpy(d->enh_pview, d->enh_sc.view, sizeof d->enh_pview);
