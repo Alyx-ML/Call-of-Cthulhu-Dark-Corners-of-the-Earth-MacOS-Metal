@@ -38,7 +38,9 @@ typedef struct setting_text {
 } setting_text;
 
 static const setting_text graphics_rows[] = {
-    { offsetof(RtEnh, aa), "Anti-Aliasing (MetalFX)", "Smooths the edges of the 3D scene.", { "Off", "On" } },
+    { offsetof(RtEnh, aa), "Anti-Aliasing (MetalFX)",
+      "Smooths the edges. Quality, Balanced and Performance draw the 3D scene smaller and upscale it (faster).",
+      { "Off", "Native", "Quality (1.5x)", "Balanced (1.7x)", "Performance (2x)" } },
     { offsetof(RtEnh, gi), "Global Illumination (RTGI)", "Light that bounces from lit surfaces into the shadows.",
       { "Off", "Low", "Medium", "High" } },
     { offsetof(RtEnh, ao), "Ambient Occlusion", "Darker corners and contact areas.", { "Off", "Low", "Medium", "High" } },

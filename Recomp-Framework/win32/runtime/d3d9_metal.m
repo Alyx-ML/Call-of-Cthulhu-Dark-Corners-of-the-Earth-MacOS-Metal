@@ -447,7 +447,7 @@ struct Device {
     id<MTLBuffer> vis; uint64_t vis_serial[VIS_SLOTS]; uint32_t vis_next; struct Query *vis_owner[VIS_SLOTS];
     Swap *swap;
     Surf *rt[4], *ds;
-    struct { int active; uint32_t flags; float color[4]; float z; uint32_t stencil; } pend;
+    struct Pend { int active; uint32_t flags; float color[4]; float z; uint32_t stencil; } pend;
     uint32_t pass_w, pass_h, pass_ms;
     State st;
     SB *rec;
@@ -498,7 +498,7 @@ struct Device {
     // temporal anti-aliasing (rt_enh.h aa): the 3D scene draws of a frame move by a sub-pixel offset (taa_offset)
     float taa_jit[2];              // the offset (pixels, y down) in the vertex constants uploaded last (pos_fixup)
     float taa_lod;                 // the texture LOD bias of temporal anti-aliasing in the pixel constants uploaded last
-                                   //    (ps_consts_header): TAA_LOD_BIAS for a scene draw with an offset, otherwise 0
+                                   //    (ps_consts_header): the bias of taa_draw_offset for a scene draw with an offset, otherwise 0
     int taa_lod_logged;            // the first draw with the LOD bias is in the log
     // the interface in 4:3 (d3d9_enh_ui_vs): the horizontal scale of this draw and of the uploaded vertex constants
     // (pos_fixup), 1 = the full width
@@ -509,6 +509,21 @@ struct Device {
     uint32_t enh_pframe;           // the last frame with a scene camera and scene passes (0: none)
     float enh_pvp[16], enh_pview[16];   // the view-projection and the view of the camera of that frame
     int taa_vp_ok;                 // taa_vp holds a camera
+    // upscaling (rt_enh.h aa 2 .. 4, up_redirect): the scene draws of a frame go into up_color and up_depth, which are
+    // smaller than the back buffer by RT_ENH_AA_SCALES; enh_apply upscales them into the back buffer (up_out)
+    int up_lvl;                    // the value of rt_enh->aa for the frame up_lvl_f (aa_level)
+    uint32_t up_lvl_f;
+    int up_block;                  // 1: up_redirect is 0 (the clear of the back buffer itself, begin_pass_flush_clear)
+    int up_want;                   // 1: the pass is for a draw with a depth test (the scene can start, up_redirect)
+    struct Pend up_pend;           // a full clear of the back buffer in the frame up_pend_f, before its scene: the
+    uint32_t up_pend_f;            //    first pass into the scene copies gets it too
+    int pass_up;                   // the current render pass draws into up_color and up_depth
+    float up_sx, up_sy;            // the size of up_color / the size of the back buffer, in x and y
+    float up_kx, up_ky;            // the scale of the viewport in the uploaded vertex constants (pos_fixup)
+    uint32_t up_frame;             // the last frame with a draw into up_color
+    id<MTLTexture> up_color, up_color_srgb, up_depth;
+    id<MTLTexture> up_out;         // the back buffer texture of the frame up_frame
+    id<MTLTexture> enh_depth_src;  // the game's depth texture of the scene of this frame (enh_depth can be up_depth)
 };
 
 // ---------------- submission ----------------
@@ -554,6 +569,8 @@ static void ensure_cmd(Device *d) {
 }
 static uint64_t cur_serial(Device *d) { ensure_cmd(d); return d->serial; }
 static void begin_pass_flush_clear(Device *d);
+static int aa_level(Device *d);
+static const float aa_scales[RT_ENH_AA_MAX + 1] = RT_ENH_AA_SCALES;   // the upscaling factor of each aa value
 static void end_pass(Device *d) {
     if (d->enc) { [d->enc endEncoding]; d->enc = nil; }
 }
@@ -790,7 +807,9 @@ static Tex *tex_new(Device *d, uint32_t w, uint32_t h, uint32_t dd, uint32_t lev
     int rt = (usage & (USAGE_RENDERTARGET | USAGE_DEPTHSTENCIL)) || (standalone && f->rt && pool == POOL_DEFAULT) ||
              (usage & USAGE_AUTOGENMIPMAP);
     td.usage = MTLTextureUsageShaderRead | (rt ? MTLTextureUsageRenderTarget : 0) |
-               ((f->has_swz || f->srgb != MTLPixelFormatInvalid) ? MTLTextureUsagePixelFormatView : 0);
+               ((f->has_swz || f->srgb != MTLPixelFormatInvalid) ? MTLTextureUsagePixelFormatView : 0) |
+               // a depth-stencil texture: the stencil view of the character mask (d3d9_enhance.m)
+               (f->kind == 2 ? MTLTextureUsagePixelFormatView : 0);
     td.storageMode = (f->kind || t->ms > 1 || (usage & (USAGE_RENDERTARGET | USAGE_DEPTHSTENCIL))) ? MTLStorageModePrivate : MTLStorageModeShared;
     t->mtl = [d->mtl newTextureWithDescriptor:td];
     if (t->mtl && t->ms > 1 && !f->kind) {
@@ -1542,7 +1561,18 @@ static id<MTLRenderPipelineState> pso_get(Device *d, const PSOKey *k, D3D9Fn *vf
     cache_put(d->pso_cache, key, p ? p : [NSNull null], "pipeline state");
     return p;
 }
-typedef struct { uint8_t zf, zw, sen, pad; uint8_t f[4], b[4]; uint8_t rmask, wmask; } DSSKey;
+typedef struct { uint8_t zf, zw, sen, mark; uint8_t f[4], b[4]; uint8_t rmask, wmask; } DSSKey;
+// The character mask of the ambient occlusion and the global illumination (rt_enh.h ao, gi): an opaque draw into the back buffer that writes the depth,
+// with the game's stencil test off, writes bit ENH_CHAR_BIT of the stencil where it passes the depth test: 1 for a
+// draw of d3d9_enh_light_vs (a character), 0 for the other draws. The game's draws with the stencil test on keep the
+// game's stencil state. The accumulation of the ambient occlusion and the global illumination reads the bit
+// (d3d9_enh_scene: a shorter history on a character).
+#define ENH_CHAR_BIT 0x80u
+static int enh_char_mark(const Device *d) {
+    const State *S = &d->st;
+    return rt_enh && (rt_enh->ao > 0 || rt_enh->gi > 0) && d->ds && d->ds->tex->f->kind == 2 && d->rt[0] && d->rt[0]->swap &&
+           !S->rs[RS_STENCILENABLE] && S->rs[RS_ZENABLE] && S->rs[RS_ZWRITEENABLE] && !S->rs[RS_ALPHABLENDENABLE];
+}
 static id<MTLDepthStencilState> dss_get(Device *d) {
     State *S = &d->st;
     DSSKey k; memset(&k, 0, sizeof k);
@@ -1565,7 +1595,7 @@ static id<MTLDepthStencilState> dss_get(Device *d) {
 #undef SOP
 #undef SFN
         k.rmask = (uint8_t)S->rs[RS_STENCILMASK]; k.wmask = (uint8_t)S->rs[RS_STENCILWRITEMASK];
-    }
+    } else if (enh_char_mark(d)) k.mark = 1;
     NSData *key = [NSData dataWithBytes:&k length:sizeof k];
     id<MTLDepthStencilState> s = d->dss_cache[key];
     if (s) return s;
@@ -1581,6 +1611,13 @@ static id<MTLDepthStencilState> dss_get(Device *d) {
         b.depthStencilPassOperation = (MTLStencilOperation)k.b[2]; b.stencilCompareFunction = (MTLCompareFunction)k.b[3];
         f.readMask = b.readMask = k.rmask; f.writeMask = b.writeMask = k.wmask;
         dd.frontFaceStencil = f; dd.backFaceStencil = b;
+    } else if (k.mark) {
+        MTLStencilDescriptor *f = [MTLStencilDescriptor new];
+        f.stencilCompareFunction = MTLCompareFunctionAlways;
+        f.stencilFailureOperation = f.depthFailureOperation = MTLStencilOperationKeep;
+        f.depthStencilPassOperation = MTLStencilOperationReplace;
+        f.readMask = 0; f.writeMask = ENH_CHAR_BIT;
+        dd.frontFaceStencil = f; dd.backFaceStencil = f;
     }
     s = [d->mtl newDepthStencilStateWithDescriptor:dd];
     if (!s) rt_fatal("[d3d9] Metal did not create a depth-stencil state");
@@ -1672,6 +1709,46 @@ static id<MTLTexture> rt_view(Tex *t, int srgb) {
     }
     return t->mtl;
 }
+// Upscaling (rt_enh.h aa 2 .. 4): the scene of a frame starts at its first draw into the back buffer with the depth
+// buffer and the depth test on (up_want; the game's menus draw with the depth buffer and the depth test off). From
+// there to the end of the scene (enh_apply), a render pass into the back buffer goes into the scene copies up_color and
+// up_depth: with the depth buffer of the back buffer, or with no depth buffer. Not for multiple render targets or
+// multisampling.
+static int up_redirect(Device *d) {
+    const Surf *r0 = d->rt[0];
+    uint32_t f = d->frame + 1;
+    if (d->up_block || aa_level(d) < 2 || !r0 || !r0->swap || d->rt[1] || d->rt[2] || d->rt[3] || d->enh_done == f ||
+        r0->level != 0 || r0->tex->sc != 1 || r0->tex->ms != 1) return 0;
+    if (d->up_frame != f && !d->up_want) return 0;
+    if (!d->ds) return d->up_frame == f;
+    return d->ds->tex->ms == 1 && d->ds->w == r0->w && d->ds->h == r0->h;
+}
+// the scene copies for the back buffer bt (and its depth buffer dt, or NULL) at the scale of this frame
+static void up_targets(Device *d, Tex *bt, Tex *dt) {
+    float k = aa_scales[d->up_lvl];
+    NSUInteger W = bt->mtl.width, H = bt->mtl.height;
+    NSUInteger w = (NSUInteger)lroundf((float)W / k), h = (NSUInteger)lroundf((float)H / k);
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    d->up_sx = (float)w / (float)W; d->up_sy = (float)h / (float)H;
+    if (!d->up_color || d->up_color.width != w || d->up_color.height != h || d->up_color.pixelFormat != bt->mtl.pixelFormat) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:bt->mtl.pixelFormat width:w height:h mipmapped:NO];
+        td.storageMode = MTLStorageModePrivate;
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
+        d->up_color = [d->mtl newTextureWithDescriptor:td];
+        if (!d->up_color) rt_fatal("[d3d9] out of GPU memory for the scene copy of upscaling (%lux%lu)", (unsigned long)w, (unsigned long)h);
+        d->up_color_srgb = nil;
+        rt_log("[d3d9] upscaling: the scene is drawn at %lux%lu for the %lux%lu back buffer", (unsigned long)w, (unsigned long)h,
+               (unsigned long)W, (unsigned long)H);
+    }
+    if (dt && (!d->up_depth || d->up_depth.width != w || d->up_depth.height != h || d->up_depth.pixelFormat != dt->mtl.pixelFormat)) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dt->mtl.pixelFormat width:w height:h mipmapped:NO];
+        td.storageMode = MTLStorageModePrivate;
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+        d->up_depth = [d->mtl newTextureWithDescriptor:td];
+        if (!d->up_depth) rt_fatal("[d3d9] out of GPU memory for the scene depth of upscaling (%lux%lu)", (unsigned long)w, (unsigned long)h);
+    }
+}
 // the render encoder for the current render targets (pending full clears become load actions)
 static id<MTLRenderCommandEncoder> begin_pass(Device *d) {
     if (d->enc) return d->enc;
@@ -1682,12 +1759,28 @@ static id<MTLRenderCommandEncoder> begin_pass(Device *d) {
     MTLRenderPassDescriptor *p = [MTLRenderPassDescriptor renderPassDescriptor];
     int srgb = d->st.rs[RS_SRGBWRITEENABLE] != 0, pc = d->pend.active ? (int)d->pend.flags : 0;
     uint32_t W = 0, H = 0, ms = 1;
+    int up = up_redirect(d);
+    if (up) up_targets(d, d->rt[0]->tex, d->ds ? d->ds->tex : NULL);
+    uint32_t fr = d->frame + 1;
+    if (up) {
+        // the full clear of the back buffer that an earlier pass of this frame took
+        if (!pc && d->up_pend_f == fr) { d->pend = d->up_pend; pc = (int)d->pend.flags; }
+        d->up_pend_f = 0;
+    } else if (pc && d->rt[0] && d->rt[0]->swap && aa_level(d) >= 2) { d->up_pend = d->pend; d->up_pend_f = fr; }
     for (int i = 0; i < 4; i++) {
         Surf *s = d->rt[i];
         if (!s) continue;
         Tex *t = s->tex;
         MTLRenderPassColorAttachmentDescriptor *a = p.colorAttachments[i];
         a.texture = rt_view(t, srgb);
+        if (up) {
+            a.texture = d->up_color;
+            if (srgb && t->f->srgb != MTLPixelFormatInvalid) {
+                if (!d->up_color_srgb) d->up_color_srgb = [d->up_color newTextureViewWithPixelFormat:t->f->srgb];
+                if (!d->up_color_srgb) rt_fatal("[d3d9] Metal did not create the sRGB view of the scene copy of upscaling");
+                a.texture = d->up_color_srgb;
+            }
+        }
         a.level = s->level; a.slice = t->cube ? s->face : 0;
         if (pc & 1) {
             a.loadAction = MTLLoadActionClear;
@@ -1695,6 +1788,7 @@ static id<MTLRenderCommandEncoder> begin_pass(Device *d) {
         } else a.loadAction = MTLLoadActionLoad;
         a.storeAction = MTLStoreActionStore;
         if (!W) { W = s->w * t->sc; H = s->h * t->sc; ms = t->ms; }
+        if (up) { W = (uint32_t)d->up_color.width; H = (uint32_t)d->up_color.height; }
         t->last_use = t->last_write = d->serial;
         t->init[s->face * t->levels + s->level] = 1;
         if (t->usage & USAGE_AUTOGENMIPMAP) t->mips_dirty = 1;
@@ -1704,12 +1798,12 @@ static id<MTLRenderCommandEncoder> begin_pass(Device *d) {
         if (d->rt[0] && d->rt[0]->tex->sc != 1 && (d->ds->w != W || d->ds->h != H))
             rt_fatal("[d3d9] the %ux%u shadow target (stored %ux larger, Sharp Character Shadows) is drawn with a %ux%u depth "
                      "buffer; turn off Sharp Character Shadows", d->rt[0]->w, d->rt[0]->h, d->rt[0]->tex->sc, d->ds->w, d->ds->h);
-        p.depthAttachment.texture = t->mtl;
+        p.depthAttachment.texture = up ? d->up_depth : t->mtl;
         p.depthAttachment.loadAction = (pc & 2) ? MTLLoadActionClear : MTLLoadActionLoad;
         p.depthAttachment.clearDepth = d->pend.z;
         p.depthAttachment.storeAction = MTLStoreActionStore;
         if (t->f->kind == 2) {
-            p.stencilAttachment.texture = t->mtl;
+            p.stencilAttachment.texture = up ? d->up_depth : t->mtl;
             p.stencilAttachment.loadAction = (pc & 4) ? MTLLoadActionClear : MTLLoadActionLoad;
             p.stencilAttachment.clearStencil = d->pend.stencil & 0xFF;
             p.stencilAttachment.storeAction = MTLStoreActionStore;
@@ -1721,7 +1815,7 @@ static id<MTLRenderCommandEncoder> begin_pass(Device *d) {
     d->enc = [d->cmd renderCommandEncoderWithDescriptor:p];
     if (!d->enc) rt_fatal("[d3d9] Metal did not create a render encoder (%ux%u, %u samples)", W, H, ms);
     d->pend.active = 0;
-    d->pass_w = W; d->pass_h = H; d->pass_ms = ms;
+    d->pass_w = W; d->pass_h = H; d->pass_ms = ms; d->pass_up = up;
     d->cur_pso = nil; d->cur_dss = nil;
     if (slot != UINT32_MAX) {
         [d->enc setVisibilityResultMode:MTLVisibilityResultModeCounting offset:slot * 8];
@@ -1732,6 +1826,17 @@ static id<MTLRenderCommandEncoder> begin_pass(Device *d) {
 static void begin_pass_flush_clear(Device *d) {
     if (!d->pend.active) return;
     if (d->enc) { d->pend.active = 0; return; }
+    if (up_redirect(d)) {
+        // upscaling: the clear goes into the scene copies and into the back buffer itself
+        __typeof__(d->pend) pc = d->pend;
+        begin_pass(d);
+        end_pass(d);
+        d->pend = pc; d->up_block = 1;
+        begin_pass(d);
+        end_pass(d);
+        d->up_block = 0;
+        return;
+    }
     begin_pass(d);
     end_pass(d);
 }
@@ -1976,8 +2081,16 @@ static id<MTLDepthStencilState> clear_dss(Device *d, uint32_t flags) {
     return s;
 }
 // clear a rectangle of the current targets with a quad (partial clears)
+// x0 .. y1: the rectangle in Direct3D pixels of the targets
 static void clear_quad(Device *d, uint32_t flags, const float *col, float z, uint32_t stencil, int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
     id<MTLRenderCommandEncoder> e = begin_pass(d);
+    // the storage of the target can be larger than its Direct3D size (Tex.sc) or smaller (the scene copies of upscaling)
+    double ksx = d->rt[0] ? (double)d->rt[0]->tex->sc : 1.0, ksy = ksx;
+    if (d->pass_up) { ksx = d->up_sx; ksy = d->up_sy; }
+    x0 = (int32_t)floor(x0 * ksx); y0 = (int32_t)floor(y0 * ksy); x1 = (int32_t)ceil(x1 * ksx); y1 = (int32_t)ceil(y1 * ksy);
+    if (x1 > (int32_t)d->pass_w) x1 = (int32_t)d->pass_w;
+    if (y1 > (int32_t)d->pass_h) y1 = (int32_t)d->pass_h;
+    if (x1 <= x0 || y1 <= y0) return;
     UtilKey k; memset(&k, 0, sizeof k);
     k.tag = 'C'; k.mask = (flags & 1) ? 1 : 0; k.samples = (uint8_t)d->pass_ms;
     float cols[4][4];
@@ -2009,33 +2122,48 @@ static void clear_quad(Device *d, uint32_t flags, const float *col, float z, uin
 
 // ---------------- temporal anti-aliasing (rt_enh.h aa) ----------------
 // MetalFX (d3d9_enh_taa) needs the 3D scene of each frame at a different sub-pixel position. The offset of frame f is
-// the Halton (2, 3) point of index f mod 8 + 1, minus 0.5 (8 phases, the MetalFX count for a scale of 1). A frame
-// after a frame without anti-aliasing gets no offset (MetalFX starts its history again in that frame). The draws into
-// the back buffer with a depth buffer, before the end of the opaque scene (enh_apply), move by the offset; the
-// post-processing and the UI after it do not.
-#define TAA_PHASES 8
+// the Halton (2, 3) point of index f mod n + 1, minus 0.5, in pixels of the scene. n is the phase count of the MetalFX
+// integration guide of Apple, ceil(8 x scale^2): 8 for anti-aliasing (scale 1), 18, 24 and 32 for upscaling 1.5x, 1.7x
+// and 2x. A frame after a frame without anti-aliasing, or after a change of the setting, gets no offset (MetalFX starts
+// its history again in that frame). The draws into the back buffer with a depth buffer (with upscaling: the draws into
+// the scene copies), before the end of the opaque scene (enh_apply), move by the offset; the post-processing and the
+// UI after it do not.
+// the value of rt_enh->aa for this frame: read once in each frame, so that a change in the menu takes effect at the
+// start of the next frame
+static int aa_level(Device *d) {
+    uint32_t f = d->frame + 1;
+    if (d->up_lvl_f != f) {
+        int l = rt_enh ? rt_enh->aa : 0;
+        if (l < 0 || l > RT_ENH_AA_MAX) l = 0;
+        if (l != d->up_lvl) d->taa_frame = 0;
+        d->up_lvl = l; d->up_lvl_f = f;
+    }
+    return d->up_lvl;
+}
 static float taa_halton(uint32_t i, uint32_t b) {
     float r = 0.0f, f = 1.0f / (float)b;
     while (i > 0) { r += f * (float)(i % b); i /= b; f /= (float)b; }
     return r;
 }
 // returns 1 when frame f has offsets (o), 0 when it has none (o = 0)
-static int taa_offset(const Device *d, uint32_t f, float o[2]) {
+static int taa_offset(Device *d, uint32_t f, float o[2]) {
     o[0] = o[1] = 0.0f;
-    if (!rt_enh || rt_enh->aa != 1 || d->taa_frame == 0 || d->taa_frame != f - 1) return 0;
-    uint32_t i = f % TAA_PHASES + 1;
+    int l = aa_level(d);
+    if (l < 1 || d->taa_frame == 0 || d->taa_frame != f - 1) return 0;
+    uint32_t i = f % (uint32_t)ceilf(8.0f * aa_scales[l] * aa_scales[l]) + 1;
     o[0] = taa_halton(i, 2) - 0.5f; o[1] = taa_halton(i, 3) - 0.5f;
     return 1;
 }
 // The texture LOD bias of the scene draws with an offset: log2(input size / output size) - 1 (the MetalFX
-// integration guide of Apple), with the input size equal to the output size. It is added to D3DSAMP_MIPMAPLODBIAS.
-// MetalFX gets back the detail of the sharper mipmap levels from the offsets of the frames.
-#define TAA_LOD_BIAS (-1.0f)
-// the offset of this draw (o, pixels with y down); returns its texture LOD bias (TAA_LOD_BIAS with an offset, or 0)
-static float taa_draw_offset(const Device *d, float o[2]) {
+// integration guide of Apple): -1 for anti-aliasing, -1.58, -1.77 and -2 for upscaling 1.5x, 1.7x and 2x. It is added
+// to D3DSAMP_MIPMAPLODBIAS. MetalFX gets back the detail of the sharper mipmap levels from the offsets of the frames.
+// the offset of this draw (o, pixels of the scene with y down); returns its texture LOD bias (0 without an offset)
+static float taa_draw_offset(Device *d, float o[2]) {
     uint32_t f = d->frame + 1;
     const Surf *r0 = d->rt[0];
-    if (r0 && r0->swap && d->ds && d->enh_done != f && taa_offset(d, f, o)) return TAA_LOD_BIAS;
+    int l = aa_level(d);
+    int scene = l >= 2 ? d->pass_up : r0 && r0->swap && d->ds && d->enh_done != f;
+    if (scene && taa_offset(d, f, o)) return -log2f(aa_scales[l]) - 1.0f;
     o[0] = o[1] = 0.0f;
     return 0.0f;
 }
@@ -2044,7 +2172,8 @@ static float taa_draw_offset(const Device *d, float o[2]) {
 static void pos_fixup(Device *d, float *f) {
     State *S = &d->st;
     // the half-pixel offset is that of the viewport of the draw (in 4:3 for the interface: d3d9_enh_ui_vs)
-    float w = (float)S->vp[2] * d->ui_k, h = (float)S->vp[3], zr = fbits(S->vp[5]) - fbits(S->vp[4]);
+    // (and, for a draw into the scene copies of upscaling, scaled to their size: up_kx, up_ky)
+    float w = (float)S->vp[2] * d->ui_k * d->up_kx, h = (float)S->vp[3] * d->up_ky, zr = fbits(S->vp[5]) - fbits(S->vp[4]);
     // with the sub-pixel offset of temporal anti-aliasing (taa_jit, in pixels with y down)
     f[0] = w > 0 ? ((63.0f / 64.0f) + 2.0f * d->taa_jit[0]) / w : 0.0f;
     f[1] = h > 0 ? -((63.0f / 64.0f) + 2.0f * d->taa_jit[1]) / h : 0.0f;
@@ -2354,12 +2483,17 @@ static int prepare(Device *d, int points, const UpStream *up, uint32_t *instance
     // textures that need their mipmaps generated (blits, before the render pass)
     for (int s = 0; s < 16; s++) if (pf->samplers >> s & 1) { Tex *t = bound_tex(d, s); if (t && t->mips_dirty) tex_gen_mips(d, t); }
     for (int s = 0; s < 4; s++) if (vf->samplers >> s & 1) { Tex *t = bound_tex(d, 16 + s); if (t && t->mips_dirty) tex_gen_mips(d, t); }
+    // upscaling: a draw with the depth test into the back buffer starts the scene of the frame; the pass into the back
+    // buffer itself ends there
+    d->up_want = d->ds && S->rs[RS_ZENABLE];
+    if (d->enc && !d->pass_up && up_redirect(d)) end_pass(d);
     id<MTLRenderCommandEncoder> e = begin_pass(d);
+    d->up_want = 0;
     uint64_t serial = d->serial;
     if (pso != d->cur_pso) { [e setRenderPipelineState:pso]; d->cur_pso = pso; }
     id<MTLDepthStencilState> dss = dss_get(d);
     if (dss != d->cur_dss) { [e setDepthStencilState:dss]; d->cur_dss = dss; }
-    [e setStencilReferenceValue:S->rs[RS_STENCILREF] & 0xFF];
+    [e setStencilReferenceValue:enh_char_mark(d) ? (S->vs && S->vs->lv ? ENH_CHAR_BIT : 0u) : S->rs[RS_STENCILREF] & 0xFF];
     uint32_t cull = S->rs[RS_CULLMODE];
     [e setFrontFacingWinding:MTLWindingClockwise];
     [e setCullMode:cull == 2 ? MTLCullModeFront : cull == 3 ? MTLCullModeBack : MTLCullModeNone];
@@ -2368,22 +2502,25 @@ static int prepare(Device *d, int points, const UpStream *up, uint32_t *instance
     [e setDepthBias:0 slopeScale:fbits(S->rs[RS_SLOPESCALEDEPTHBIAS]) clamp:0];
     float bf[4]; color4(S->rs[RS_BLENDFACTOR], bf);
     [e setBlendColorRed:bf[0] green:bf[1] blue:bf[2] alpha:bf[3]];
-    // viewport and scissor rectangle in Direct3D pixels; the storage of the target can be larger (Tex.sc)
-    int64_t sc = d->rt[0]->tex->sc;
+    // viewport and scissor rectangle in Direct3D pixels; the storage of the target can be larger (Tex.sc) or smaller
+    // (the scene copies of upscaling: up_sx, up_sy)
+    double sc = (double)d->rt[0]->tex->sc, scy = sc;
+    if (d->pass_up) { sc = d->up_sx; scy = d->up_sy; }
     // an interface draw in 4:3 (d3d9_enh_ui_vs): the viewport and the scissor rectangle are scaled horizontally by
     // ui_k about the center of the target
     double uk = d->ui_k, ucx = (double)d->pass_w * 0.5;
     double vx = (double)S->vp[0] * sc, vw = (double)S->vp[2] * sc;
     if (uk != 1.0) { vx = ucx + (vx - ucx) * uk; vw *= uk; }
-    [e setViewport:(MTLViewport){vx, (double)S->vp[1] * sc, vw, (double)S->vp[3] * sc, fbits(S->vp[4]), fbits(S->vp[5])}];
+    [e setViewport:(MTLViewport){vx, (double)S->vp[1] * scy, vw, (double)S->vp[3] * scy, fbits(S->vp[4]), fbits(S->vp[5])}];
     int64_t x0 = 0, y0 = 0, x1 = d->pass_w, y1 = d->pass_h;
     if (S->rs[RS_SCISSORTESTENABLE]) {
-        int64_t sx0 = (int64_t)S->scissor[0] * sc, sx1 = (int64_t)S->scissor[2] * sc;
-        if (uk != 1.0) { sx0 = (int64_t)floor(ucx + ((double)sx0 - ucx) * uk); sx1 = (int64_t)ceil(ucx + ((double)sx1 - ucx) * uk); }
-        if (sx0 > x0) x0 = sx0;
-        if (S->scissor[1] * sc > y0) y0 = S->scissor[1] * sc;
-        if (sx1 < x1) x1 = sx1;
-        if (S->scissor[3] * sc < y1) y1 = S->scissor[3] * sc;
+        double sx0 = floor((double)S->scissor[0] * sc), sx1 = ceil((double)S->scissor[2] * sc);
+        int64_t sy0 = (int64_t)floor((double)S->scissor[1] * scy), sy1 = (int64_t)ceil((double)S->scissor[3] * scy);
+        if (uk != 1.0) { sx0 = floor(ucx + (sx0 - ucx) * uk); sx1 = ceil(ucx + (sx1 - ucx) * uk); }
+        if ((int64_t)sx0 > x0) x0 = (int64_t)sx0;
+        if (sy0 > y0) y0 = sy0;
+        if ((int64_t)sx1 < x1) x1 = (int64_t)sx1;
+        if (sy1 < y1) y1 = sy1;
     }
     if (x1 <= x0 || y1 <= y0) return 0;   // nothing inside the scissor rectangle
     [e setScissorRect:(MTLScissorRect){(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0)}];
@@ -2393,6 +2530,8 @@ static int prepare(Device *d, int points, const UpStream *up, uint32_t *instance
     float lod = taa_draw_offset(d, jt);
     if (jt[0] != d->taa_jit[0] || jt[1] != d->taa_jit[1]) { d->taa_jit[0] = jt[0]; d->taa_jit[1] = jt[1]; d->vsc_dirty = d->ffc_dirty = 1; }
     if (d->ui_k != d->ui_k_up) { d->ui_k_up = d->ui_k; d->vsc_dirty = d->ffc_dirty = 1; }
+    float ukx = d->pass_up ? d->up_sx : 1.0f, uky = d->pass_up ? d->up_sy : 1.0f;
+    if (ukx != d->up_kx || uky != d->up_ky) { d->up_kx = ukx; d->up_ky = uky; d->vsc_dirty = d->ffc_dirty = 1; }
     if (lod != d->taa_lod) {
         d->taa_lod = lod; d->psc_dirty = 1;
         if (lod != 0.0f && !d->taa_lod_logged) {
@@ -2524,11 +2663,9 @@ static struct { int on; char dir[64], pos[64], grad[64]; uint32_t stride; } enh_
 void d3d9_enh_light_dir(float x, float y, float z) {
     float n = sqrtf(x * x + y * y + z * z);
     if (!(n > 0.0f) || !isfinite(n)) rt_fatal("[d3d9] d3d9_enh_light_dir: the direction (%g, %g, %g) has no length", x, y, z);
-    if (enh_lvs.on) rt_fatal("[d3d9] d3d9_enh_light_dir: d3d9_enh_light_vs already gives the light");
     enh_ld.on = 1; enh_ld.dir[0] = x / n; enh_ld.dir[1] = y / n; enh_ld.dir[2] = z / n;
 }
 void d3d9_enh_light_vs(const char *dir, const char *pos, const char *grad, uint32_t stride) {
-    if (enh_ld.on) rt_fatal("[d3d9] d3d9_enh_light_vs: d3d9_enh_light_dir already gives the light");
     if (!dir || !pos || !grad || strlen(dir) >= sizeof enh_lvs.dir || strlen(pos) >= sizeof enh_lvs.pos ||
         strlen(grad) >= sizeof enh_lvs.grad || stride < 1 || stride > 64)
         rt_fatal("[d3d9] d3d9_enh_light_vs: bad constant names or register stride %u", stride);
@@ -2632,12 +2769,18 @@ static void enh_note_draw(Device *d) {
     State *S = &d->st; Surf *r0 = d->rt[0];
     uint32_t f = d->frame + 1;
     if (!r0) return;
+    if (d->pass_up) {
+        // upscaling: the scene of this frame is in the scene copies
+        d->up_frame = f; d->up_out = r0->tex->mtl;
+        d->enh_color = d->up_color;
+        if (d->ds) { d->enh_depth = d->up_depth; d->enh_depth_src = d->ds->tex->mtl; }
+    }
     if (!d->ds && enh_is_light_target(r0) && S->vs && d->enh_light_frame != f) {
         if (enh_light_of((const float (*)[4])S->vsf[enh_lp.creg], d->enh_sc.light)) d->enh_light_frame = f;
     }
-    if (rt_enh->ao <= 0 && rt_enh->contact <= 0 && rt_enh->gi <= 0 && rt_enh->bloom <= 0 && rt_enh->tonemap != 1 && rt_enh->hdr != 1 && rt_enh->aa != 1) return;
+    if (rt_enh->ao <= 0 && rt_enh->contact <= 0 && rt_enh->gi <= 0 && rt_enh->bloom <= 0 && rt_enh->tonemap != 1 && rt_enh->hdr != 1 && rt_enh->aa < 1) return;
     if (d->enh_done == f) return;
-    if (rt_enh->contact > 0 && r0->swap && S->vs && S->vs->lv) enh_light_note(d, f, S);
+    if (rt_enh->contact > 0 && !enh_ld.on && r0->swap && S->vs && S->vs->lv) enh_light_note(d, f, S);
     if (r0->swap && d->ds && S->rs[RS_ZENABLE] && S->rs[RS_ZWRITEENABLE] && !S->rs[RS_ALPHABLENDENABLE]) {
         d->enh_scene = f;
         if (enh_camvs.on) {
@@ -2647,7 +2790,7 @@ static void enh_note_draw(Device *d) {
             memcpy(d->enh_sc.view, S->xf[2], sizeof d->enh_sc.view);
             memcpy(d->enh_sc.proj, S->xf[3], sizeof d->enh_sc.proj);
         }
-        d->enh_color = r0->tex->mtl; d->enh_depth = d->ds->tex->mtl;
+        if (!d->pass_up) { d->enh_color = r0->tex->mtl; d->enh_depth = d->ds->tex->mtl; d->enh_depth_src = d->enh_depth; }
     }
 }
 // HDR output and tone mapping (rt_enh.h) act on the scene and keep the UI at paper white. A draw into the back
@@ -2695,8 +2838,9 @@ static void tm_note(Device *d) {
 // from this copy.
 static void enh_apply(Device *d) {
     uint32_t f = d->frame + 1;
-    if (!rt_enh || d->enh_scene != f || d->enh_done == f) return;
+    if (!rt_enh || (d->enh_scene != f && d->up_frame != f) || d->enh_done == f) return;
     d->enh_done = f;
+    int up = d->up_frame == f;
     if (d->pend.active) begin_pass_flush_clear(d);
     ensure_cmd(d);
     end_encoders(d);
@@ -2704,7 +2848,7 @@ static void enh_apply(Device *d) {
         memcpy(d->enh_sc.light, enh_ld.dir, sizeof enh_ld.dir); d->enh_sc.light[3] = 0.0f;
         d->enh_sc.have_light = 1;
     } else if (!enh_lvs.on) d->enh_sc.have_light = d->enh_light_frame == f;
-    int ao = rt_enh->ao, contact = rt_enh->contact, gi = rt_enh->gi, taa = rt_enh->aa == 1, have_cam = !enh_camvs.on;
+    int ao = rt_enh->ao, contact = rt_enh->contact, gi = rt_enh->gi, taa = aa_level(d) == 1 || up, have_cam = !enh_camvs.on;
     if (enh_camvs.on && (ao > 0 || contact > 0 || gi > 0 || taa)) {
         // the camera with the most draws (the level geometry, whose world transform is the identity)
         uint32_t best = 0, n = d->enh_cam_frame == f ? d->enh_ncam : 0;
@@ -2723,7 +2867,7 @@ static void enh_apply(Device *d) {
             ao = contact = gi = 0;
         }
     }
-    if (enh_lvs.on) {
+    if (enh_lvs.on && !enh_ld.on) {
         d->enh_sc.have_light = contact > 0 && enh_light_pick(d, f, d->enh_sc.view);
         memcpy(d->enh_sc.light, d->enh_lv, sizeof d->enh_lv);
     }
@@ -2758,12 +2902,16 @@ static void enh_apply(Device *d) {
         mat_mul(d->enh_sc.view, d->enh_sc.proj, vp);
         int motion = have_cam && cont && d->taa_vp_ok && mat_inv(vp, iv);
         if (motion) mat_mul(iv, d->taa_vp, rp);
-        if (d3d9_enh_taa(d->mtl, d->cmd, d->enh_color, d->enh_depth, motion ? rp : NULL, o[0], o[1], !cont)) {
+        if (up && !d->enh_depth) rt_fatal("[d3d9] upscaling: the scene of frame %u has no depth buffer", f);
+        if (d3d9_enh_taa(d->mtl, d->cmd, d->enh_color, d->enh_depth, up ? d->up_out : d->enh_color, motion ? rp : NULL, o[0], o[1], !cont)) {
             d->taa_frame = f;
             d->taa_vp_ok = have_cam;
             memcpy(d->taa_vp, vp, sizeof vp);
-        }
+        } else if (up) rt_fatal("[d3d9] upscaling: MetalFX did not take the scene of frame %u", f);
+        // the depth buffer of the back buffer gets the scene depth at its size, for the draws after the scene
+        if (up) d3d9_enh_depth_up(d->mtl, d->cmd, d->enh_depth, d->enh_depth_src);
     }
+    if (up) d->enh_color = d->up_out;
     d3d9_enh_bloom(d->mtl, d->cmd, d->enh_color, rt_enh->bloom);
     id<MTLTexture> c = d->enh_color;
     if ((rt_enh->tonemap == 1 || rt_enh->hdr == 1) && c.pixelFormat == MTLPixelFormatRGBA16Float && c.sampleCount == 1) {
@@ -2781,7 +2929,7 @@ static void enh_apply(Device *d) {
             rt_log("[d3d9] HDR output and tone mapping: frame %u, the scene before post-processing copied (%lux%lu)", d->frame,
                    (unsigned long)c.width, (unsigned long)c.height);
     }
-    d->enh_color = d->enh_depth = nil;
+    d->enh_color = d->enh_depth = d->enh_depth_src = d->up_out = nil;
 }
 // The interface in 4:3 (rt_enh.h, d3d9_enh_ui_vs).
 static struct { int on; char src[64]; uint32_t creg; } enh_ui;
@@ -3740,6 +3888,7 @@ METHOD(d3d_CreateDevice) {
     d->d3d = (Obj *)self; priv_ref(d->d3d);
     d->adapter = a; d->devtype = type; d->focus = focus; d->behavior = beh;
     d->ui_k = d->ui_k_up = 1.0f;
+    d->up_kx = d->up_ky = 1.0f;
     uint32_t pp[14], err = D3DERR_NOTAVAILABLE;
     if (!dev_init_metal(d) || (err = pp_check(d, gpp, focus, pp)) || (err = dev_reset(d, pp, focus))) {
         obj_release(&d->o);
@@ -4143,7 +4292,7 @@ METHOD(dev_SetDepthStencilSurface) {
     if (M(1) && (!s || !s->tex->f->kind)) return D3DERR_INVALIDCALL;
     // the scene ends when its depth buffer is replaced or removed while the back buffer is the target; binding a
     // depth buffer where there was none does not end it (the game binds its scene depth buffer again during the scene)
-    if (s != d->ds && d->rt[0] && d->rt[0]->swap && d->ds && d->ds->tex->mtl == d->enh_depth) enh_apply(d);
+    if (s != d->ds && d->rt[0] && d->rt[0]->swap && d->ds && d->ds->tex->mtl == d->enh_depth_src) enh_apply(d);
     targets_changing(d);
     REBIND(d->ds, s);
     mark_dirty(d);
@@ -4206,8 +4355,7 @@ METHOD(dev_Clear) {
             if (r[3] < b1) b1 = r[3];
             if (a1 <= a0 || b1 <= b0) continue;
         }
-        int64_t sc = t0->tex->sc;   // the storage of the target can be larger than its Direct3D size
-        clear_quad(d, flags, col, z, stencil, (int32_t)(a0 * sc), (int32_t)(b0 * sc), (int32_t)(a1 * sc), (int32_t)(b1 * sc));
+        clear_quad(d, flags, col, z, stencil, (int32_t)a0, (int32_t)b0, (int32_t)a1, (int32_t)b1);
     }
     d->cur_pso = nil; d->cur_dss = nil;
     return D3D_OK;

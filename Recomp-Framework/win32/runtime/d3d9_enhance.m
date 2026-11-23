@@ -75,9 +75,13 @@
 // keeps the composite above white, for HDR output and tone mapping; a unorm back buffer clamps the composite when it
 // stores it.
 //
-// Temporal anti-aliasing: the MetalFX temporal scaler at the size of the back buffer (input size = output size), as
-// in Apple's "Applying temporal antialiasing and upscaling using MetalFX". d3d9_metal.m moves the 3D scene draws of each
-// frame by a sub-pixel offset (the Halton (2, 3) sequence, 8 phases) and gives that offset here. The motion vectors come
+// Temporal anti-aliasing and upscaling: the MetalFX temporal scaler, as in Apple's "Applying temporal antialiasing and
+// upscaling using MetalFX". With anti-aliasing the input size is the size of the back buffer. With upscaling
+// (Quality 1.5x, Balanced 1.7x, Performance 2x) d3d9_metal.m draws the scene into smaller copies of the back buffer and
+// its depth buffer; the ambient occlusion, the global illumination and the contact shadows run at that size, MetalFX
+// writes the back buffer, and d3d9_enh_depth_up writes the scene depth into the depth buffer at its size (the nearest
+// pixel) for the draws after the scene. d3d9_metal.m moves the 3D scene draws of each frame by a sub-pixel offset
+// (the Halton (2, 3) sequence, ceil(8 x scale^2) phases) and gives that offset here. The motion vectors come
 // from the depth buffer and the camera of this frame and the last frame (taa_motion): the movement of the camera only.
 // The game's vertex shaders give no position of the last frame, so an object that moves by itself (a character, a
 // door) gets the motion of the static world behind it at that pixel; MetalFX then finds that the history color does not
@@ -122,10 +126,26 @@
 // The two histories alternate between two textures (by the parity of the frame). The history starts again when the
 // camera of the last frame is not known, when the last frame did not have these passes, or when the textures are
 // made again. The motion of objects that move by themselves is not known (as for the anti-aliasing); the depth and
-// normal tests remove most of their history. Measured on a static view (the town, frame 7300, high levels, film
+// normal tests remove most of their history. A surface that moves with the camera (for example the bus that carries
+// the camera in the first level) keeps its screen position, so the camera motion does not find its history. When the
+// camera moved and the history at the same pixel has the same view distance (within 0.3%, and for the global
+// illumination a normal cosine of 0.9 or more), while the reprojected taps do not match (the best tap is more than 4
+// times that error and more than 0.5% away, or no tap is used), the history of the same pixel is used. In the bus
+// scene, 24% of the moving pixels move with the camera (measured). The ambient occlusion of a pixel with a short
+// history (k < AO_FRAMES) starts from the depth-weighted mean of its 5 x 5 pixels (the weight decreases linearly from
+// 1 at 2% of the view distance to 0) mixed with its own value in the proportion (k - 1) / (AO_FRAMES - 1), so a
+// surface that comes into view does not show the noise of one frame. The motion of objects that move by themselves (doors,
+// characters) is not known, so a history can hold the light or the occlusion of where such an object was, also at the
+// still pixels around it. Thus the history is clipped to this frame's mean +- TA_CLIP (1.25) x the standard deviation
+// of the 3 x 3 neighbors whose view distance is within TA_CLIP_Z (5%) of the pixel (variance clipping). Measured on a static view (the town, frame 7300, high levels, film
 // grain off), against fixed noise with no accumulation: the fine noise of the lit wall above the noise of a frame
 // without global illumination and ambient occlusion decreased by approximately 75%, and the frame-to-frame change did
 // not increase.
+//
+// Characters: the game animates its characters, and the motion of their surfaces is not known (only the motion of the
+// camera). d3d9_metal.m marks the pixels of the character draws (the draws of d3d9_enh_light_vs) with bit 0x80 of the
+// stencil (ENH_CHAR_BIT). In gi_accum and ao_accum, the history of these pixels holds at most TA_CHAR_FRAMES (4)
+// frames, so it follows the animation faster. A depth texture with no stencil gives no mask.
 //
 // Settings: XeGTAO falloff range 0.615, sample distribution power 2, depth mip offset 3.30, denoise beta 1.2. The
 // levels low, medium and high use 1 x 2, 2 x 2 and 3 x 3 slices x steps, an effect radius of 0.8, 1.2 and 1.6 m
@@ -169,6 +189,10 @@ static const char enh_src[] =
     "constant uint SLICES [[function_constant(0)]];\n"
     "constant uint STEPS [[function_constant(1)]];\n"
     "#define SKY 1.0e6\n"
+    "#define TA_CLIP 1.25\n"          // the history is clipped to the mean +- TA_CLIP x the standard deviation of this frame
+    "#define TA_CLIP_Z 0.05\n"        // the neighbors of the clip: view distance within 5% of the pixel
+    "#define TA_CHAR_FRAMES 4.0\n"    // the most frames in the history of a character pixel
+
     "static float view_z(float z, constant AOC &c) {\n"
     "  if (z >= 1.0) return SKY;\n"
     "  float den = z - c.da;\n"
@@ -568,7 +592,7 @@ static const char enh_src[] =
     // temporal accumulation (see the comment at the top of the file). TA.r: the rows of inverse(this frame's
     // view-projection) x the last frame's view-projection (row vectors); rot: the rows of the rotation from this frame's
     // view space to the last frame's view space; valid = 0: no history (it starts again); stats != 0: count the pixels
-    "struct TA { float4 r[4]; float4 rot[3]; float sw, sh, da, db; uint valid, stats, maxn, pad; };\n"
+    "struct TA { float4 r[4]; float4 rot[3]; float sw, sh, da, db; uint valid, stats, maxn, mask; };\n"
     // the screen position (0 .. 1) and the view distance in the last frame of the surface at the screen position sp and
     // the view distance z of this frame; false when the surface is behind the last camera
     "static bool ta_reproj(float2 sp, float z, constant TA &t, thread float2 &ps, thread float &pz) {\n"
@@ -580,6 +604,12 @@ static const char enh_src[] =
     "  pz = q.w * z;\n"   // q is the last clip position / this view distance
     "  return true;\n"
     "}\n"
+    // a surface that moves with the camera (a vehicle that carries the camera): the history at the same pixel has the
+    // same view distance (es: its relative error), and the camera motion does not explain the history (er: the
+    // smallest relative error of the reprojected taps, 1 when no tap was used)
+    "static bool ta_attached(float es, float er) { return es < 0.003 && er > max(4.0 * es, 0.005); }\n"
+    // the most frames in the history of a pixel: fewer on a character (its motion is not known)
+    "static float ta_maxn(constant TA &t, bool ch) { return ch ? min(float(t.maxn), TA_CHAR_FRAMES) : float(t.maxn); }\n"
     // cnt: 0 the pixels with a surface, 1 the pixels with no history, 2 the sum of the motion (1/4 pixels)
     "static void ta_count(device atomic_uint *cnt, uint base, bool hist, float mv) {\n"
     "  atomic_fetch_add_explicit(&cnt[base], 1u, memory_order_relaxed);\n"
@@ -592,16 +622,18 @@ static const char enh_src[] =
     "kernel void gi_accum(texture2d<float, access::read> cur [[texture(0)]], texture2d<float, access::read> nc [[texture(1)]],\n"
     "  texture2d<float, access::read> hp [[texture(2)]], texture2d<float, access::read> np [[texture(3)]],\n"
     "  texture2d<float, access::write> ho [[texture(4)]], constant TA &t [[buffer(0)]], device atomic_uint *cnt [[buffer(1)]],\n"
-    "  uint2 p [[thread_position_in_grid]]) {\n"
+    "  texture2d<uint, access::read> sm [[texture(5)]], uint2 p [[thread_position_in_grid]]) {\n"
     "  if (p.x >= ho.get_width() || p.y >= ho.get_height()) return;\n"
     "  float3 c = cur.read(p).rgb;\n"
     "  float4 n = nc.read(p);\n"
     "  if (n.w >= SKY * 0.5 || dot(n.xyz, n.xyz) < 0.5) { ho.write(float4(c, 1.0), p); return; }\n"
-    "  float nh = 0.0, mv = 0.0;\n"
+    "  float nh = 0.0, mv = 0.0, er = 1.0;\n"
     "  float3 hs = float3(0.0);\n"
     "  float2 ss = float2(t.sw, t.sh), sp = (float2(min(int2(p) * 2, int2(ss) - 1)) + 0.5) / ss, ps;\n"
     "  float pz;\n"
-    "  if (t.valid != 0u && ta_reproj(sp, n.w, t, ps, pz)) {\n"
+    "  bool ch = t.mask != 0u && (sm.read(uint2(min(int2(p) * 2, int2(ss) - 1))).r & 0x80u) != 0u;\n"
+    "  bool rp = t.valid != 0u && ta_reproj(sp, n.w, t, ps, pz);\n"
+    "  if (rp) {\n"
     "    mv = length((ps - sp) * ss);\n"
     "    float3 pn = n.x * t.rot[0].xyz + n.y * t.rot[1].xyz + n.z * t.rot[2].xyz;\n"
     "    float2 hq = (ps * ss - 0.5) * 0.5, b = floor(hq), fr = hq - b;\n"   // in the pixels of the half-size history
@@ -613,11 +645,26 @@ static const char enh_src[] =
     "      float4 pv = np.read(uint2(qq));\n"
     "      if (!(abs(pv.w - pz) < 0.04 * pz) || dot(pv.xyz, pn) < 0.9) continue;\n"
     "      float w = (o.x != 0 ? fr.x : 1.0 - fr.x) * (o.y != 0 ? fr.y : 1.0 - fr.y);\n"
-    "      acc += hp.read(uint2(qq)) * w; ws += w;\n"
+    "      acc += hp.read(uint2(qq)) * w; ws += w; er = min(er, abs(pv.w - pz) / pz);\n"
     "    }\n"
-    "    if (ws > 0.05) { acc /= ws; nh = acc.a; hs = acc.rgb; }\n"
+    "    if (ws > 0.05) { acc /= ws; nh = acc.a; hs = acc.rgb; } else er = 1.0;\n"
     "  }\n"
-    "  float k = min(nh, float(t.maxn) - 1.0) + 1.0;\n"
+    "  if (t.valid != 0u && (!rp || mv > 0.5)) {\n"
+    "    float4 n0 = np.read(p);\n"
+    "    if (ta_attached(abs(n0.w - n.w) / n.w, er) && dot(n0.xyz, n.xyz) >= 0.9) { float4 h0 = hp.read(p); hs = h0.rgb; nh = h0.a; }\n"
+    "  }\n"
+    "  if (nh > 0.0) {\n"
+    "    int2 cm = int2(int(cur.get_width()) - 1, int(cur.get_height()) - 1);\n"
+    "    float3 m1 = float3(0.0), m2 = float3(0.0); float wn = 0.0;\n"
+    "    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {\n"
+    "      uint2 q = uint2(clamp(int2(p) + int2(x, y), int2(0), cm));\n"
+    "      if (!(abs(nc.read(q).w - n.w) <= TA_CLIP_Z * n.w)) continue;\n"
+    "      float3 v = cur.read(q).rgb; m1 += v; m2 += v * v; wn += 1.0;\n"
+    "    }\n"
+    "    m1 /= wn; float3 sd = sqrt(max(m2 / wn - m1 * m1, float3(0.0)));\n"
+    "    hs = clamp(hs, m1 - TA_CLIP * sd, m1 + TA_CLIP * sd);\n"
+    "  }\n"
+    "  float k = min(nh, ta_maxn(t, ch) - 1.0) + 1.0;\n"
     "  ho.write(float4(nh > 0.0 ? mix(hs, c, 1.0 / k) : c, nh > 0.0 ? k : 1.0), p);\n"
     "  if (t.stats != 0u) ta_count(cnt, 0u, nh > 0.0, mv);\n"
     "}\n"
@@ -625,14 +672,17 @@ static const char enh_src[] =
     // 0), hp the history of the last frame (r the visibility, g the frames in it, b the view distance); ho the new history
     "kernel void ao_accum(texture2d<float, access::read> cur [[texture(0)]], texture2d<float, access::read> zt [[texture(1)]],\n"
     "  texture2d<float, access::read> hp [[texture(2)]], texture2d<float, access::write> ho [[texture(3)]],\n"
-    "  constant TA &t [[buffer(0)]], device atomic_uint *cnt [[buffer(1)]], uint2 p [[thread_position_in_grid]]) {\n"
+    "  constant TA &t [[buffer(0)]], device atomic_uint *cnt [[buffer(1)]], texture2d<uint, access::read> sm [[texture(4)]],\n"
+    "  uint2 p [[thread_position_in_grid]]) {\n"
     "  if (p.x >= ho.get_width() || p.y >= ho.get_height()) return;\n"
     "  float a = cur.read(p).r, z = zt.read(p).r;\n"
     "  if (z >= SKY * 0.5) { ho.write(float4(a, 1.0, SKY, 0.0), p); return; }\n"
-    "  float nh = 0.0, hs = 0.0, mv = 0.0;\n"
+    "  float nh = 0.0, hs = 0.0, mv = 0.0, er = 1.0;\n"
     "  float2 ss = float2(t.sw, t.sh), sp = (float2(p) + 0.5) / ss, ps;\n"
     "  float pz;\n"
-    "  if (t.valid != 0u && ta_reproj(sp, z, t, ps, pz)) {\n"
+    "  bool ch = t.mask != 0u && (sm.read(p).r & 0x80u) != 0u;\n"
+    "  bool rp = t.valid != 0u && ta_reproj(sp, z, t, ps, pz);\n"
+    "  if (rp) {\n"
     "    mv = length((ps - sp) * ss);\n"
     "    float2 hq = ps * ss - 0.5, b = floor(hq), fr = hq - b;\n"
     "    int2 hm = int2(int(hp.get_width()) - 1, int(hp.get_height()) - 1);\n"
@@ -643,11 +693,38 @@ static const char enh_src[] =
     "      float4 h = hp.read(uint2(qq));\n"
     "      if (!(abs(h.b - pz) < 0.04 * pz)) continue;\n"
     "      float w = (o.x != 0 ? fr.x : 1.0 - fr.x) * (o.y != 0 ? fr.y : 1.0 - fr.y);\n"
-    "      acc += h.rg * w; ws += w;\n"
+    "      acc += h.rg * w; ws += w; er = min(er, abs(h.b - pz) / pz);\n"
     "    }\n"
-    "    if (ws > 0.05) { acc /= ws; hs = acc.x; nh = acc.y; }\n"
+    "    if (ws > 0.05) { acc /= ws; hs = acc.x; nh = acc.y; } else er = 1.0;\n"
     "  }\n"
-    "  float k = min(nh, float(t.maxn) - 1.0) + 1.0;\n"
+    "  if (t.valid != 0u && (!rp || mv > 0.5)) {\n"
+    "    float4 h0 = hp.read(p);\n"
+    "    if (ta_attached(abs(h0.b - z) / z, er)) { hs = h0.r; nh = h0.g; }\n"
+    "  }\n"
+    "  float mn = ta_maxn(t, ch);\n"
+    "  int2 mx = int2(int(cur.get_width()) - 1, int(cur.get_height()) - 1);\n"
+    "  if (nh > 0.0) {\n"
+    "    float m1 = 0.0, m2 = 0.0, wn = 0.0;\n"
+    "    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {\n"
+    "      uint2 q = uint2(clamp(int2(p) + int2(x, y), int2(0), mx));\n"
+    "      if (!(abs(zt.read(q).r - z) <= TA_CLIP_Z * z)) continue;\n"
+    "      float v = cur.read(q).r; m1 += v; m2 += v * v; wn += 1.0;\n"
+    "    }\n"
+    "    m1 /= wn; float sd = sqrt(max(m2 / wn - m1 * m1, 0.0));\n"
+    "    hs = clamp(hs, m1 - TA_CLIP * sd, m1 + TA_CLIP * sd);\n"
+    "  }\n"
+    // a short history: this frame's visibility is the depth-weighted mean of its 5 x 5 pixels, less as the history
+    // grows, so a surface that comes into view does not start with the noise of one frame
+    "  if (nh < mn - 1.0) {\n"
+    "    float sm = 0.0, sw = 0.0;\n"
+    "    for (int y = -2; y <= 2; y++) for (int x = -2; x <= 2; x++) {\n"
+    "      uint2 q = uint2(clamp(int2(p) + int2(x, y), int2(0), mx));\n"
+    "      float w = saturate(1.0 - abs(zt.read(q).r - z) / (0.02 * z));\n"
+    "      sm += cur.read(q).r * w; sw += w;\n"
+    "    }\n"
+    "    a = mix(sm / sw, a, nh / (mn - 1.0));\n"
+    "  }\n"
+    "  float k = min(nh, mn - 1.0) + 1.0;\n"
     "  ho.write(float4(nh > 0.0 ? mix(hs, a, 1.0 / k) : a, nh > 0.0 ? k : 1.0, z, 0.0), p);\n"
     "  if (t.stats != 0u) ta_count(cnt, 3u, nh > 0.0, mv);\n"
     "}\n"
@@ -783,6 +860,20 @@ static const char enh_src[] =
     "  }\n"
     "  mv.write(float4(m, 0.0, 0.0), gid);\n"
     "}\n"
+    // the depth (and the stencil) of the scene at the render size, written into the depth buffer of the back buffer at
+    // the output size: each output pixel takes the nearest render pixel (k: render size / output size)
+    "struct DU { float d [[depth(any)]]; uint s [[stencil]]; };\n"
+    "fragment DU depth_up_fs(PV in [[stage_in]], depth2d<float, access::read> sd [[texture(0)]],\n"
+    "  texture2d<uint, access::read> ss [[texture(1)]], constant float2 &k [[buffer(0)]]) {\n"
+    "  uint2 q = min(uint2(in.pos.xy * k), uint2(sd.get_width() - 1, sd.get_height() - 1));\n"
+    "  DU o; o.d = sd.read(q); o.s = ss.read(q).r; return o;\n"
+    "}\n"
+    "struct DD { float d [[depth(any)]]; };\n"
+    "fragment DD depth_up_d_fs(PV in [[stage_in]], depth2d<float, access::read> sd [[texture(0)]],\n"
+    "  constant float2 &k [[buffer(0)]]) {\n"
+    "  uint2 q = min(uint2(in.pos.xy * k), uint2(sd.get_width() - 1, sd.get_height() - 1));\n"
+    "  DD o; o.d = sd.read(q); return o;\n"
+    "}\n"
     "fragment float4 bloom_comp(BV in [[stage_in]], texture2d<float> t [[texture(0)]], constant BP &p [[buffer(0)]],\n"
     "  float4 dst [[color(0)]]) {\n"
     "  return float4(to_srgb(mix(to_lin(dst.rgb), up8(t, in.uv, p.px) * p.inv, p.k)), dst.a);\n"
@@ -793,7 +884,7 @@ typedef struct { float light[4]; int32_t offset[2]; float far_z, near_z, thickne
 typedef struct { float beta; uint32_t ao, contact; float strength; float light[4]; float mulx, muly, addx, addy, da, db, px, py;
                  uint32_t gi; float gik, pad0, pad1; } CC;
 typedef struct { float mulx, muly, addx, addy, da, db, px, py, radius, thick, sw, sh; uint32_t rays, steps, lods, frame; } GIC;
-typedef struct { float r[4][4]; float rot[3][4]; float sw, sh, da, db; uint32_t valid, stats, maxn, pad; } TA;
+typedef struct { float r[4][4]; float rot[3][4]; float sw, sh, da, db; uint32_t valid, stats, maxn, pad; } TA;   // pad: the character mask is valid (shader: mask)
 typedef struct { int32_t count[3]; int32_t offset[2]; } SssDispatch;
 
 typedef struct { float px[2]; float k, inv; } BP;
@@ -815,11 +906,16 @@ static struct {
     id<MTLRenderPipelineState> apply; MTLPixelFormat apply_fmt;
     id<MTLTexture> hilbert, depths, mip[AO_MIPS], ao0, ao1, edges, shadow, gi0, gi1, gin[2], gc, gcm[GI_MIPS], gh[2], aoh[2];
     id<MTLBuffer> nostats;          // the counter buffer of the frames without statistics
+    id<MTLTexture> sview, sview_src, nomask;   // the stencil view of the depth texture sview_src; a 1 x 1 zero mask
     uint32_t gi_hist, ao_hist;      // the frame of the last history of the global illumination / ambient occlusion (0: none)
     id<MTLRenderPipelineState> bloom_pre, bloom_down, bloom_up, bloom_comp; MTLPixelFormat bloom_comp_fmt;
     id<MTLTexture> bloom_lv[BLOOM_LEVELS];
     id<MTLComputePipelineState> taa_motion;
-    id<MTLFXTemporalScaler> taa; NSUInteger taa_w, taa_h; MTLPixelFormat taa_fmt;
+    id<MTLFXTemporalScaler> taa; NSUInteger taa_w, taa_h, taa_ow, taa_oh; MTLPixelFormat taa_fmt;
+    int taa_new;                   // the scaler was made again: its first frame starts the history again
+    id<MTLRenderPipelineState> dup; MTLPixelFormat dup_fmt;   // the depth write-back of upscaling
+    id<MTLDepthStencilState> dup_dss;
+    id<MTLTexture> dup_sview, dup_sview_src;
     id<MTLTexture> taa_mv, taa_dz, taa_out;
     int logged_taa, logged_taa_ms;
     int logged_gi, logged_ao, logged_sss, logged_cam, logged_ms, logged_bloom, logged_bloom_ms;
@@ -883,6 +979,12 @@ static void setup(id<MTLDevice> dev) {
     static const uint32_t zero[8];
     E.nostats = [dev newBufferWithBytes:zero length:sizeof zero options:MTLResourceStorageModeShared];
     if (!E.nostats) rt_fatal("[d3d9] out of memory for the temporal accumulation counters");
+    MTLTextureDescriptor *md = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Uint width:1 height:1 mipmapped:NO];
+    md.storageMode = MTLStorageModeShared; md.usage = MTLTextureUsageShaderRead;
+    E.nomask = [dev newTextureWithDescriptor:md];
+    if (!E.nomask) rt_fatal("[d3d9] out of GPU memory for the character mask texture");
+    static const uint8_t z1 = 0;
+    [E.nomask replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&z1 bytesPerRow:1];
 }
 static id<MTLTexture> tex_of(id<MTLTexture> __strong *slot, NSUInteger w, NSUInteger h, MTLPixelFormat fmt, NSUInteger mips) {
     id<MTLTexture> t = *slot;
@@ -995,6 +1097,17 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
         // temporal accumulation: the reprojection of this frame, and the counters of the statistics (rt_verbose, every 600
         // frames)
         TA t; memset(&t, 0, sizeof t);
+        // the character mask: the stencil of a depth texture with a stencil (d3d9_metal.m ENH_CHAR_BIT); TA.pad = 1
+        // when the mask is valid
+        id<MTLTexture> mask = E.nomask;
+        if (depth.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
+            if (E.sview_src != depth) {
+                E.sview = [depth newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
+                if (!E.sview) rt_fatal("[d3d9] Metal did not create the stencil view of the depth texture (character mask)");
+                E.sview_src = depth;
+            }
+            mask = E.sview; t.pad = 1;
+        }
         memcpy(t.r, s->reproj, sizeof t.r);
         for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) t.rot[i][j] = s->rot[i * 3 + j];
         t.sw = (float)w; t.sh = (float)h; t.da = da; t.db = db;
@@ -1066,6 +1179,7 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
             [ce setTexture:E.gh[cur ^ 1u] atIndex:2];
             [ce setTexture:E.gin[cur ^ 1u] atIndex:3];
             [ce setTexture:E.gh[cur] atIndex:4];
+            [ce setTexture:mask atIndex:5];
             [ce dispatchThreads:MTLSizeMake(hw, hh, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
             E.gi_hist = s->frame;
             // GI_PASSES a-trous passes (distances 1, 2, 4, ...): gh[cur] -> gi1 -> gi0 -> ...
@@ -1123,6 +1237,7 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
             [ce setTexture:E.mip[0] atIndex:1];
             [ce setTexture:E.aoh[cur ^ 1u] atIndex:2];
             [ce setTexture:E.aoh[cur] atIndex:3];
+            [ce setTexture:mask atIndex:4];
             [ce dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
             E.ao_hist = s->frame;
             id<MTLTexture> aoin = E.aoh[cur];
@@ -1304,13 +1419,18 @@ static id<MTLTexture> taa_tex(NSUInteger w, NSUInteger h, MTLPixelFormat fmt, MT
     if (!t) rt_fatal("[d3d9] out of GPU memory for the anti-aliasing %s texture (%lux%lu)", what, (unsigned long)w, (unsigned long)h);
     return t;
 }
-static void taa_setup(NSUInteger w, NSUInteger h, MTLPixelFormat fmt) {
-    if (E.taa && E.taa_w == w && E.taa_h == h && E.taa_fmt == fmt) return;
+// the scaler for the input w x h and the output ow x oh (equal for anti-aliasing at the size of the back buffer)
+static void taa_setup(NSUInteger w, NSUInteger h, NSUInteger ow, NSUInteger oh, MTLPixelFormat fmt) {
+    if (E.taa && E.taa_w == w && E.taa_h == h && E.taa_ow == ow && E.taa_oh == oh && E.taa_fmt == fmt) return;
     if (![MTLFXTemporalScalerDescriptor supportsDevice:E.dev]) rt_fatal("[d3d9] this GPU does not support the MetalFX temporal scaler (anti-aliasing)");
+    float scale = fmaxf((float)ow / (float)w, (float)oh / (float)h);
     float mn = [MTLFXTemporalScalerDescriptor supportedInputContentMinScaleForDevice:E.dev];
-    if (!(mn <= 1.0f)) rt_fatal("[d3d9] the MetalFX temporal scaler of this GPU needs a scale of at least %g; anti-aliasing needs 1", mn);
+    float mxs = [MTLFXTemporalScalerDescriptor supportedInputContentMaxScaleForDevice:E.dev];
+    if (!(mn <= scale) || !(scale <= mxs + 1e-3f))
+        rt_fatal("[d3d9] the MetalFX temporal scaler of this GPU supports scales %g to %g; this setting needs %.3f. Choose another "
+                 "Anti-Aliasing (MetalFX) setting", mn, mxs, scale);
     MTLFXTemporalScalerDescriptor *dd = [MTLFXTemporalScalerDescriptor new];
-    dd.inputWidth = w; dd.inputHeight = h; dd.outputWidth = w; dd.outputHeight = h;
+    dd.inputWidth = w; dd.inputHeight = h; dd.outputWidth = ow; dd.outputHeight = oh;
     dd.colorTextureFormat = fmt; dd.outputTextureFormat = fmt;
     dd.depthTextureFormat = MTLPixelFormatR32Float; dd.motionTextureFormat = MTLPixelFormatRG16Float;
     dd.autoExposureEnabled = NO;
@@ -1318,17 +1438,18 @@ static void taa_setup(NSUInteger w, NSUInteger h, MTLPixelFormat fmt) {
     id<MTLFXTemporalScaler> sc = [dd newTemporalScalerWithDevice:E.dev];
     if (!sc) rt_fatal("[d3d9] the MetalFX temporal scaler (anti-aliasing) was not created for %lux%lu, format %lu",
                       (unsigned long)w, (unsigned long)h, (unsigned long)fmt);
-    E.taa = sc; E.taa_w = w; E.taa_h = h; E.taa_fmt = fmt;
+    E.taa = sc; E.taa_w = w; E.taa_h = h; E.taa_ow = ow; E.taa_oh = oh; E.taa_fmt = fmt; E.taa_new = 1;
     E.taa_mv = taa_tex(w, h, MTLPixelFormatRG16Float, sc.motionTextureUsage, "motion");
     E.taa_dz = taa_tex(w, h, MTLPixelFormatR32Float, sc.depthTextureUsage, "depth");
-    E.taa_out = taa_tex(w, h, fmt, sc.outputTextureUsage, "output");
+    E.taa_out = taa_tex(ow, oh, fmt, sc.outputTextureUsage, "output");
     sc.motionVectorScaleX = 1.0f; sc.motionVectorScaleY = 1.0f;
     sc.inputContentWidth = w; sc.inputContentHeight = h;
     sc.depthReversed = NO;
-    rt_log("[d3d9] MetalFX temporal anti-aliasing %lux%lu, format %lu", (unsigned long)w, (unsigned long)h, (unsigned long)fmt);
+    rt_log("[d3d9] MetalFX temporal %s %lux%lu to %lux%lu (scale %.2f), format %lu", ow == w && oh == h ? "anti-aliasing" : "upscaling",
+           (unsigned long)w, (unsigned long)h, (unsigned long)ow, (unsigned long)oh, scale, (unsigned long)fmt);
 }
-int d3d9_enh_taa(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTexture> depth, const float *reproj,
-                 float jx, float jy, int reset) {
+int d3d9_enh_taa(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTexture> depth, id<MTLTexture> out,
+                 const float *reproj, float jx, float jy, int reset) {
     NSUInteger w = color.width, h = color.height;
     if (color.sampleCount > 1 || depth.sampleCount > 1 || depth.width != w || depth.height != h) {
         if (!E.logged_taa_ms) rt_log("[d3d9] anti-aliasing: the scene is multisampled or its depth buffer (%lux%lu) differs from the "
@@ -1339,8 +1460,13 @@ int d3d9_enh_taa(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> colo
     }
     @autoreleasepool {
         setup(dev);
-        taa_setup(w, h, color.pixelFormat);
+        if (out.pixelFormat != color.pixelFormat || out.sampleCount > 1 || out.width < w || out.height < h)
+            rt_fatal("[d3d9] upscaling: the output (%lux%lu, format %lu) does not fit the scene (%lux%lu, format %lu)",
+                     (unsigned long)out.width, (unsigned long)out.height, (unsigned long)out.pixelFormat, (unsigned long)w,
+                     (unsigned long)h, (unsigned long)color.pixelFormat);
+        taa_setup(w, h, out.width, out.height, color.pixelFormat);
         id<MTLFXTemporalScaler> sc = E.taa;
+        if (E.taa_new) { reset = 1; E.taa_new = 0; }
         if ((color.usage & sc.colorTextureUsage) != sc.colorTextureUsage)
             rt_fatal("[d3d9] anti-aliasing: the back buffer texture lacks the usage 0x%lx that MetalFX needs", (unsigned long)sc.colorTextureUsage);
         TC k; memset(&k, 0, sizeof k);
@@ -1360,9 +1486,68 @@ int d3d9_enh_taa(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> colo
         [sc encodeToCommandBuffer:cb];
         id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
         be.label = @"Anti-aliasing output";
-        [be copyFromTexture:E.taa_out toTexture:color];
+        [be copyFromTexture:E.taa_out toTexture:out];
         [be endEncoding];
         if (!E.logged_taa) { rt_log("[d3d9] anti-aliasing: first frame (jitter %.3f %.3f, %s)", jx, jy, reproj ? "camera motion" : "no camera motion"); E.logged_taa = 1; }
     }
     return 1;
+}
+
+void d3d9_enh_depth_up(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst) {
+    @autoreleasepool {
+        setup(dev);
+        MTLPixelFormat fmt = dst.pixelFormat;
+        int st = fmt == MTLPixelFormatDepth32Float_Stencil8;
+        if (src.pixelFormat != fmt || src.sampleCount > 1 || dst.sampleCount > 1)
+            rt_fatal("[d3d9] upscaling: the scene depth (format %lu) and the depth buffer (format %lu) differ", (unsigned long)src.pixelFormat,
+                     (unsigned long)fmt);
+        if (!E.dup || E.dup_fmt != fmt) {
+            MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+            pd.vertexFunction = [E.lib newFunctionWithName:@"enh_vs"];
+            pd.fragmentFunction = [E.lib newFunctionWithName:st ? @"depth_up_fs" : @"depth_up_d_fs"];
+            pd.depthAttachmentPixelFormat = fmt;
+            if (st) pd.stencilAttachmentPixelFormat = fmt;
+            NSError *err = nil;
+            E.dup = [E.dev newRenderPipelineStateWithDescriptor:pd error:&err];
+            if (!E.dup) rt_fatal("[d3d9] the depth pipeline of upscaling was not created: %s", err.localizedDescription.UTF8String);
+            E.dup_fmt = fmt;
+        }
+        if (!E.dup_dss) {
+            MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+            dd.depthCompareFunction = MTLCompareFunctionAlways; dd.depthWriteEnabled = YES;
+            MTLStencilDescriptor *sd = [MTLStencilDescriptor new];
+            sd.stencilCompareFunction = MTLCompareFunctionAlways;
+            sd.stencilFailureOperation = sd.depthFailureOperation = MTLStencilOperationKeep;
+            sd.depthStencilPassOperation = MTLStencilOperationReplace;
+            sd.readMask = sd.writeMask = 0xFF;
+            dd.frontFaceStencil = sd; dd.backFaceStencil = sd;
+            E.dup_dss = [E.dev newDepthStencilStateWithDescriptor:dd];
+            if (!E.dup_dss) rt_fatal("[d3d9] the depth state of upscaling was not created");
+        }
+        if (st && E.dup_sview_src != src) {
+            E.dup_sview = [src newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
+            if (!E.dup_sview) rt_fatal("[d3d9] Metal did not create the stencil view of the scene depth");
+            E.dup_sview_src = src;
+        }
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.depthAttachment.texture = dst;
+        rp.depthAttachment.loadAction = MTLLoadActionDontCare;
+        rp.depthAttachment.storeAction = MTLStoreActionStore;
+        if (st) {
+            rp.stencilAttachment.texture = dst;
+            rp.stencilAttachment.loadAction = MTLLoadActionDontCare;
+            rp.stencilAttachment.storeAction = MTLStoreActionStore;
+        }
+        id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+        if (!re) rt_fatal("[d3d9] Metal did not create the depth encoder of upscaling");
+        re.label = @"Upscaling depth";
+        float k[2] = {(float)src.width / (float)dst.width, (float)src.height / (float)dst.height};
+        [re setRenderPipelineState:E.dup];
+        [re setDepthStencilState:E.dup_dss];
+        [re setFragmentTexture:src atIndex:0];
+        if (st) [re setFragmentTexture:E.dup_sview atIndex:1];
+        [re setFragmentBytes:k length:sizeof k atIndex:0];
+        [re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [re endEncoding];
+    }
 }

@@ -31,7 +31,8 @@ typedef struct RtEnh {
                        //    the calibration test image (only with HDR output)
     int32_t fov;       // game project: the field of view of the player camera (0 = the game's; the game project gives
                        //    the steps)
-    int32_t aa;        // 0: off; 1: MetalFX temporal anti-aliasing of the 3D scene
+    int32_t aa;        // 0: off; 1: MetalFX temporal anti-aliasing of the 3D scene; 2..4: the 3D scene at a lower resolution,
+                       //    MetalFX temporal upscaling to the back buffer: Quality (1.5x), Balanced (1.7x), Performance (2x)
     int32_t sanity;    // game project: the intensity of the game's visual sanity effects (0 = the game's; the game
                        //    project gives the steps)
     int32_t hrtf;      // 0: 3D sounds with balance panning; 1: 3D sounds through the head-related transfer function (HRTF)
@@ -57,6 +58,9 @@ typedef struct RtEnh {
                                320, 340, 380, 420, 460, 500, 540, 580, 610, 640}
 #define RT_ENH_HDR_PAPERS 21
 #define RT_ENH_HDR_DEFAULT 10
+// The upscaling factor (back buffer size / scene size) of each value of aa.
+#define RT_ENH_AA_SCALES {1.0f, 1.0f, 1.5f, 1.7f, 2.0f}
+#define RT_ENH_AA_MAX 4
 // macOS gives the brightness of the screen only as EDR headroom, a factor of the current SDR white. The runtime takes
 // the peak of the screen as 100 nits x the potential EDR headroom (16 on a Liquid Retina XDR display: 1600 nits, its
 // HDR peak), so SDR white is approximately 100 nits x potential headroom / current headroom. The runtime converts
@@ -80,8 +84,10 @@ void d3d9_enh_light_dir(float x, float y, float z);
 // r = -2 / its trace, and the light is at pos + r x dir; a trace of 0 or more gives a light at infinity in the
 // direction dir. The light of a frame is the light of the draw nearest the camera. The light moves 15% of the way to
 // a new light in each frame, and a frame with no such draw keeps the last light. Until the first such draw, no frame
-// has contact shadows. Call it before the device is created, and not together with d3d9_enh_light_dir. With this call
-// d3d9_enh_light_pass does not give the light; its render targets still do not end the scene.
+// has contact shadows. Call it before the device is created. With this call d3d9_enh_light_pass does not give the
+// light; its render targets still do not end the scene. With d3d9_enh_light_dir too, the fixed light of
+// d3d9_enh_light_dir is the light, and these draws are only the characters of the ambient occlusion and the global
+// illumination (their pixels keep a shorter history, because the motion of an animated character is not known).
 void d3d9_enh_light_vs(const char *dir, const char *pos, const char *grad, uint32_t stride);
 
 // The interface in 4:3: the 2D draws of the game's interface are the draws with a vertex shader whose debug
@@ -141,10 +147,15 @@ int d3d9_enh_scene(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> co
 // Dual Kawase bloom (level 1..3, 0 = off) of the scene in color: render passes on cb that add the bloom to color in
 // place. Returns 1 when color was changed.
 int d3d9_enh_bloom(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> color, int level);
-// MetalFX temporal anti-aliasing of the scene in color (with its depth buffer): color is replaced by the output of
-// MetalFX. reproj: the rows of inverse(this frame's view-projection) x the last frame's view-projection (row vectors),
-// or NULL when the motion of the camera is not known (zero motion). jx, jy: the sub-pixel offset of this frame's scene
-// draws in pixels (y down). reset: the history of MetalFX starts again. Returns 1 when color was changed.
-int d3d9_enh_taa(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTexture> depth, const float *reproj,
-                 float jx, float jy, int reset);
+// MetalFX temporal anti-aliasing and upscaling of the scene in color (with its depth buffer): the output of MetalFX at
+// the size of out is copied into out (out can be color: anti-aliasing at the same size). out has the format of color
+// and is at least as large. reproj: the rows of inverse(this frame's view-projection) x the last frame's view-projection
+// (row vectors), or NULL when the motion of the camera is not known (zero motion). jx, jy: the sub-pixel offset of this
+// frame's scene draws in pixels of color (y down). reset: the history of MetalFX starts again. Returns 1 when out was
+// changed, 0 when color is multisampled or depth has another size (no change).
+int d3d9_enh_taa(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> color, id<MTLTexture> depth, id<MTLTexture> out,
+                 const float *reproj, float jx, float jy, int reset);
+// The depth (and the stencil) of src at the size of dst, written into all of dst (the nearest pixel of src). src and dst
+// have the same depth format.
+void d3d9_enh_depth_up(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst);
 #endif

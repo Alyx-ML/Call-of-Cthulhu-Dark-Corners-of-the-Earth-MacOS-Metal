@@ -1014,3 +1014,105 @@ Verification:
 
 - `make app` built the app (only the two known `key_frame` warnings of `wmvcore.c`).
 - Headless run of 75 s, High, with `MTL_DEBUG_LAYER=1` and `MTL_SHADER_VALIDATION=1`, and a settings file with the line `temporal_accumulation=1`: 2400 frames, no Metal validation error, no "not a valid setting" message. The `RT_VERBOSE` log shows the accumulation in each 600 frames.
+
+## 2026-11-23: Ambient occlusion in motion
+
+Report (user): the ambient occlusion moves with the camera and pops in and out when the camera moves.
+
+Cause (measured with a temporary GPU counter of the change of the denoised ambient occlusion from one frame to the next, at the reprojected position, High, the user's settings):
+
+- Surfaces that move with the camera. In the bus scene of the first level, 24% of the moving pixels keep their screen position (the bus carries the camera). The temporal accumulation follows only the camera, so the history of these surfaces came from another surface (the AO moved with the camera) or was removed (the AO started again from the noise of one frame). When the player walks, 0.08% of the moving pixels move with the camera.
+- Surfaces that come into view (disocclusion, the screen edges when the camera turns) started from the noise of one frame. In a fast turn (64 pixels for each frame), pixels with a history of 2 frames or less changed by more than 0.05 in 12% of the frames, against approximately 1% for the other pixels.
+- Not a cause (no change in the counters): samples outside the screen, the depth mip filter, a limit on the screen radius, and the noise of the samples (12 slices x 8 steps gave the same result after the accumulation).
+
+Changes (`Recomp-Framework/win32/runtime/d3d9_enhance.m`):
+
+- `ta_attached`: when the camera moved, a history at the same pixel with the same view distance (within 0.3%) replaces the reprojected history when no reprojected tap is within max(4 x that error, 0.5%). `ao_accum` and `gi_accum` use it (the global illumination also needs a normal cosine of 0.9 or more).
+- `ao_accum`: a pixel with a history of fewer than `AO_FRAMES` frames starts from the depth-weighted mean of its 5 x 5 pixels, mixed with its own value in the proportion (history frames) / (`AO_FRAMES` - 1).
+- The comment at the top of the file describes both rules.
+
+Result, bus scene (2930 frames, mean motion 16.5 pixels for each frame), before and after:
+
+| Measure | Before | After |
+|---|---|---|
+| Pixels that change by more than 0.05 in a frame | 4.07% | 2.90% |
+| Pixels with no history | 5.9% | 1.9% |
+| Of these, pixels that change by more than 0.05 | 31% | 14% |
+| 8 x 8 blocks whose mean changes by more than 0.05 | 1.90% | 2.24% |
+
+The large-area change (the last row) increased a little. Its cause is not known. Static camera: no change (0.07% of the pixels change by more than 0.05). Not verified: turning with the mouse after the change (the turn test was not repeated), and objects that move by themselves (people, doors), whose motion is not known.
+
+Verification:
+
+- `make app` built the app with no new warning. The final source has no measurement code. `cocoa32.m` and `dinput8.c` (temporary test input) are the same as the repository.
+- Headless run of 75 s, ambient occlusion High, `MTL_DEBUG_LAYER=1` and `MTL_SHADER_VALIDATION=1`: 2400 frames, no Metal validation error. That settings file has the global illumination off; the measured runs (global illumination High, no validation) ran with no error.
+
+## 2026-11-23: Contact shadows in motion, ambient occlusion on characters
+
+Reports (user, with screenshots): the contact shadows move and pop in and out when the camera moves; the ambient occlusion gives odd character rendering. A first correction (a light that stays fixed while it is the same, with a fade between lights) made the shadows worse. The removal of the ambient occlusion from the characters made the characters look washed out.
+
+Causes:
+
+- Contact shadows: the light was the light of the lit draw (a character) nearest the camera, and it moved 15% of the way to that light in each frame. This light changes when the camera moves (another character becomes the nearest) and from frame to frame (the game's light of a character). Measured with the fade correction in the bus scene: 76 light changes and 1,068 faded frames of 2,920.
+- Characters: characters animate, and the history of the ambient occlusion and the global illumination comes from the motion of the camera only. On a character, the old values were at the wrong place.
+
+Changes:
+
+- `CoC-Recomp/enhance.c`: `d3d9_enh_light_dir(0, 0, 1)` gives the contact shadows a fixed light straight above (+Z, the up axis of the world). The light does not change with the camera. `d3d9_enh_light_vs` stays, and now only marks the characters.
+- `Recomp-Framework/win32/runtime/rt_enh.h`: `d3d9_enh_light_vs` and `d3d9_enh_light_dir` can be used together. Then the fixed light is the light, and the draws of `d3d9_enh_light_vs` are the characters.
+- `Recomp-Framework/win32/runtime/d3d9_metal.m`: an opaque back-buffer draw that writes the depth, with the game's stencil test off, writes bit 0x80 of the stencil: 1 for a character draw, 0 for the other draws (`enh_char_mark`, only with ambient occlusion or global illumination on). Depth-stencil textures get `MTLTextureUsagePixelFormatView` (the stencil view). The removed `rt_fatal` calls stopped the use of both light functions together. With the fixed light, the light of the character draws is not read.
+- `Recomp-Framework/win32/runtime/d3d9_enhance.m`: `ao_accum` and `gi_accum` read the stencil (an `X32_Stencil8` view, or a 1 x 1 zero texture when the depth texture has no stencil). A character pixel uses no history. It keeps its ambient occlusion and global illumination of this frame.
+
+Verification:
+
+- A temporary log of the game's stencil states (130 s, the bus and the town): the game did not turn the stencil test on. Not verified: the later levels.
+- A temporary counter found 1,276 to 91,412 character pixels in the bus frames with characters, and 0 in the town frames with no character.
+- Headless run of 170 s (to frame 6600, the town) with the user's settings, global illumination high and `MTL_DEBUG_LAYER=1`: no validation error. The log gives the contact shadow light (0, 0, 1, 0) from the first frame.
+- `make app`: no new warning. The final app has no measurement code.
+- Not verified at run time: the look of the contact shadows and the characters while the camera moves (no screenshots).
+
+## 2026-11-23: Ghosting of the global illumination and the ambient occlusion
+
+Report (user, with screenshots): the global illumination looks a bit off, moving doors leave ghosts, and the characters have odd blocks of ambient occlusion.
+
+Causes:
+
+- The motion of objects that move by themselves (doors, characters) is not known. The depth test removes the history where the depth changes, but the still pixels around a moving object kept the light and the occlusion of where the object was.
+- Character pixels used no history: each frame showed the noise of one frame, smoothed over 5 x 5 pixels, as blocks.
+
+Changes:
+
+- `Recomp-Framework/win32/runtime/d3d9_enhance.m`: `gi_accum` and `ao_accum` clip the history to this frame's mean +- 1.25 x the standard deviation of the 3 x 3 neighbors at the same view distance (within 5%) (variance clipping, `TA_CLIP`, `TA_CLIP_Z`). Character pixels keep a history of at most 4 frames (`TA_CHAR_FRAMES`, `ta_maxn`).
+- `Recomp-Framework/win32/runtime/d3d9_metal.m`, `rt_enh.h`, `CoC-Recomp/enhance.c`: comments changed to the shorter character history.
+
+Verification:
+
+- Headless run of 170 s with the user's settings, global illumination high, `MTL_DEBUG_LAYER=1` and `MTL_SHADER_VALIDATION=1`: no validation error.
+- Temporary measurement in the town (still camera, 1.6 to 2.0 million pixels, frames 6600 to 9000), mean change of a pixel from one frame to the next: ambient occlusion 0.0075 to 0.0094 with the clip and 0.0074 to 0.0092 without it; global illumination luminance 0.00009 to 0.00016 with the clip and 0.00008 to 0.00014 without it. The clip does not add visible noise.
+- `make app`: no new warning. The measurement code is removed.
+- Not verified: the ghosting of a moving door and the look of the characters (no screenshots, and no moving door in the headless test).
+
+## 2026-11-23: MetalFX upscaling presets; Unofficial Patch shader fixes
+
+### Unofficial Patch 1.7 shader fixes
+
+- The files of the GOG release already have both fixes (checked again): bytes 432 to 443 of `psModulateColorByAlpha.pso` are -1.0 three times, and byte 1116 of `Skydome_NoColor.vso` selects `v1`. No change is necessary.
+
+### MetalFX upscaling
+
+- The setting Anti-Aliasing (MetalFX) has the values Off, Native, Quality (1.5x), Balanced (1.7x) and Performance (2x) (`anti_aliasing` 0 to 4 in `Enhancements.cfg`; 1 is the old On).
+- With Quality, Balanced or Performance, the scene of a frame starts at its first draw into the back buffer with the depth buffer and the depth test on. From there to the end of the scene, the render passes into the back buffer go into copies of the back buffer and its depth buffer at the back buffer size / the factor (`up_redirect`). The viewport, the scissor rectangle, partial clears, the half-pixel offset and the sub-pixel offset are scaled to the copies. A full clear of the back buffer before the scene also clears the copies.
+- Ambient occlusion, global illumination and contact shadows run on the copies. MetalFX upscales the copies into the back buffer, and `d3d9_enh_depth_up` writes the scene depth and stencil into the depth buffer at its size (nearest pixel). Bloom, tone mapping, the game's post-processing and the interface stay at the full size.
+- Sub-pixel offsets: ceil(8 x scale^2) phases (8, 18, 24, 32). Texture LOD bias: -log2(scale) - 1 (-1, -1.58, -1.77, -2).
+- The menus of the game draw with the depth buffer bound and the depth test off, so they are not upscaled.
+
+Changed files: `Recomp-Framework/win32/runtime/d3d9_metal.m`, `d3d9_enhance.m`, `rt_enh.h` (`RT_ENH_AA_SCALES`, `RT_ENH_AA_MAX`, the new `d3d9_enh_taa` argument `out`, `d3d9_enh_depth_up`), `CoC-Recomp/enhance.c` (menu values), `CoC-Recomp/launcher.m` (launcher values).
+
+Verification:
+
+- `make app`: no new warning.
+- Headless runs with `MTL_DEBUG_LAYER=1` and `MTL_SHADER_VALIDATION=1` at Performance (900 x 563 to 1800 x 1125) and Balanced (1059 x 662): no validation error.
+- A temporary counter (Performance, 7,200 upscaled frames, the bus and the town): 0 interface draws in the copies, 0 back buffer draws before the end of the scene outside the copies. The main menu was not upscaled.
+- GPU time per frame (temporary measurement, the town, all enhancements on, global illumination high): Native 15 to 18 ms, Quality 9 to 11 ms, Performance approximately 7.7 ms.
+- The measurement code is removed. Not verified: the image on the screen, Quality at run time with validation, later levels, the pause menu and the inventory with upscaling.
+

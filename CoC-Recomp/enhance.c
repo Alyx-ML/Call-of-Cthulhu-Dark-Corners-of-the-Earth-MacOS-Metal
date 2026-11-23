@@ -68,6 +68,7 @@ extern void (*rt_dinput_poll_hook)(void);   // dinput8.c
 enum { T_TITLE, T_GAME, T_2X, T_AO, T_OFF, T_LOW, T_MEDIUM, T_HIGH, T_ON,
        T_TONEMAP, T_HDR, T_CONTACT, T_SKIP, T_BLOOM, T_SHADOWS, T_SUBS, T_125, T_150, T_175,
        T_CALIB, T_PEAK, T_PAPER, T_FOV, T_110, T_120, T_130, T_140, T_SANITY, T_S75, T_S50, T_S25, T_AA, T_HRTF, T_RAWMOUSE, T_GI, T_GRAIN,
+       T_AA_NATIVE, T_AA_QUALITY, T_AA_BALANCED, T_AA_PERF,
        T_NITS0, T_NITS_END = T_NITS0 + RT_ENH_HDR_PEAKS - 1,     // the values of RT_ENH_HDR_PEAK_NITS
        T_BRI0, T_BRI_END = T_BRI0 + RT_ENH_HDR_PAPERS - 1,       // the values of RT_ENH_HDR_PAPER_NITS
        T_COUNT };
@@ -82,6 +83,9 @@ static const char *const txt[T_COUNT] = {
     [T_SANITY] = "Sanity Effects", [T_S75] = "75%", [T_S50] = "50%", [T_S25] = "25%",
     [T_AA] = "Anti-Aliasing (MetalFX)", [T_HRTF] = "Headphone Audio (HRTF)", [T_RAWMOUSE] = "Raw Mouse Input",
     [T_GI] = "Global Illumination (RTGI)", [T_GRAIN] = "Film Grain",
+    // Anti-Aliasing (MetalFX): anti-aliasing at the size of the screen, or upscaling from 1/1.5, 1/1.7 or 1/2 of it
+    [T_AA_NATIVE] = "Native", [T_AA_QUALITY] = "Quality (1.5x)", [T_AA_BALANCED] = "Balanced (1.7x)",
+    [T_AA_PERF] = "Performance (2x)",
     // the steps -10 .. +10 of the two settings of the RE Engine, with their values in nits (rt_enh.h)
     [T_NITS0] =
     "-10 (300 nits)", "-9 (400 nits)", "-8 (500 nits)", "-7 (600 nits)", "-6 (700 nits)", "-5 (750 nits)",
@@ -125,7 +129,7 @@ const CocEnhKey coc_enh_keys[] = {
     {"hdr_brightness", offsetof(RtEnh, hdr_paper), RT_ENH_HDR_PAPERS - 1, RT_ENH_HDR_DEFAULT},     // 0: 300 nits
     {"field_of_view", offsetof(RtEnh, fov), 4, 0},
     {"sanity_effects", offsetof(RtEnh, sanity), 4, 0},
-    {"anti_aliasing", offsetof(RtEnh, aa), 1, 0},
+    {"anti_aliasing", offsetof(RtEnh, aa), RT_ENH_AA_MAX, 0},   // 1: native; 2 .. 4: upscaling
     {"headphone_audio", offsetof(RtEnh, hrtf), 1, 0},
     {"raw_mouse_input", offsetof(RtEnh, raw_mouse), 1, 0},
     {"global_illumination", offsetof(RtEnh, gi), 3, 0},
@@ -259,12 +263,17 @@ void coc_enh_init(void) {
     // the character shadow projector (512x512 R5G6B5 target, no depth buffer, the light's view-projection matrix in
     // c0..c3): the game draws into these targets during the scene
     d3d9_enh_light_pass(512, 512, 23 /* D3DFMT_R5G6B5 */, 0);
-    // the light of the contact shadows is the game's own light of its characters: the character shaders
+    // the characters: the character shaders
     // (Skinning_*bone*.vso) light the normal maps with the vector toward the light skinLightDir (c87) at the
     // character's center skinCenterPos (c86), plus skinLightGradients (c89, c91, c93: its derivatives along world
     // x, y and z; c90, c92, c94 are the derivatives of the light color) times the offset from the center. In a level
     // the derivatives were those of a point light approximately 100 units from the center (-(I - L L^T) / r).
     d3d9_enh_light_vs("skinLightDir", "skinCenterPos", "skinLightGradients", 2);
+    // the light of the contact shadows is a fixed light straight above (+Z, the up axis of the world). The light of the
+    // characters changes with the character nearest the camera and from frame to frame, so the shadows moved and
+    // changed when the camera moved. The characters of d3d9_enh_light_vs keep a shorter history in the ambient
+    // occlusion and the global illumination.
+    d3d9_enh_light_dir(0.0f, 0.0f, 1.0f);
     // the camera: the game draws the world with vertex shaders and does not set the fixed-function transforms; its
     // world shaders (Static_Lightmapped.vso and others) have the world-view-projection matrix matFinal in c0..c3
     d3d9_enh_camera_vs(0);
@@ -288,7 +297,7 @@ void coc_enh_init(void) {
            rt_enh->hdr ? "on" : "off", txt[T_NITS0 + rt_enh->hdr_peak], txt[T_BRI0 + rt_enh->hdr_paper],
            rt_enh->contact ? "on" : "off", lvl[rt_enh->bloom], rt_enh->shadows ? "on" : "off", sub[rt_enh->sub_scale],
            rt_enh->skip_intro ? "on" : "off", (const char *[]){"game", "110%", "120%", "130%", "140%"}[rt_enh->fov],
-           (const char *[]){"game", "75%", "50%", "25%", "off"}[rt_enh->sanity], rt_enh->aa ? "MetalFX" : "off", rt_enh->hrtf ? "HRTF" : "off",
+           (const char *[]){"game", "75%", "50%", "25%", "off"}[rt_enh->sanity], (const char *[]){"off", "MetalFX native", "MetalFX quality (1.5x)", "MetalFX balanced (1.7x)", "MetalFX performance (2x)"}[rt_enh->aa], rt_enh->hrtf ? "HRTF" : "off",
            rt_enh->raw_mouse ? "on" : "off", lvl[rt_enh->gi], rt_enh->grain ? "off" : "game");
 }
 
@@ -508,7 +517,7 @@ void coc_enh_build_menu(CPU *c) {
     add_enum(c, menu, T_FOV, (const int[]){T_GAME, T_110, T_120, T_130, T_140}, 5, K_FOV);
     add_enum(c, menu, T_SANITY, (const int[]){T_GAME, T_S75, T_S50, T_S25, T_OFF}, 5, K_SANITY);
     add_enum(c, menu, T_GRAIN, (const int[]){T_GAME, T_OFF}, 2, K_GRAIN);
-    add_enum(c, menu, T_AA, (const int[]){T_OFF, T_ON}, 2, K_AA);
+    add_enum(c, menu, T_AA, (const int[]){T_OFF, T_AA_NATIVE, T_AA_QUALITY, T_AA_BALANCED, T_AA_PERF}, 5, K_AA);
     add_enum(c, menu, T_HRTF, (const int[]){T_OFF, T_ON}, 2, K_HRTF);
     add_enum(c, menu, T_RAWMOUSE, (const int[]){T_OFF, T_ON}, 2, K_RAWMOUSE);
     add_enum(c, menu, T_GI, (const int[]){T_OFF, T_LOW, T_MEDIUM, T_HIGH}, 4, K_GI);
