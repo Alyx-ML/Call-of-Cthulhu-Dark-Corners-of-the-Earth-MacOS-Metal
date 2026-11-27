@@ -32,7 +32,7 @@ The app does not use a file with a different value.
 
 ## Install
 
-1. Download `Call of Cthulhu DCoTE.zip` from the latest release on the **Releases** page of this repository.
+1. Download `Call.of.Cthulhu.DCoTE.zip` from the latest release on the **Releases** page of this repository.
 2. Open the zip. Move **Call of Cthulhu DCoTE** to the Applications folder.
 3. Open **Call of Cthulhu DCoTE**. If macOS does not open it, go to **System Settings > Privacy & Security** and click **Open Anyway**. You do this only one time.
 4. In the launcher window, click **Choose Folder…** and select the game folder (the folder that contains the `Engine` folder).
