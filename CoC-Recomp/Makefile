@@ -27,3 +27,13 @@ include $(FW)/win32/win32.mk
 # folder this project is in. The app does not keep this path: the player chooses the game folder in the launcher.
 GAME_DIR ?= $(CURDIR)/..
 $(BUILD)/game/pad.o: CFLAGS += -I$(SDL3_PREFIX)/include
+
+# Development: `make app` also puts the game bundle of this build where the app keeps the result of its first-start
+# setup (Converted/<conversion ID>/game.bundle in the data folder of game.c). The app on the development Mac then
+# starts the game with no setup. The release zip has no game code; a player's app makes the bundle on the first Play.
+DEV_DATA = $(HOME)/Library/Application Support/CoCDCoTE-recomp
+app: dev-bundle
+dev-bundle: $(BUILD)/game.bundle $(BUILD)/conv_id
+	d="$(DEV_DATA)/Converted/$$(cat $(BUILD)/conv_id)" && mkdir -p "$$d" && \
+	    cp $(BUILD)/game.bundle "$$d/game.bundle.tmp" && mv "$$d/game.bundle.tmp" "$$d/game.bundle"
+.PHONY: dev-bundle
