@@ -1116,3 +1116,59 @@ Verification:
 - GPU time per frame (temporary measurement, the town, all enhancements on, global illumination high): Native 15 to 18 ms, Quality 9 to 11 ms, Performance approximately 7.7 ms.
 - The measurement code is removed. Not verified: the image on the screen, Quality at run time with validation, later levels, the pause menu and the inventory with upscaling.
 
+
+## 2026-11-27: NVIDIA NRD denoiser for the global illumination
+
+The REBLUR_DIFFUSE denoiser of NVIDIA Real-time Denoisers (NRD 4.18.0, NVIDIA-RTX/NRD commit `fca9486957dececb7a7d5b5646d0829c667a01cf`) replaces `gi_accum` (temporal accumulation) and `gi_denoise` (4 a-trous passes) of the global illumination. The ambient occlusion keeps its own accumulation (`ao_accum`).
+
+Build:
+
+- `install.sh` downloads NRD at the fixed commit into `Recomp-Framework/third_party/nrd` (not changed, not in the repository). It installs CMake and SPIRV-Cross with Homebrew. It downloads the official Slang 2026.18.3 release for macOS arm64 (`slang-2026.18.3-macos-aarch64.tar.gz`, published 2026-09-25, SHA-256 `6c8bf066a4254e8d053f864a52ea18388702d409ed9f20b3d6da66e8d772c906`, the digest that GitHub gives for the asset) into `Recomp-Framework/third_party/slang` and keeps `bin/slangc`, `lib` and the license files. The player does not install a shader compiler. No macOS build of DXC is available without the LunarG Vulkan SDK, so the build does not use DXC.
+- `Recomp-Framework/win32/nrd.mk` builds NRD with its own CMake as a static library. The NRD build downloads its NVIDIA dependencies (ShaderMake, MathLib, and sse2neon through MathLib). Options: static library, no embedded shaders (`NRD_EMBEDS_SPIRV_SHADERS=OFF`), no compiler search of ShaderMake (`SHADERMAKE_FIND_COMPILERS=OFF`), quad intrinsics off (SPIRV-Cross gives no compute derivatives to Metal), the default normal and roughness encodings. Thus the NRD build runs no shader compiler.
+- `tools/nrd_dump.cpp` (linked with NRD) writes the shader identifiers of the 24 REBLUR_DIFFUSE pipelines (14 different identifiers). `tools/nrd_msl.py` compiles each different identifier with Slang to SPIR-V, with the arguments of the NRD build and of the Slang mode of ShaderMake (`cs_6_0`, `-O3`, column-major matrices, `NRD_INTERNAL`, the macros of the identifier, register shifts s 0, b 2, u 3, t 20). SPIRV-Cross (`--msl-decoration-binding`) changes the SPIR-V to Metal Shading Language. `runtime/nrd_glue.hlsl` is compiled the same way, without register shifts. The output is `build/nrd/nrd_msl.h`, with one shader for each identifier and the shader index of each pipeline (`nrd_pipe`).
+- Slang against DXC (the SPIR-V of the earlier NRD build, made with the DXC of the LunarG Vulkan SDK 1.4.363.0 on this Mac, only for this comparison): for all 14 shaders, the Metal arguments (kinds, types, access and indices) are the same, and the SPIR-V constant buffer layouts (member offsets, matrix order, matrix strides) are the same. The Slang warnings are HLSL rules that DXC also applies: implicit conversions (float2 to int2, bool to float), undefined macros in `#if` (value 0), an identical macro definition again (`REBLUR_TYPE`) and `#pragma pack_matrix` (replaced by `-matrix-layout-column-major`).
+
+Runtime:
+
+- `d3d9_nrd.mm` creates the NRD instance, checks that each pipeline has the identifier of its shader in `nrd_msl.h`, compiles the 16 Metal kernels (14 NRD shaders and 2 glue kernels) at the first global illumination frame (in parallel, fast math off) and runs the dispatches of `nrd::GetComputeDispatches` on the compute encoder of the enhancement passes. The SPIR-V register shifts of the NRD build are the Metal indices: samplers 0 and 1, constants at buffer 2, storage textures from texture 3, textures from texture 20.
+- `nrd_glue.hlsl` (our code, with the pack and unpack functions of the unchanged `NRD.hlsli`): `nrd_pack` writes the view distance, the world normal (roughness 1), the light with the normalized hit distance, the camera motion (0 for a surface that moves with the camera, the same test as `ta_attached`) and the history confidence (0.25 on character pixels, read by NRD in the next frame). `nrd_unpack` writes the denoised light and the view distance for the composite.
+- `gi_main` writes the mean hit distance of the rays (a ray with no hit counts the ray length, 3 m) in place of the view distance.
+- Settings: the REBLUR defaults; the maximum accumulated frames from 0.5 s and the filtered frame rate (the formula of `NRDSettings.h`, 30 frames at 60 fps); hit distance parameter A = 3 m in world units; denoising range 500000 units. The history starts again after a new texture size or a frame without a known last camera.
+- `rt_enh.h` / `d3d9_metal.m`: `EnhScene` has the view and the projection of the last frame (`pview`, `pproj`), which NRD needs.
+- The statistics log of the temporal accumulation shows only the ambient occlusion.
+
+Verification:
+
+- `make app`: no new warning. The NRD CMake build shows two warnings of its ShaderMake dependency (CMake policy CMP0225 in `ExternalProject_Add`, and "jobserver unavailable" of its sub-build). They come from the NVIDIA build files and do not change the result.
+- `make nrd` with Slang (clean NRD build folder): 14 s, 24 pipelines, 14 shaders, 2 glue kernels.
+- All 14 NRD Metal shaders and the 2 glue kernels compile (216 ms in parallel at the first frame of the headless run).
+- Headless run of 60 s (the user's settings, global illumination high, 1800 x 1125, computed at 900 x 563) to frame 3000: 21 NRD dispatches per frame, at most 30 accumulated frames, no error.
+- The `install.sh` Slang step: the downloaded archive has the SHA-256 above, and its `tar` member list extracts. The build used the `slangc` 2026.18.3 of the LunarG SDK on this Mac. The downloaded `slangc` was not run here (this session does not allow it).
+- Not verified: the image on the screen, the GPU time with NRD, Metal API and shader validation with NRD, later levels, a complete `install.sh` run on a Mac without the LunarG SDK.
+
+## 2026-11-27: The app sets up the game on the first Play
+
+The app has no game code. On the first Play, it converts the player's `Engine/CoCMainWin32.exe` (the GOG release, checked by SHA-256) and keeps the result in `~/Library/Application Support/CoCDCoTE-recomp/Converted/<conversion ID>/game.bundle`. The player needs no developer tools, no Python and no download, and runs no script.
+
+- `Recomp-Framework/win32/convert/translate32.c`: the translator in C (the port of `tools/recomp_w32.py` and `tools/pe32.py`), with Capstone 5.0.7 built from source (`capstone.mk`, x86 only). `make gen` uses it.
+- `Recomp-Framework/win32/llvm.mk`: clang and lld of LLVM 23.1.6 as one binary (`llvm clang`, `llvm ld64.lld`), 91 MB after `strip -x`. The app has it in `Contents/Helpers/llvm`.
+- `Recomp-Framework/win32/runtime/convert32.c`: the conversion. It translates, compiles the 35 C files with one process for each processor (at most one for each 512 MB of half the memory, and 10 minutes for each process), links the bundle against the app binary and `gen_lib/libSystem.tbd`, moves the bundle to its place with one rename, and removes the folders of other conversion IDs. Messages go to `convert.log` in the data folder.
+- `launcher.m`: after Play, the game folder panel shows "Setting up the game for this Mac. This happens only on the first start." and a progress bar. A closed window or Quit stops the conversion (the compile processes are stopped) and then closes the window. A failure shows the reason in the window, and Play is available again.
+- `game.c`: the headless run (`RT_HEADLESS`) converts the game too, with the progress on stderr.
+- The app has no `orig.exe`. `Contents/Resources/conversion` has the conversion ID, `provided.txt`, `patches.txt`, the compile and link arguments, the headers of the translated code (13 clang headers, not the 15 MB of all clang headers) and `libSystem.tbd`.
+- `Makefile`: `MACOS_MIN = 26.0` (`LSMinimumSystemVersion`). The bundled SDL3 of Homebrew is built for macOS 27.2.
+- `ffmpeg.mk`: FFmpeg is built as dylibs (install name `@rpath/<name>`). The app has them in `Contents/Frameworks`, so the player can replace them (LGPL). The configure prefix is relative, because the libraries keep the configure arguments.
+- `win32.mk` / `make_app.py`: `Contents/Resources/licenses` has the licenses of the code in the app (Recomp-Framework, FFmpeg, LLVM, Capstone, NVIDIA NRD, ShaderMake, MathLib, sse2neon, SDL3). `make_app.py` removes the debug map from the app binary (`strip -S`), so the app has no paths of the build Mac. The global symbols stay for `-bundle_loader`.
+- `convert32.c`: the conversion runs a copy of `Contents/Helpers/llvm` in its work folder. The copy has no extended attributes, so a quarantine attribute of the download does not stop it.
+- `game.c`, `Makefile`: the app does not keep the game folder of the build (`COC_BUILD_GAME_DIR` is removed). The launcher shows the folder of the last Play, else no folder. A headless run needs the folder as the argument or in `COCDCOTE_GAME_DIR`.
+- `install.sh` is removed from the repository. The release has the built app as a zip.
+
+Verification:
+
+- The two translators write the same files (the 34 code files, `funcs.h`, `tables.c`), byte for byte, with the default options, with `--jobs 1`, and with `--abi-trim`. Time: 1.5 s in C, 6.2 s in Python.
+- Headless run with an empty data folder: the conversion took 12.5 s (M4 Pro), then the game ran to frame 3000 with no error. After a new conversion ID, the app made the new bundle and removed the folder of the old ID.
+- The largest code file (`code_0028.c`, 3.3 MB) compiles in 5.3 s with a maximum resident set size of 355 MB.
+- The app is 97 MB, 39 MB as a zip; `codesign --verify --deep --strict` passes, also after extraction of the zip.
+- No file in the zip contains the user name of the build Mac (byte search of all files).
+- Headless run with an empty data folder and a quarantine attribute on `Contents/Helpers/llvm`: the conversion completed, and the intro videos decoded with the FFmpeg dylibs of the app.
+- Not verified: the window during the conversion (no screenshots), a Mac with less memory or fewer processors, the first open of a downloaded app (Gatekeeper asks the player to approve an app with no Developer ID).

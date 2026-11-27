@@ -507,7 +507,7 @@ struct Device {
     uint32_t taa_frame;            // the last frame with anti-aliasing
     float taa_vp[16];              // the view-projection of the camera of the last anti-aliasing frame
     uint32_t enh_pframe;           // the last frame with a scene camera and scene passes (0: none)
-    float enh_pvp[16], enh_pview[16];   // the view-projection and the view of the camera of that frame
+    float enh_pvp[16], enh_pview[16], enh_pproj[16];   // the view-projection, the view and the projection of that frame
     int taa_vp_ok;                 // taa_vp holds a camera
     // upscaling (rt_enh.h aa 2 .. 4, up_redirect): the scene draws of a frame go into up_color and up_depth, which are
     // smaller than the back buffer by RT_ENH_AA_SCALES; enh_apply upscales them into the back buffer (up_out)
@@ -2877,6 +2877,8 @@ static void enh_apply(Device *d) {
     mat_mul(d->enh_sc.view, d->enh_sc.proj, svp);
     d->enh_sc.frame = f;
     d->enh_sc.have_reproj = 0;
+    memcpy(d->enh_sc.pview, d->enh_sc.view, sizeof d->enh_sc.pview);
+    memcpy(d->enh_sc.pproj, d->enh_sc.proj, sizeof d->enh_sc.pproj);
     if (have_cam && d->enh_pframe != 0 && d->enh_pframe == f - 1) {
         float iv[16];
         if (mat_inv(svp, iv)) {
@@ -2886,6 +2888,8 @@ static void enh_apply(Device *d) {
                 float a = 0.0f; for (int k = 0; k < 3; k++) a += d->enh_sc.view[k * 4 + i] * d->enh_pview[k * 4 + j];
                 d->enh_sc.rot[i * 3 + j] = a;
             }
+            memcpy(d->enh_sc.pview, d->enh_pview, sizeof d->enh_sc.pview);
+            memcpy(d->enh_sc.pproj, d->enh_pproj, sizeof d->enh_sc.pproj);
             d->enh_sc.have_reproj = 1;
         }
     }
@@ -2893,6 +2897,7 @@ static void enh_apply(Device *d) {
     if (have_cam && (ao > 0 || gi > 0)) {
         d->enh_pframe = f;
         memcpy(d->enh_pvp, svp, sizeof svp); memcpy(d->enh_pview, d->enh_sc.view, sizeof d->enh_pview);
+        memcpy(d->enh_pproj, d->enh_sc.proj, sizeof d->enh_pproj);
     } else d->enh_pframe = 0;
     if (taa) {
         // the motion of the camera from the last frame: inverse(this view-projection) x the last view-projection

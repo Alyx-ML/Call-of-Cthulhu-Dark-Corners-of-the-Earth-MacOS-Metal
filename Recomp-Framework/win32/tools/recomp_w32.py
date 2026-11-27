@@ -12,8 +12,10 @@ codegen are carried over, with the i386 differences:
   - imports are called through IAT slots: stdcall shims pop their own arguments (see win32/runtime/rt32.h);
   - x87 compares set the status word (C.fsw) for the fnstsw ax / sahf / test ah idioms of 32-bit MSVC code.
 
-usage: recomp_w32.py ORIG.exe OUTDIR [--native FILE] [--patches FILE] [--probes FILE] [--only ADDR,...]
+usage: recomp_w32.py ORIG.exe OUTDIR --provided FILE [--native FILE] [--patches FILE] [--probes FILE] [--only ADDR,...]
                                      [--no-abi-trim] [--jobs N]
+  --provided: the I_ functions (import shims) of the runtime, one name on each line; tables.c has a stub only for
+              the other imports
 """
 import os, re, sys, collections, multiprocessing as mp, struct
 sys.path.insert(0, os.path.dirname(__file__))
@@ -1322,6 +1324,7 @@ class Translator:
 
 TR = None
 NATIVE, PROBES, PATCHES = {}, {}, {}
+PROVIDED = set()   # the I_ functions of the runtime (--provided)
 
 
 def _work(chunk):
@@ -1375,6 +1378,11 @@ def main():
         for line in open(opt("--native")):
             line = line.split("#")[0].split()
             if line: NATIVE[int(line[0], 16)] = line[1]
+    if not opt("--provided"):
+        sys.exit("recomp_w32.py: --provided FILE (the I_ functions of the runtime, one name on each line) is required")
+    for line in open(opt("--provided")):
+        line = line.strip()
+        if line: PROVIDED.add(line)
     TR = Translator(path)
     TR.funcs_list = TR.funcs
     TR.funcs = set(TR.funcs)
@@ -1401,8 +1409,11 @@ def main():
     t.append('#include "cpu32.h"\n#include "tables32.h"\n#include "funcs.h"\n')
     t.append("const GFunc gfuncs[] = {\n" + "".join("  {0x%xu, F_%x},\n" % (a, a) for a in TR.funcs_list) + "};\n")
     t.append("const int ngfuncs = %d;\n" % len(TR.funcs_list))
+    # an import that the runtime does not provide gets a stub that reports it (the game bundle links against the
+    # runtime, so the runtime's I_ functions must not have a definition in the bundle)
     for n in allimp:
-        t.append('__attribute__((weak)) void I_%s(CPU *c) { unimpl_import(c, "%s"); }\n' % (imp_sym(n), n))
+        if "I_" + imp_sym(n) not in PROVIDED:
+            t.append('void I_%s(CPU *c) { unimpl_import(c, "%s"); }\n' % (imp_sym(n), n))
     t.append("const GImport gimports[] = {\n" + "".join('  {0x%xu, "%s", I_%s},\n' % (a, n, imp_sym(n)) for a, n in sorted(pe.iat.items())) + "};\n")
     t.append("const int ngimports = %d;\n" % len(pe.iat))
     t.append("const GSection gsections[] = {\n" + "".join('  {"%s", 0x%xu, 0x%x, 0x%x, 0x%x, 0x%x},\n' % s for s in pe.sections) + "};\n")

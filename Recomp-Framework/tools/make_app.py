@@ -3,7 +3,8 @@
 
 usage: make_app.py BINARY GAME_EXE OUT.app [--name NAME] [--display-name NAME] [--short-name NAME] [--bundle-id ID]
                    [--category UTI] [--version V]
-                   [--resource FILE[=NAME]]... [--lib DYLIB]... [--icon IMAGE] [--no-vulkan]
+                   [--resource FILE[=NAME]]... [--lib DYLIB]... [--helper EXE]... [--icon IMAGE] [--no-vulkan]
+                   [--min-macos V]
   BINARY    the linked runtime + recompiled game (build/boot)
   GAME_EXE  the original Windows executable, used only for its icon
   --name    executable name (default: OUT.app's name)
@@ -13,6 +14,8 @@ usage: make_app.py BINARY GAME_EXE OUT.app [--name NAME] [--display-name NAME] [
                   (default: --display-name)
   --resource  copy FILE into Contents/Resources (as NAME), e.g. the image named by rt_game.image
   --lib       copy DYLIB into Contents/Frameworks (signed), e.g. a d3d9 backend the runtime dlopens
+  --helper    copy the executable EXE into Contents/Helpers (signed), e.g. a tool the app runs
+  --min-macos the oldest macOS version that the app runs on (LSMinimumSystemVersion, default 26.0)
   --icon      the app icon from IMAGE (any format sips reads; center-cropped to a square) instead of the exe's,
               for games whose exe icon is tiny
   --no-vulkan an OpenGL game: no Vulkan driver in the bundle
@@ -37,6 +40,10 @@ while "--resource" in args:
 libs = []
 while "--lib" in args:
     libs.append(opt("--lib", None))
+helpers = []
+while "--helper" in args:
+    helpers.append(opt("--helper", None))
+min_macos = opt("--min-macos", "26.0")
 icon_image = opt("--icon", None)
 if icon_image is not None and not os.path.isfile(icon_image):
     sys.exit("make_app.py: the icon image %s does not exist" % icon_image)
@@ -55,6 +62,9 @@ if os.path.exists(app):
 os.makedirs(macos); os.makedirs(res)
 
 shutil.copy2(binary, os.path.join(macos, app_name))
+# the debug map (the paths of the source and object files of the build Mac) stays in the build binary only; the
+# app binary keeps its global symbols (the game bundle links against them, -bundle_loader). Signed below.
+subprocess.run(["strip", "-S", os.path.join(macos, app_name)], check=True)
 
 # the KosmicKrisp Vulkan driver built from Mesa source (make kosmickrisp): driver, ICD json, loader, driconf XML
 # code goes in Frameworks/kosmickrisp, data (ICD json, drirc.d, VERSION) in Resources/kosmickrisp (codesign
@@ -62,10 +72,15 @@ shutil.copy2(binary, os.path.join(macos, app_name))
 kk = os.path.join(os.path.dirname(binary), "kosmickrisp")
 for r in resources:
     src, _, name = r.partition("=")
-    shutil.copy2(src, os.path.join(res, name or os.path.basename(src)))
+    dst = os.path.join(res, name or os.path.basename(src))   # NAME can have folders (made in Resources)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copy2(src, dst)
 for lib in libs:
     os.makedirs(os.path.join(contents, "Frameworks"), exist_ok=True)
     shutil.copy2(lib, os.path.join(contents, "Frameworks", os.path.basename(lib)))
+for h in helpers:
+    os.makedirs(os.path.join(contents, "Helpers"), exist_ok=True)
+    shutil.copy2(h, os.path.join(contents, "Helpers", os.path.basename(h)))
 if no_vulkan:
     pass
 elif os.path.isdir(kk):
@@ -94,7 +109,7 @@ with open(os.path.join(contents, "Info.plist"), "wb") as f:
         "CFBundlePackageType": "APPL",
         "CFBundleShortVersionString": version,
         "CFBundleVersion": "1",
-        "LSMinimumSystemVersion": "26.0",
+        "LSMinimumSystemVersion": min_macos,
         "LSApplicationCategoryType": category,
         "NSHighResolutionCapable": True,
         # online services of older games often use plain http://
@@ -127,6 +142,8 @@ with tempfile.TemporaryDirectory() as tmp:
 # ad-hoc signatures: the bundled dylibs first, then the whole bundle (arm64 code must be signed to run)
 for lib in libs:
     subprocess.run(["codesign", "--force", "--sign", "-", os.path.join(contents, "Frameworks", os.path.basename(lib))], check=True, capture_output=True)
+for h in helpers:
+    subprocess.run(["codesign", "--force", "--sign", "-", os.path.join(contents, "Helpers", os.path.basename(h))], check=True, capture_output=True)
 fw = os.path.join(contents, "Frameworks", "kosmickrisp")
 if os.path.isdir(fw):
     for f in sorted(os.listdir(fw)):

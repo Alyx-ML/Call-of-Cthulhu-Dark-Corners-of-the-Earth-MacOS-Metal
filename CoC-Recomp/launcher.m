@@ -139,6 +139,12 @@ static int32_t *setting_field(RtEnh *e, size_t off)
 @property(nonatomic) NSTextField *status;
 @property(nonatomic) NSTextField *banner;
 @property(nonatomic) NSButton *play;
+@property(nonatomic) NSButton *chooseButton;
+@property(nonatomic) NSButton *restoreButton;
+@property(nonatomic) NSProgressIndicator *progress;
+@property(nonatomic) BOOL preparing;
+@property(nonatomic) BOOL showingProgress;
+@property(nonatomic) BOOL closeWhenPrepared;
 @property(nonatomic) NSMutableDictionary<NSNumber *, NSPopUpButton *> *popups;   // key: the offset of the setting
 @property(nonatomic) NSImageView *icon;
 @property(nonatomic) BOOL finished;
@@ -151,6 +157,8 @@ static int32_t *setting_field(RtEnh *e, size_t off)
     char dir[LAUNCHER_PATH_LEN];
     bool dirOK;
     coc_launcher_check_fn check;
+    coc_launcher_prepare_fn prepare;
+    atomic_int cancel;               // set when the window closes during the preparation
     char iconDir[LAUNCHER_PATH_LEN]; // the folder of the shown icon, or ""
     RtEnh values;                    // the settings of the file; the window changes the ones it shows
 }
@@ -272,6 +280,15 @@ static NSView *panel(NSStackView *content, CGFloat width)
 {
     NSButton *choose = [NSButton buttonWithTitle:@"Choose Folder…" target:self action:@selector(choose:)];
     NSStackView *statusRow, *stack;
+    self.chooseButton = choose;
+    // the progress of the preparation of the game (shown during the first Play)
+    self.progress = [NSProgressIndicator new];
+    self.progress.style = NSProgressIndicatorStyleBar;
+    self.progress.indeterminate = NO;
+    self.progress.minValue = 0;
+    self.progress.maxValue = 100;
+    self.progress.accessibilityLabel = @"Setup progress";
+    self.progress.hidden = YES;
     self.path = text_label(@"", [NSFont systemFontOfSize:12], C_TEXT);
     self.path.lineBreakMode = NSLineBreakByTruncatingMiddle;
     self.path.selectable = YES;
@@ -287,13 +304,15 @@ static NSView *panel(NSStackView *content, CGFloat width)
     statusRow = [NSStackView stackViewWithViews:@[ self.statusIcon, self.status ]];
     statusRow.alignment = NSLayoutAttributeTop;
     statusRow.spacing = 8;
-    stack = [NSStackView stackViewWithViews:@[ group_title(@"Game folder"), self.path, statusRow, choose ]];
+    stack = [NSStackView stackViewWithViews:@[ group_title(@"Game folder"), self.path, statusRow, self.progress, choose ]];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.alignment = NSLayoutAttributeLeading;
     stack.spacing = 10;
     [stack setCustomSpacing:14 afterView:statusRow];
     [self.path.widthAnchor constraintEqualToAnchor:stack.widthAnchor].active = YES;
     [statusRow.widthAnchor constraintEqualToAnchor:stack.widthAnchor].active = YES;
+    [self.progress.widthAnchor constraintEqualToAnchor:stack.widthAnchor].active = YES;
+    [stack setCustomSpacing:14 afterView:self.progress];
     return stack;
 }
 
@@ -420,6 +439,7 @@ static NSView *panel(NSStackView *content, CGFloat width)
     [self.play.widthAnchor constraintGreaterThanOrEqualToConstant:120].active = YES;
 
     restore = [NSButton buttonWithTitle:@"Restore Defaults" target:self action:@selector(restore:)];
+    self.restoreButton = restore;
     restore.controlSize = NSControlSizeLarge;
     versionNote = text_label(@"The game uses these settings when it starts. You can also change them in the game, in "
                              @"Options > Enhancements.",
@@ -591,18 +611,119 @@ static NSView *panel(NSStackView *content, CGFloat width)
         return;
     }
     values = chosen;
-    [self finishWithPlay:YES];
+    [self startPreparing];
+}
+
+// The controls that change the folder or the settings, and Play: off during the preparation.
+- (void)setControlsEnabled:(BOOL)on
+{
+    self.play.enabled = on && dirOK;
+    self.chooseButton.enabled = on;
+    self.restoreButton.enabled = on;
+    for (NSNumber *off in self.popups) self.popups[off].enabled = on;
+}
+
+static void prepare_progress(void *ctx, double done)
+{
+    CoCLauncher *l = (__bridge CoCLauncher *)ctx;
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [l showProgress:done];
+    });
+}
+
+// The preparation of the game (prepare) on another thread; the window waits for it.
+- (void)startPreparing
+{
+    char *folder;
+    if (prepare == NULL)
+    {
+        [self finishWithPlay:YES];
+        return;
+    }
+    self.preparing = YES;
+    atomic_store(&cancel, 0);
+    [self setControlsEnabled:NO];
+    folder = strdup(dir);
+    if (folder == NULL) launcher_fail(@"The game cannot start.", @"Out of memory.");
+    coc_launcher_prepare_fn fn = prepare;
+    atomic_int *stop = &cancel;
+    void *ctx = (__bridge void *)self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+      char why[1400];
+      int ok = fn(folder, prepare_progress, ctx, stop, why, sizeof why);
+      free(folder);
+      NSString *problem = ok ? nil : nsstr(why);
+      dispatch_async(dispatch_get_main_queue(), ^{
+        [self prepared:ok problem:problem];
+      });
+    });
+}
+
+- (void)showProgress:(double)done
+{
+    if (!self.preparing || self.closeWhenPrepared) return;
+    if (!self.showingProgress)
+    {
+        NSImage *img = [NSImage imageWithSystemSymbolName:@"gearshape.fill" accessibilityDescription:@"Setting up"];
+        if (img == nil) launcher_fail(@"A symbol of macOS is missing.", @"The status symbol cannot be loaded.");
+        self.showingProgress = YES;
+        self.statusIcon.image = img;
+        self.statusIcon.contentTintColor = rgb(C_BRASS);
+        self.status.stringValue = @"Setting up the game for this Mac. This happens only on the first start.";
+        self.status.textColor = rgb(C_TEXT);
+        self.progress.hidden = NO;
+    }
+    self.progress.doubleValue = done < 0 ? 0 : done > 1 ? 100 : done * 100;
+}
+
+- (void)prepared:(int)ok problem:(NSString *)problem
+{
+    self.preparing = NO;
+    self.showingProgress = NO;
+    if (self.closeWhenPrepared)
+    {
+        [self finishWithPlay:NO];
+        return;
+    }
+    if (ok)
+    {
+        self.progress.doubleValue = 100;
+        [self finishWithPlay:YES];
+        return;
+    }
+    self.progress.hidden = YES;
+    [self setControlsEnabled:YES];
+    [self showFolder];
+    [self showProblem:[@"The game could not be set up for this Mac: " stringByAppendingString:problem]];
+}
+
+// Quit or a closed window during the preparation: the preparation stops first, then the window closes.
+- (void)closeAfterPreparing
+{
+    self.closeWhenPrepared = YES;
+    atomic_store(&cancel, 1);
+    self.status.stringValue = @"Stopping…";
 }
 
 - (IBAction)quit:(id)sender
 {
     (void)sender;
+    if (self.preparing)
+    {
+        [self closeAfterPreparing];
+        return;
+    }
     [self finishWithPlay:NO];
 }
 
 - (BOOL)windowShouldClose:(NSWindow *)sender
 {
     (void)sender;
+    if (self.preparing)
+    {
+        [self closeAfterPreparing];
+        return NO;
+    }
     [self finishWithPlay:NO];
     return YES;
 }
@@ -631,7 +752,7 @@ static bool copy_standard(char *out, size_t n, NSString *path)
     return true;
 }
 
-int coc_launcher_run(const char *initial, coc_launcher_check_fn check, char *out, size_t n)
+int coc_launcher_run(const char *initial, coc_launcher_check_fn check, coc_launcher_prepare_fn prepare, char *out, size_t n)
 {
     CoCLauncher *l;
     NSString *remembered;
@@ -649,6 +770,7 @@ int coc_launcher_run(const char *initial, coc_launcher_check_fn check, char *out
         [NSApp finishLaunching];
         l = [CoCLauncher new];
         l->check = check;
+        l->prepare = prepare;
         l->dir[0] = 0;
         l->iconDir[0] = 0;
         // The folder that the window shows first: the folder of the last Play, else initial. When the folder of the last

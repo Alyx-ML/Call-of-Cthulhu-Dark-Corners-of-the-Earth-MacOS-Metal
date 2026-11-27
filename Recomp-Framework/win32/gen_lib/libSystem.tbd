@@ -1,0 +1,20 @@
+--- !tapi-tbd
+# The libSystem of the game bundle link (win32.mk game.bundle) when the app links the translated game code on the
+# player's Mac, without the macOS SDK. It lists the libSystem functions that the translated code can call: the
+# functions of gen_include (math.h, string.h) and the functions that clang adds itself (bzero, memset_pattern, bcmp,
+# sincos, the stack protector, ___chkstk_darwin). Each one is an export of a library that libSystem re-exports
+# (libsystem_m, libsystem_c, libsystem_platform, libcompiler_rt, libdyld). The link stops with an error when the code
+# calls another function. The file must start with the line "--- !tapi-tbd": lld identifies the file type by it.
+tbd-version:     4
+targets:         [ arm64-macos ]
+install-name:    '/usr/lib/libSystem.B.dylib'
+current-version: 1351
+exports:
+  - targets:         [ arm64-macos ]
+    symbols:         [ ___bzero, ___chkstk_darwin, ___sincos_stret, ___sincosf_stret, ___stack_chk_fail,
+                       ___stack_chk_guard, _acos, _asin, _atan, _atan2, _bcmp, _bzero, _ceil, _copysign, _cos,
+                       _exp, _exp2, _fabs, _fabsf, _floor, _fmod, _frexp, _ldexp, _log, _log10, _log2, _memcmp,
+                       _memcpy, _memmove, _memset, _memset_pattern16, _memset_pattern4, _memset_pattern8,
+                       _nearbyint, _pow, _remainder, _rint, _round, _sin, _sqrt, _sqrtf, _strlen, _tan, _trunc,
+                       dyld_stub_binder ]
+...

@@ -5,15 +5,17 @@
 //
 // The game folder (the one that contains Engine/CoCMainWin32.exe) comes from, in order: the second argument
 // (`app <exe> <game folder>`), COCDCOTE_GAME_DIR, or the launcher window (launcher.m), which shows first the folder of
-// the last Play, else the folder the project was built from (COC_BUILD_GAME_DIR). With RT_HEADLESS (no window), the
-// launcher does not open, and the folder is the one the project was built from.
+// the last Play. With RT_HEADLESS (no window), the launcher does not open: the folder must come from the argument or
+// COCDCOTE_GAME_DIR.
 #include "rt32.h"
+#include "convert32.h"
 #include "launcher.h"
 #include <CommonCrypto/CommonDigest.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <mach-o/dyld.h>
 #include <libgen.h>
+#include <limits.h>
+#include <mach-o/dyld.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -77,17 +79,83 @@ static int game_problem(const char *dir, char *why, size_t n) {
     return 1;
 }
 
-// the executable image the runtime loads (rt_game.image): the app's Resources, next to the binary, one folder up
-static int find_image(char *out, size_t n) {
-    char exe[1024]; uint32_t len = sizeof exe;
-    if (_NSGetExecutablePath(exe, &len) != 0) return 0;
-    char dir[1024]; snprintf(dir, sizeof dir, "%s", dirname(exe));
-    const char *rel[] = {"/../Resources/", "/", "/../"};
-    for (int i = 0; i < 3; i++) {
-        snprintf(out, n, "%s%s%s", dir, rel[i], rt_game.image);
-        if (access(out, R_OK) == 0) return 1;
+// the app binary (loader) and the Contents folder of the app; 0 on an error, and why has the reason
+static int app_paths(char loader[PATH_MAX], char contents[PATH_MAX], char *why, size_t n) {
+    char exe[PATH_MAX], macos[PATH_MAX];
+    uint32_t len = sizeof exe;
+    if (_NSGetExecutablePath(exe, &len) != 0) { snprintf(why, n, "the path of the app is too long"); return 0; }
+    if (!realpath(exe, loader)) { snprintf(why, n, "%s: %s", exe, strerror(errno)); return 0; }
+    if (!dirname_r(loader, macos) || !dirname_r(macos, contents)) { snprintf(why, n, "%s: %s", loader, strerror(errno)); return 0; }
+    return 1;
+}
+
+// the conversion ID of the app (Contents/Resources/conversion/id, win32.mk conv_id): 16 hex digits; 0 on an error,
+// and why has the reason
+static int conv_id(char id[17], char *why, size_t n) {
+    char loader[PATH_MAX], contents[PATH_MAX], path[PATH_MAX + 64];
+    if (!app_paths(loader, contents, why, n)) return 0;
+    int r = snprintf(path, sizeof path, "%s/Resources/conversion/id", contents);
+    if (r <= 0 || (size_t)r >= sizeof path) { snprintf(why, n, "the path of the app is too long"); return 0; }
+    FILE *f = fopen(path, "r");
+    if (!f) { snprintf(why, n, "%s: %s", path, strerror(errno)); return 0; }
+    char line[64] = {0};
+    int ok = fgets(line, sizeof line, f) != NULL;
+    fclose(f);
+    line[strcspn(line, "\r\n")] = 0;
+    if (!ok || strlen(line) != 16 || strspn(line, "0123456789abcdef") != 16) { snprintf(why, n, "%s is not a conversion ID", path); return 0; }
+    memcpy(id, line, 17);
+    return 1;
+}
+
+// the bundle of the converted game code: <data folder>/Converted/<conversion ID>/game.bundle
+static int bundle_path(const char *id, char *out, size_t n) {
+    int r = snprintf(out, n, "%s/Converted/%s/game.bundle", rt_data_dir, id);
+    return r > 0 && (size_t)r < n;
+}
+
+// The game code for this Mac: when the bundle of this conversion ID is missing, the app makes it from the player's
+// executable (convert32.h). 1 when the bundle is there; else 0, and why has the reason.
+static int ensure_game_code(const char *exe, void (*progress)(void *ctx, double done), void *ctx, atomic_int *cancel,
+                            char *why, size_t n) {
+    char id[17], bundle[2048], loader[PATH_MAX], contents[PATH_MAX], conv[PATH_MAX + 64], llvm[PATH_MAX + 64], logp[1100];
+    if (!conv_id(id, why, n)) return 0;
+    if (!bundle_path(id, bundle, sizeof bundle)) { snprintf(why, n, "the data folder path is too long"); return 0; }
+    if (access(bundle, R_OK) == 0) return 1;
+    if (!app_paths(loader, contents, why, n)) return 0;
+    snprintf(conv, sizeof conv, "%s/Resources/conversion", contents);
+    snprintf(llvm, sizeof llvm, "%s/Helpers/llvm", contents);
+    int r = snprintf(logp, sizeof logp, "%s/convert.log", rt_data_dir);
+    FILE *log = r > 0 && (size_t)r < sizeof logp ? fopen(logp, "w") : NULL;   // the messages, for a report of a problem
+    W32Convert c = {0};
+    c.exe = exe;
+    c.conv_dir = conv;
+    c.llvm = llvm;
+    c.loader = loader;
+    c.out = bundle;
+    c.cancel = cancel;
+    c.progress = progress;
+    c.progress_ctx = ctx;
+    c.log = log;
+    if (progress) progress(ctx, 0);
+    int ok = w32_convert(&c, why, n);
+    if (log) {
+        if (!ok) fprintf(log, "convert: %s\n", why);
+        fclose(log);
     }
-    return 0;
+    return ok;
+}
+
+// the preparation of the launcher window (launcher.h): the game code for the executable of the chosen folder
+static int prepare_game(const char *dir, void (*progress)(void *ctx, double done), void *ctx, atomic_int *cancel, char *why, size_t n) {
+    char exe[2048];
+    int r = snprintf(exe, sizeof exe, "%s/Engine/%s", dir, rt_game.exe);
+    if (r <= 0 || (size_t)r >= sizeof exe) { snprintf(why, n, "the game folder path is too long"); return 0; }
+    return ensure_game_code(exe, progress, ctx, cancel, why, n);
+}
+
+static void print_progress(void *ctx, double done) {
+    int *last = ctx, pct = (int)(done * 100);
+    if (pct / 10 != *last / 10 || pct == 100) { fprintf(stderr, "setting up the game for this Mac: %d%%\n", pct); *last = pct; }
 }
 
 int main(int argc, char **argv) {
@@ -98,7 +166,6 @@ int main(int argc, char **argv) {
     rt_game.exe = "CoCMainWin32.exe";
     rt_game.win_dir = "C:\\Games\\CoCDCoTE\\Engine";
     rt_game.docs_dir = "C:\\Users\\Player\\Documents";
-    rt_game.image = "orig.exe";
     rt_game.steam_app_id = 0;
 
     // saves, settings and the registry: ~/Library/Application Support/CoCDCoTE-recomp (the launcher window writes the
@@ -110,11 +177,6 @@ int main(int argc, char **argv) {
 
     // the game folder
     const char *game = NULL;
-#ifdef COC_BUILD_GAME_DIR
-    const char *built = COC_BUILD_GAME_DIR;
-#else
-    const char *built = NULL;
-#endif
     static char chosen[1024];
     if (argc >= 3 && is_game_dir(argv[2])) game = argv[2];
     else if (argc >= 3) { fprintf(stderr, "%s is not the game folder: it has no Engine/CoCMainWin32.exe\n", argv[2]); return 1; }
@@ -123,10 +185,9 @@ int main(int argc, char **argv) {
         if (!is_game_dir(game)) { fprintf(stderr, "COCDCOTE_GAME_DIR=%s has no Engine/CoCMainWin32.exe\n", game); return 1; }
     }
     else if (!rt_headless) {
-        if (!coc_launcher_run(built, game_problem, chosen, sizeof chosen)) return 0;   // the window was closed
+        if (!coc_launcher_run(NULL, game_problem, prepare_game, chosen, sizeof chosen)) return 0;   // the window was closed
         game = chosen;
     }
-    else if (built && is_game_dir(built)) game = built;
     if (!game) {
         fprintf(stderr, "The game folder was not found. Start the app with the folder that contains Engine/CoCMainWin32.exe:\n"
                         "  \"Call of Cthulhu DCoTE.app/Contents/MacOS/CoCDCoTE\" CoCMainWin32.exe <game folder>\n"
@@ -138,15 +199,27 @@ int main(int argc, char **argv) {
     snprintf(rt_game_dir, sizeof rt_game_dir, "%s/Engine", root);
     if (chdir(rt_game_dir) != 0) { fprintf(stderr, "can't enter %s: %s\n", rt_game_dir, strerror(errno)); return 1; }
 
-    // the supported executable only
+    // the supported executable only: the runtime loads it from the game folder
     char image[2048], hex[65];
-    if (!find_image(image, sizeof image)) { fprintf(stderr, "the game image %s is missing from the app (rebuild it with make app)\n", rt_game.image); return 1; }
+    int r = snprintf(image, sizeof image, "%s/%s", rt_game_dir, rt_game.exe);
+    if (r <= 0 || (size_t)r >= sizeof image) { fprintf(stderr, "the game folder path is too long\n"); return 1; }
     if (!sha256_file(image, hex)) { fprintf(stderr, "can't read %s: %s\n", image, strerror(errno)); return 1; }
     if (strcmp(hex, EXE_SHA256) != 0) {
         fprintf(stderr, "Unsupported CoCMainWin32.exe (SHA-256 %s). This build supports only the GOG release "
                         "(SHA-256 " EXE_SHA256 ").\n", hex);
         return 1;
     }
+
+    // the converted game code (the launcher window made it after Play; else it is made here)
+    char id[17], bundle[2048], why[1400];
+    int last = -10;
+    if (!ensure_game_code(image, print_progress, &last, NULL, why, sizeof why)) {
+        fprintf(stderr, "The game could not be set up for this Mac: %s\n", why);
+        return 1;
+    }
+    if (!conv_id(id, why, sizeof why)) { fprintf(stderr, "can't read the conversion ID: %s\n", why); return 1; }
+    if (!bundle_path(id, bundle, sizeof bundle)) { fprintf(stderr, "the data folder path is too long\n"); return 1; }
+    if (!rt_load_game(bundle, why, sizeof why)) { fprintf(stderr, "can't load the game code %s: %s\n", bundle, why); return 1; }
 
     snprintf(rt_cmdline, sizeof rt_cmdline, "\"%s\\%s\"", rt_game.win_dir, rt_game.exe);
 

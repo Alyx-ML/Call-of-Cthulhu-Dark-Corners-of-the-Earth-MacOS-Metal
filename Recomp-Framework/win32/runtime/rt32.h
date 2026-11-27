@@ -88,6 +88,10 @@ typedef struct {
 } RtGame32;
 extern RtGame32 rt_game;
 
+// the game code: opens the bundle of the translated game code (tables32.h) and reads its tables. Call it before
+// rt_init. 1 on success; else 0, and why has the reason.
+int rt_load_game(const char *path, char *why, size_t n);
+
 // paths: Windows path in the game -> host path (backslashes, drive letters, the save folder)
 const char *rt_host_path(const char *win, char *out, size_t n);
 extern char rt_game_dir[1024], rt_data_dir[1024], rt_exe_dir[1024];

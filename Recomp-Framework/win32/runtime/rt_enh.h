@@ -129,12 +129,14 @@ void d3d9_enh_shadow_target(uint32_t w, uint32_t h, uint32_t fmt, uint32_t scale
 // of the contact shadows (homogeneous world position, w = 1, or the world direction to the light, w = 0).
 // reproj: inverse(this frame's view-projection) x the last frame's view-projection (row vectors); rot: the rotation
 // (3 x 3, row vectors) from this frame's view space to the last frame's view space; have_reproj: reproj and rot hold the
-// camera of the last frame (frame - 1); frame: the number of this frame.
+// camera of the last frame (frame - 1); pview, pproj: the view and the projection of the last frame (view and proj
+// when have_reproj is 0); frame: the number of this frame.
 typedef struct EnhScene {
     float view[16], proj[16];
     int have_light;
     float light[4];
     float reproj[16], rot[9];
+    float pview[16], pproj[16];
     int have_reproj;
     uint32_t frame;
 } EnhScene;

@@ -4,65 +4,43 @@ This project makes a native macOS app of *Call of Cthulhu: Dark Corners of the E
 
 - The app runs natively on Apple silicon. It does not use Rosetta, Wine or a Vulkan translation layer.
 - Direct3D 9 goes directly to Metal.
-- The installer translates the game code of your copy on your Mac (static recompilation).
+- On the first Play, the app translates the game code of your copy on your Mac (static recompilation). This takes approximately 15 seconds and happens only one time.
 
-This repository contains no game files and no game code. You must own the game. The installer supports only the GOG release.
+This repository and the app contain no game files and no game code. You must own the game. The app supports only the GOG release.
 
 ## Requirements
 
 - A Mac with Apple silicon (M1 or later).
-- macOS 26 or later. The app does not open on an earlier version.
-- The Xcode Command Line Tools. The installer opens the install window if they are not installed.
-- Homebrew (https://brew.sh). The installer uses Homebrew to install SDL3 for game controllers.
-- An internet connection during the install. The installer downloads the FFmpeg source and two Python packages (`capstone`, `lief`).
-- Approximately 1 GB of free disk space for the build.
+- macOS 26 or later.
+- Approximately 400 MB of free disk space: 100 MB for the app, 15 MB for the converted game code, and the temporary files of the first-start setup.
 - The game folder of the GOG release, with these contents:
   - The `Engine` folder with `CoCMainWin32.exe`.
   - The other game folders from the GOG install (for example `Scripts`, `Resources`, `MainMenu`).
-  - The file `goggame-1189711155.ico` of the GOG install. The installer makes the app icon from it.
 
-The installer checks the SHA-256 of `Engine/CoCMainWin32.exe`. The supported value is:
+The app checks the SHA-256 of `Engine/CoCMainWin32.exe`. The supported value is:
 
 ```
 f562e71e050565775f3bcf0ddbcec07fdac0deda4491ef98c956437ab61b13fe
 ```
 
-The installer stops if the file has a different value.
+The app does not use a file with a different value.
 
 ### How to get the game folder on a Mac
 
 - Copy the game folder from a Windows computer with the GOG release installed.
-- Or extract the GOG offline installer (`setup_call_of_cthulhu_*.exe`) with `innoextract` (`brew install innoextract`).
+- Or extract the GOG offline installer (`setup_call_of_cthulhu_*.exe`) with `innoextract`.
 
 ## Install
 
-1. Download this repository. Use **Code > Download ZIP** or the source archive of the latest release, or use `git clone`.
-2. Open **Terminal**.
-3. Type `cd` and a space. Drag the repository folder into the Terminal window. Push Return.
-4. Start the installer:
+1. Download `Call of Cthulhu DCoTE.zip` from the latest release on the **Releases** page of this repository.
+2. Open the zip. Move **Call of Cthulhu DCoTE** to the Applications folder.
+3. Open **Call of Cthulhu DCoTE**. If macOS does not open it, go to **System Settings > Privacy & Security** and click **Open Anyway**. You do this only one time.
+4. In the launcher window, click **Choose Folder…** and select the game folder (the folder that contains the `Engine` folder).
+5. Click **Play**.
 
-   ```bash
-   bash install.sh
-   ```
+On the first Play, the launcher window shows "Setting up the game for this Mac" and a progress bar. Then the game starts. Later starts go directly to the game.
 
-5. When the installer asks for the game folder, drag the game folder into the Terminal window. Then push Return.
-6. Wait until the installer shows `Done`. On the test Mac, the build took less than 1 minute. A slower Mac takes more time.
-7. Open **Call of Cthulhu DCoTE** in the Applications folder. The launcher window opens.
-8. Click **Play**.
-
-You can also give the game folder directly:
-
-```bash
-bash install.sh "/path/to/Call of Cthulhu - DCotE"
-```
-
-To install the app in a different folder, use `--dest`:
-
-```bash
-bash install.sh --dest ~/Applications "/path/to/Call of Cthulhu - DCotE"
-```
-
-The app reads the game data from the game folder. Do not delete the game folder after the install. If you move the game folder, select the new folder in the launcher window with **Choose Folder…**.
+The app reads the game data from the game folder. Do not delete the game folder. If you move the game folder, select the new folder in the launcher window with **Choose Folder…**.
 
 ## Saved games and settings
 
@@ -72,7 +50,7 @@ The app keeps saved games, game options and the enhancement settings in this fol
 ~/Library/Application Support/CoCDCoTE-recomp
 ```
 
-The installer does not change this folder.
+The converted game code is in the `Converted` folder in this folder. The app makes it again if you delete it.
 
 ## Launcher window
 
@@ -85,7 +63,7 @@ The launcher window opens each time you open the app. In the launcher window, yo
 
 To quit without playing, close the window.
 
-The launcher window remembers the game folder of the last **Play**. If that folder cannot be used, the window shows the game folder that the installer used.
+The launcher window remembers the game folder of the last **Play**.
 
 ## Enhancements
 
@@ -159,7 +137,7 @@ macOS does not give the brightness of the screen in nits. The app takes the peak
 ## Troubleshooting
 
 - **"is not the supported version":** the `CoCMainWin32.exe` in your game folder is not the GOG release. Only the GOG release is supported.
-- **"Homebrew was not found":** install Homebrew from https://brew.sh. Then start the installer again.
+- **"The game could not be set up for this Mac":** the launcher window shows the reason. The file `convert.log` in `~/Library/Application Support/CoCDCoTE-recomp` has the messages of the setup. Click **Play** to try again.
 - **The look direction is inverted:** the game has its own setting. Go to **Options > Controls > Advanced** and change the invert setting.
 - **The launcher window shows a problem with the game folder:** the game folder moved, or the selected folder is not the game folder. Click **Choose Folder…** and select the game folder (the folder that contains the `Engine` folder).
 
@@ -167,15 +145,18 @@ macOS does not give the brightness of the screen in nits. The app takes the peak
 
 | Folder or file | Contents |
 |---|---|
-| `install.sh` | The installer. It checks the game, installs the build tools, builds the app and installs it. |
 | `CoC-Recomp/` | The game project: start code, the launcher window, the Enhancements menu, the game controller input and the instruction patches. `STATUS.md` records the work and the verification. |
 | `Recomp-Framework/` | The recompiler and the Windows runtime for macOS (Win32, Direct3D 9 to Metal, audio, video). The license is MIT (`Recomp-Framework/LICENSE`). |
 
-The build output (`CoC-Recomp/gen`, `CoC-Recomp/build`) contains the translated game code. Do not share it or the built app.
+The app in the release has no game code. A developer build (`CoC-Recomp/gen`, `CoC-Recomp/build`) contains the translated game code. Do not share it.
 
 ## Credits
 
 - Recomp-Framework: NightSightProductions (MIT license).
-- FFmpeg (LGPL): https://ffmpeg.org. The installer downloads and builds it on your Mac.
+- FFmpeg (LGPL 2.1): https://ffmpeg.org. The app has the FFmpeg libraries as separate dylibs in `Contents/Frameworks`.
+- LLVM (Apache 2.0 with LLVM exception): https://llvm.org. The app uses clang and lld to set up the game on your Mac.
+- Capstone (BSD): https://www.capstone-engine.org.
+- NVIDIA Real-time Denoisers (NRD): https://github.com/NVIDIA-RTX/NRD.
 - SDL3 (zlib license): https://libsdl.org.
+- The license texts are in the app, in `Contents/Resources/licenses`.
 - *Call of Cthulhu: Dark Corners of the Earth* is the property of its rights holders. This project is not affiliated with them.

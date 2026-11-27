@@ -489,6 +489,39 @@ static void process_init(void) {
 char rt_game_dir[1024], rt_data_dir[1024], rt_exe_dir[1024];
 int rt_game_main(int argc, char **argv);   // game.c: settings, then rt_run
 
+// ---------------- the game bundle (the translated game code, tables32.h) ----------------
+RtGameTables rt_gt;
+
+int rt_load_game(const char *path, char *why, size_t n) {
+    if (rt_gt.funcs) { snprintf(why, n, "the game code is already loaded"); return 0; }
+    void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!h) { snprintf(why, n, "%s", dlerror()); return 0; }
+    struct { const char *name; void **p; } sym[] = {
+        {"gfuncs", NULL}, {"ngfuncs", NULL}, {"gimports", NULL}, {"ngimports", NULL}, {"gsections", NULL},
+        {"ngsections", NULL}, {"gimage_base", NULL}, {"gimage_size", NULL}, {"gentry", NULL},
+    };
+    void *v[sizeof sym / sizeof sym[0]];
+    for (size_t i = 0; i < sizeof sym / sizeof sym[0]; i++) {
+        v[i] = dlsym(h, sym[i].name);
+        if (!v[i]) { snprintf(why, n, "the game code has no symbol %s", sym[i].name); dlclose(h); return 0; }
+    }
+    RtGameTables t = {
+        .funcs = v[0], .nfuncs = *(const int *)v[1], .imports = v[2], .nimports = *(const int *)v[3],
+        .sections = v[4], .nsections = *(const int *)v[5], .image_base = *(const uint32_t *)v[6],
+        .image_size = *(const uint32_t *)v[7], .entry = *(const uint32_t *)v[8],
+    };
+    if (t.nfuncs <= 0 || t.nimports < 0 || t.nsections <= 0 || !t.image_size ||
+        (uint64_t)t.image_base + t.image_size > 0x100000000ull) {
+        snprintf(why, n, "the game code has invalid tables (%d functions, %d imports, %d sections, image 0x%x + 0x%x)",
+                 t.nfuncs, t.nimports, t.nsections, t.image_base, t.image_size);
+        dlclose(h);
+        return 0;
+    }
+    rt_gt = t;   // the bundle stays open for the life of the process
+    if (rt_verbose) rt_log("[rt] game code %s: %d functions, %d imports, %d sections", path, t.nfuncs, t.nimports, t.nsections);
+    return 1;
+}
+
 #include <mach-o/dyld.h>
 #include <libgen.h>
 void rt_init(const char *image_path) {

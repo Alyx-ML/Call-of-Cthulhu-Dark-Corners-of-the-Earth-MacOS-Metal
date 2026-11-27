@@ -1,6 +1,6 @@
 # Never commit game files, translated game code or build output.
-# The translated code is the game's code: each player makes it from their own copy with install.sh.
-gen*/
+# The translated code is the game's code: the app makes it from the player's own copy on the first Play.
+CoC-Recomp/gen*/
 build/
 external/
 orig*.exe
